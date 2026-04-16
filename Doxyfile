@@ -1,0 +1,61 @@
+#
+# Doxygen configuration for escher-mosp.
+#
+# Generate with: make docs
+# Output: docs/html/index.html
+#
+
+PROJECT_NAME           = "escher-mosp"
+PROJECT_BRIEF          = "Multi-Objective Shortest Path on GPU, backed by the ESCHER dynamic hypergraph CBST."
+OUTPUT_DIRECTORY       = docs
+CREATE_SUBDIRS         = NO
+
+INPUT                  = escher/include \
+                         escher/structure \
+                         escher/kernel \
+                         escher/utils \
+                         graph/include \
+                         graph/src \
+                         mosp/headers \
+                         mosp/src \
+                         tests/unit \
+                         README.md
+
+FILE_PATTERNS          = *.cu *.cuh *.hpp *.cpp *.md
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       = */build/* */bin/* */docs/html/*
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_METHODS  = YES
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+GENERATE_MAN           = NO
+
+USE_MDFILE_AS_MAINPAGE = README.md
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+MARKDOWN_SUPPORT       = YES
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+
+HAVE_DOT               = NO
+CLASS_DIAGRAMS         = YES
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+
+OPTIMIZE_OUTPUT_FOR_C  = NO
+BUILTIN_STL_SUPPORT    = YES
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+PREDEFINED             = __CUDACC__ \
+                         __device__= \
+                         __host__= \
+                         __global__=
