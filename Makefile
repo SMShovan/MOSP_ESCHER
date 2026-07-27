@@ -22,7 +22,8 @@
 NVCC      := nvcc
 CUDA_ARCH ?= sm_70
 
-INCLUDES  := -Iescher/include -Iescher/kernel -Igraph/include -Imosp/headers
+INCLUDES  := -Iescher/include -Iescher/kernel -Igraph/include -Imosp/headers \
+             -Ihypergraph/include -Ihsosp/include
 
 NVFLAGS   := -std=c++17 -O2 --extended-lambda -arch=$(CUDA_ARCH) $(INCLUDES)
 CXXFLAGS  := -std=c++17 -O2 -Wall $(INCLUDES)
@@ -80,11 +81,28 @@ MOSP_MAIN_OBJS    := $(MOSP_MAIN:%=$(BUILDDIR)/%.o)
 MOSP_STRESS_OBJS  := $(MOSP_STRESS:%=$(BUILDDIR)/%.o)
 MOSP_PSTRESS_OBJS := $(MOSP_PSTRESS:%=$(BUILDDIR)/%.o)
 
+# -----------------------------------------------------------------------------
+# H-SOSP: dynamic hypergraph SOSP (hypergraph/ + hsosp/)
+# -----------------------------------------------------------------------------
+
+HYPERGRAPH_SRCS := \
+    hypergraph/src/HostHypergraph.cpp \
+    hypergraph/src/HypergraphGen.cpp \
+    hypergraph/src/DynamicHypergraph.cpp
+HSOSP_DEV_SRCS  := hsosp/src/hsospDevice.cu
+
+HYPERGRAPH_OBJS := $(HYPERGRAPH_SRCS:%=$(BUILDDIR)/%.o)
+HSOSP_DEV_OBJS  := $(HSOSP_DEV_SRCS:%=$(BUILDDIR)/%.o)
+HSOSP_CORE_OBJS := $(HYPERGRAPH_OBJS) $(HSOSP_DEV_OBJS)
+
 # Unit tests
 UNIT_TESTS := \
     $(BINDIR)/test_cbst_smoke \
     $(BINDIR)/test_dynamicgraph_roundtrip \
-    $(BINDIR)/test_snapshot_matches_updateCSR
+    $(BINDIR)/test_snapshot_matches_updateCSR \
+    $(BINDIR)/test_h2h_construction \
+    $(BINDIR)/test_h2h_delta \
+    $(BINDIR)/test_hsosp_matches_dijkstra
 
 # -----------------------------------------------------------------------------
 # Phony targets
@@ -92,10 +110,13 @@ UNIT_TESTS := \
 
 .PHONY: all clean run tests docs syntax-check stressTest parallelStressTest
 
-all: $(BINDIR)/main $(BINDIR)/stressTest $(BINDIR)/parallelStressTest tests
+all: $(BINDIR)/main $(BINDIR)/stressTest $(BINDIR)/parallelStressTest \
+     $(BINDIR)/hsospBench $(BINDIR)/hsospStress tests
 
 stressTest:         $(BINDIR)/stressTest
 parallelStressTest: $(BINDIR)/parallelStressTest
+hsospBench:         $(BINDIR)/hsospBench
+hsospStress:        $(BINDIR)/hsospStress
 tests:              $(UNIT_TESTS)
 
 run: $(BINDIR)/main
@@ -150,9 +171,36 @@ $(BINDIR)/test_dynamicgraph_roundtrip: $(BUILDDIR)/tests/unit/test_dynamicgraph_
 	@mkdir -p $(BINDIR)
 	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_dynamicgraph_roundtrip.cu.o $(GRAPH_CORE_OBJS) $(LIBESCHER)
 
+# H-SOSP binaries: benchmark driver + randomized stress harness.
+$(BINDIR)/hsospBench: $(BUILDDIR)/hsosp/src/hsospBench.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/hsosp/src/hsospBench.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+
+$(BINDIR)/hsospStress: $(BUILDDIR)/hsosp/src/hsospStress.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/hsosp/src/hsospStress.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+
+$(BINDIR)/test_h2h_construction: $(BUILDDIR)/tests/unit/test_h2h_construction.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_h2h_construction.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+
+$(BINDIR)/test_h2h_delta: $(BUILDDIR)/tests/unit/test_h2h_delta.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_h2h_delta.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+
+$(BINDIR)/test_hsosp_matches_dijkstra: $(BUILDDIR)/tests/unit/test_hsosp_matches_dijkstra.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_hsosp_matches_dijkstra.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+
 # The equivalence test links in the MOSP base (needed for generateGraphCSR,
-# generateChangedEdges, updateGraphCSR, readCSR).
-MOSP_BASE_OBJS := $(MOSP_BASE:%=$(BUILDDIR)/%.o)
+# generateChangedEdges, updateGraphCSR, readCSR). generateTestCases.cu in the
+# base additionally references the SOSP kernels and the combined-graph step,
+# so those objects are linked too (this was missing upstream and made the
+# test binary fail to link).
+MOSP_BASE_OBJS := $(MOSP_BASE:%=$(BUILDDIR)/%.o) \
+                  $(BUILDDIR)/mosp/src/sequentialSOSPUpdate.cu.o \
+                  $(BUILDDIR)/mosp/src/parallelSOSPUpdate.cu.o \
+                  $(BUILDDIR)/mosp/src/parallelCombinedGraph.cu.o
 
 $(BINDIR)/test_snapshot_matches_updateCSR: $(BUILDDIR)/tests/unit/test_snapshot_matches_updateCSR.cu.o $(GRAPH_OBJS) $(MOSP_BASE_OBJS) $(LIBESCHER)
 	@mkdir -p $(BINDIR)
@@ -175,9 +223,14 @@ docs:
 
 ALL_SRCS := $(ESCHER_CU_SRCS) $(ESCHER_CPP_SRCS) $(GRAPH_CU_SRCS) $(GRAPH_CPP_SRCS) \
             $(MOSP_MAIN) $(MOSP_STRESS) $(MOSP_PSTRESS) \
+            $(HYPERGRAPH_SRCS) $(HSOSP_DEV_SRCS) \
+            hsosp/src/hsospBench.cu hsosp/src/hsospStress.cu \
             tests/unit/test_cbst_smoke.cu \
             tests/unit/test_dynamicgraph_roundtrip.cu \
-            tests/unit/test_snapshot_matches_updateCSR.cu
+            tests/unit/test_snapshot_matches_updateCSR.cu \
+            tests/unit/test_h2h_construction.cu \
+            tests/unit/test_h2h_delta.cu \
+            tests/unit/test_hsosp_matches_dijkstra.cu
 
 syntax-check:
 	@set -e; \

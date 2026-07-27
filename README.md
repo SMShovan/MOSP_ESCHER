@@ -7,6 +7,20 @@ research projects — the ESCHER CBST core and the MOSP CUDA algorithm — into
 a single build tree so that MOSP now uses our own data structure as its
 authoritative dynamic graph store.
 
+## NEW: H-SOSP — dynamic shortest paths on hypergraphs
+
+The `hypergraph/` and `hsosp/` modules implement the project defined in the
+July 2026 meeting: single-objective shortest paths on a weighted dynamic
+hypergraph via its h2h (line graph) representation, with ESCHER as the
+authoritative store and the parallel SOSP-update framework as the engine.
+See **[docs/HSOSP.md](docs/HSOSP.md)** for the model, experiments, and the
+one-command cluster pipeline:
+
+```bash
+CUDA_ARCH=sm_80 ./scripts/run_experiments.sh smoke   # sanity pass
+CUDA_ARCH=sm_80 ./scripts/run_experiments.sh full    # paper run: CSV + all figures
+```
+
 ## Layout
 
 ```

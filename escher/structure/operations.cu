@@ -24,6 +24,7 @@ struct LessThan {
 
 // Kernel prototypes moved to kernel/kernels.cuh
 #include "../kernel/kernels.cuh"
+#include "../kernel/device_utils.cuh"
 
 // Utility: dump node index and value to plain arrays
 __global__ void dumpNodeIndexValue(CBSTNode *nodes, int n, int *outIndex,
@@ -42,9 +43,62 @@ static inline void checkCuda(cudaError_t result) {
   ::escher::checkCudaImpl(result, __FILE__, __LINE__, "checkCuda");
 }
 
+// Set each node's occupancy to the true number of data values stored in its
+// segment at construction time. Mirrors the tid -> index2 rank mapping of
+// storeItemsIntoNodes so occupancy[rank] lands on the right tree node.
+__global__ void setInitialOccupancy(CBSTNode *nodes, const int *rowOccupancy,
+                                    int n) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid < n) {
+    int log2_tid = floor_log2(tid + 1);
+    int log2_n = floor_log2(n);
+    int index = ((2 * (tid + 1 - (1 << log2_tid))) + 1) * (1 << log2_n) /
+                (1 << log2_tid);
+    int index2 = min(index, index - (index / 2) + (n + 1 - (1 << log2_n)));
+    index2--;
+    if (index2 < n) {
+      nodes[tid].occupancy = rowOccupancy[index2];
+    }
+  }
+}
+
+// Grow the reusable scratch buffers (d_insertKeys / d_insertPayload /
+// d_insertPrefixSizes / d_relocationPlan) so a batch of @p K items with
+// @p payloadInts total payload values fits. The upstream code allocated
+// these once in constructCBST sized to the *initial record count*, so any
+// fill/insert/unfill batch larger than that corrupted device memory.
+static void ensureScratchCapacity(CBSTContext &ctx, int K,
+                                  long long payloadInts) {
+  if (K <= ctx.scratchKeysCap &&
+      payloadInts <= ctx.scratchPayloadCap) {
+    return;
+  }
+  int newKeysCap = ctx.scratchKeysCap > 0 ? ctx.scratchKeysCap : 1;
+  while (newKeysCap < K) newKeysCap += newKeysCap / 2 + 1;
+  long long newPayloadCap =
+      ctx.scratchPayloadCap > 0 ? ctx.scratchPayloadCap : 4;
+  while (newPayloadCap < payloadInts) newPayloadCap += newPayloadCap / 2 + 1;
+
+  if (ctx.d_insertKeys) checkCuda(cudaFree(ctx.d_insertKeys));
+  if (ctx.d_insertPayload) checkCuda(cudaFree(ctx.d_insertPayload));
+  if (ctx.d_insertPrefixSizes) checkCuda(cudaFree(ctx.d_insertPrefixSizes));
+  if (ctx.d_relocationPlan) checkCuda(cudaFree(ctx.d_relocationPlan));
+
+  checkCuda(cudaMalloc(&ctx.d_insertKeys, newKeysCap * sizeof(int)));
+  checkCuda(cudaMalloc(&ctx.d_insertPayload,
+                       static_cast<size_t>(newPayloadCap) * sizeof(int)));
+  checkCuda(cudaMalloc(&ctx.d_insertPrefixSizes, newKeysCap * sizeof(int)));
+  checkCuda(
+      cudaMalloc(&ctx.d_relocationPlan, 3LL * newKeysCap * sizeof(int)));
+
+  ctx.scratchKeysCap = newKeysCap;
+  ctx.scratchPayloadCap = newPayloadCap;
+}
+
 void constructCBST(int *keys, int *startOffsets, int numRecords,
                    int *flatPayload, int flatPayloadSize, int payloadCapacity,
-                   const char *datasetName, CBSTContext &ctx) {
+                   const char *datasetName, CBSTContext &ctx,
+                   const int *rowOccupancy) {
   // Argument validation. The upstream ESCHER code silently exited or
   // returned on bad input; we now surface the error as an EscherError
   // so DynamicGraph and MOSP callers can handle failures gracefully.
@@ -91,9 +145,13 @@ void constructCBST(int *keys, int *startOffsets, int numRecords,
                        (ctx.fixedSize - flatPayloadSize) * sizeof(int)));
 
   checkCuda(cudaMalloc(&ctx.d_insertKeys, numRecords * sizeof(int)));
-  checkCuda(cudaMalloc(&ctx.d_insertPayload, numRecords * 3 * sizeof(int)));
+  checkCuda(cudaMalloc(&ctx.d_insertPayload,
+                       static_cast<size_t>(numRecords) * 3 * sizeof(int)));
   checkCuda(cudaMalloc(&ctx.d_insertPrefixSizes, numRecords * sizeof(int)));
-  checkCuda(cudaMalloc(&ctx.d_relocationPlan, 3 * numRecords * sizeof(int)));
+  checkCuda(cudaMalloc(&ctx.d_relocationPlan,
+                       3LL * numRecords * sizeof(int)));
+  ctx.scratchKeysCap = numRecords;
+  ctx.scratchPayloadCap = static_cast<long long>(numRecords) * 3;
   // Availability arrays (0/1 per node) and subtree sums (per node)
   checkCuda(cudaMalloc(&ctx.d_avail, numRecords * sizeof(int)));
   checkCuda(cudaMalloc(&ctx.d_subtreeAvail, numRecords * sizeof(int)));
@@ -109,6 +167,20 @@ void constructCBST(int *keys, int *startOffsets, int numRecords,
   storeItemsIntoNodes<<<numBlocks, blockSize>>>(
       ctx.d_nodes, ctx.d_keys, ctx.d_startOffsets, numRecords, flatPayloadSize);
   checkCuda(cudaDeviceSynchronize());
+
+  // Initialize per-node occupancy from the caller-provided true row counts
+  // so subsequent fillCBST appends land after the construct-time data
+  // instead of overwriting it (see structure.hpp for background).
+  if (rowOccupancy != nullptr) {
+    int *d_rowOcc = nullptr;
+    checkCuda(cudaMalloc(&d_rowOcc, numRecords * sizeof(int)));
+    checkCuda(cudaMemcpy(d_rowOcc, rowOccupancy, numRecords * sizeof(int),
+                         cudaMemcpyHostToDevice));
+    setInitialOccupancy<<<numBlocks, blockSize>>>(ctx.d_nodes, d_rowOcc,
+                                                  numRecords);
+    checkCuda(cudaDeviceSynchronize());
+    checkCuda(cudaFree(d_rowOcc));
+  }
 
   // The upstream ESCHER code launched @c printEachNode here for debugging,
   // which spams stdout with one printf per record. MOSP's stress tests run
@@ -130,6 +202,8 @@ void fillCBST(const std::vector<int> &insertKeys,
   int K = static_cast<int>(insertKeys.size());
   std::vector<int> relocationPlanHost(K * 3, 0);
 
+  ensureScratchCapacity(ctx, K,
+                        static_cast<long long>(insertPayload.size()));
   checkCuda(cudaMemcpy(ctx.d_insertKeys, insertKeys.data(), K * sizeof(int),
                        cudaMemcpyHostToDevice));
   checkCuda(cudaMemcpy(ctx.d_insertPayload, insertPayload.data(),
@@ -323,6 +397,7 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
   int blockSize = 256;
 
   // Copy inputs to device
+  ensureScratchCapacity(ctx, K, static_cast<long long>(newPayload.size()));
   checkCuda(cudaMemcpy(ctx.d_insertKeys, newKeys.data(), K * sizeof(int),
                        cudaMemcpyHostToDevice));
   checkCuda(cudaMemcpy(ctx.d_insertPayload, newPayload.data(),
@@ -672,6 +747,17 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     dumpNodeIndexValue<<<blocksDump, blockSize>>>(ctx.d_nodes, oldN, d_idx,
                                                   d_val);
     checkCuda(cudaDeviceSynchronize());
+
+    // Sort (key, startOffset) pairs on the DEVICE. The upstream code copied
+    // both arrays to the host and ran std::sort over up to numRecords pairs
+    // on every surplus insert, which dominates batch time for multi-million
+    // record trees. Deleted nodes carry index -1 and sort to the front.
+    {
+      thrust::device_ptr<int> idx_ptr = thrust::device_pointer_cast(d_idx);
+      thrust::device_ptr<int> val_ptr = thrust::device_pointer_cast(d_val);
+      thrust::sort_by_key(idx_ptr, idx_ptr + oldN, val_ptr);
+    }
+
     std::vector<int> h_idx(oldN), h_val(oldN);
     checkCuda(cudaMemcpy(h_idx.data(), d_idx, oldN * sizeof(int),
                          cudaMemcpyDeviceToHost));
@@ -680,16 +766,15 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     checkCuda(cudaFree(d_idx));
     checkCuda(cudaFree(d_val));
 
+    // Skip the leading non-positive (deleted) entries; the rest is sorted.
+    int firstValid = 0;
+    while (firstValid < oldN && h_idx[firstValid] <= 0)
+      ++firstValid;
     std::vector<std::pair<int, int>> pairs;
-    pairs.reserve(oldN);
-    for (int i = 0; i < oldN; ++i) {
-      if (h_idx[i] > 0)
-        pairs.emplace_back(h_idx[i], h_val[i]);
+    pairs.reserve(oldN - firstValid);
+    for (int i = firstValid; i < oldN; ++i) {
+      pairs.emplace_back(h_idx[i], h_val[i]);
     }
-    std::sort(pairs.begin(), pairs.end(),
-              [](const std::pair<int, int> &a, const std::pair<int, int> &b) {
-                return a.first < b.first;
-              });
 
     int validOldCount = static_cast<int>(pairs.size());
     int newN = validOldCount + surplus;
@@ -747,9 +832,13 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     checkCuda(cudaMemset(ctx.d_subtreeAvail, 0, newN * sizeof(int)));
 
     checkCuda(cudaMalloc(&ctx.d_insertKeys, newN * sizeof(int)));
-    checkCuda(cudaMalloc(&ctx.d_insertPayload, newN * 3 * sizeof(int)));
+    checkCuda(cudaMalloc(&ctx.d_insertPayload,
+                         static_cast<size_t>(newN) * 3 * sizeof(int)));
     checkCuda(cudaMalloc(&ctx.d_insertPrefixSizes, newN * sizeof(int)));
-    checkCuda(cudaMalloc(&ctx.d_relocationPlan, newN * 3 * sizeof(int)));
+    checkCuda(cudaMalloc(&ctx.d_relocationPlan,
+                         3LL * newN * sizeof(int)));
+    ctx.scratchKeysCap = newN;
+    ctx.scratchPayloadCap = static_cast<long long>(newN) * 3;
 
     int blocksBuild = (newN + blockSize - 1) / blockSize;
     buildEmptyBinaryTree<<<blocksBuild, blockSize>>>(ctx.d_nodes, newN);
@@ -866,9 +955,10 @@ CBSTOperations &CBSTOperations::operator=(CBSTOperations &&other) noexcept {
 }
 
 void CBSTOperations::construct(int *keys, int *startOffsets, int numRecords,
-                               int *flatPayload, int flatPayloadSize) {
+                               int *flatPayload, int flatPayloadSize,
+                               const int *rowOccupancy) {
   constructCBST(keys, startOffsets, numRecords, flatPayload, flatPayloadSize,
-                ctx_.fixedSize, ctx_.datasetName, ctx_);
+                ctx_.fixedSize, ctx_.datasetName, ctx_, rowOccupancy);
   constructed_ = true;
 }
 
@@ -910,6 +1000,8 @@ void unfillCBST(const std::vector<int> &keysToUnfill,
   if (keysToUnfill.empty())
     return;
   // Reuse insert buffers for passing inputs
+  ensureScratchCapacity(ctx, static_cast<int>(keysToUnfill.size()),
+                        static_cast<long long>(valuesToRemove.size()));
   checkCuda(cudaMemcpy(ctx.d_insertKeys, keysToUnfill.data(),
                        keysToUnfill.size() * sizeof(int),
                        cudaMemcpyHostToDevice));

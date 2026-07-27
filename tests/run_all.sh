@@ -25,6 +25,13 @@ echo "=== unit tests ==="
 "$BIN/test_cbst_smoke"
 "$BIN/test_dynamicgraph_roundtrip"
 "$BIN/test_snapshot_matches_updateCSR"
+"$BIN/test_h2h_construction"
+"$BIN/test_h2h_delta"
+"$BIN/test_hsosp_matches_dijkstra"
+
+echo
+echo "=== H-SOSP randomized stress ==="
+"$BIN/hsospStress" --configs 50
 
 echo
 echo "=== main pipeline ==="

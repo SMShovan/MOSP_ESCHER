@@ -1,5 +1,9 @@
 #include "../include/binning.hpp"
 
+#include <cstddef>
+
+using std::size_t;
+
 void binByDegree(const int* prefixSizes,
                  int K,
                  int thSmall,

@@ -35,6 +35,14 @@ struct CBSTContext {
     int initialPayloadSize;
     const char* datasetName;
     int alignment;
+    // Capacities of the reusable scratch buffers (d_insertKeys /
+    // d_insertPayload / d_insertPrefixSizes / d_relocationPlan). The
+    // upstream code sized these once at construct time (numRecords keys,
+    // numRecords*3 payload ints) and silently overflowed device memory
+    // whenever a fill/insert/unfill batch was larger than that. The
+    // capacities are now tracked and the buffers grow on demand.
+    int scratchKeysCap;
+    long long scratchPayloadCap;
 };
 
 // Mapping returned by insertCBST: for each input item i, itemToKey[i] is the
@@ -45,7 +53,15 @@ struct InsertMapping {
 };
 
 // Host API for CBST operations (free functions)
-void constructCBST(int* keys, int* startOffsets, int numRecords, int* flatPayload, int flatPayloadSize, int payloadCapacity, const char* datasetName, CBSTContext& ctx);
+//
+// rowOccupancy (optional): per-record count of REAL data values in each
+// record's payload segment, in the same order as keys/startOffsets. The
+// upstream code left every node's occupancy at 0 after construction (the
+// "fixup pass" mentioned in build_tree.cu never existed), which made the
+// first fillCBST on a row overwrite the construct-time payload from the
+// segment base. Pass the true per-row counts to get correct append
+// positions; pass nullptr to keep the legacy behavior.
+void constructCBST(int* keys, int* startOffsets, int numRecords, int* flatPayload, int flatPayloadSize, int payloadCapacity, const char* datasetName, CBSTContext& ctx, const int* rowOccupancy = nullptr);
 void fillCBST(const std::vector<int>& insertKeys, const std::vector<int>& insertPayload, const std::vector<int>& insertPrefixSizes, CBSTContext& ctx);
 void deleteCBST(const std::vector<int>& deleteKeys, CBSTContext& ctx);
 InsertMapping insertCBST(const std::vector<int>& newKeys, const std::vector<int>& newPayload, const std::vector<int>& newPrefixSizes, CBSTContext& ctx);
@@ -60,7 +76,7 @@ struct CBSTOperations {
     CBSTOperations(CBSTOperations&& other) noexcept;
     CBSTOperations& operator=(CBSTOperations&& other) noexcept;
 
-    void construct(int* keys, int* startOffsets, int numRecords, int* flatPayload, int flatPayloadSize);
+    void construct(int* keys, int* startOffsets, int numRecords, int* flatPayload, int flatPayloadSize, const int* rowOccupancy = nullptr);
     InsertMapping insert(const std::vector<int>& insertKeys, const std::vector<int>& insertPayload, const std::vector<int>& insertPrefixSizes);
     void fill(const std::vector<int>& insertKeys, const std::vector<int>& insertPayload, const std::vector<int>& insertPrefixSizes);
     void erase(const std::vector<int>& deleteKeys);

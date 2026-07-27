@@ -130,29 +130,44 @@ struct DynamicGraph::Impl {
     void constructCbsts_(std::vector<std::vector<int>>& perEdgeRecords,
                          std::vector<std::vector<int>>& perVertexOut,
                          std::vector<std::vector<int>>& perVertexIn) {
+        // True per-row value counts, so constructCBST can initialize each
+        // node's occupancy and later fills append instead of overwriting.
+        auto rowCounts = [](const std::vector<std::vector<int>>& rows) {
+            std::vector<int> counts(rows.size());
+            for (std::size_t i = 0; i < rows.size(); ++i)
+                counts[i] = static_cast<int>(rows[i].size());
+            return counts;
+        };
+
         // --- edgesCBST ---
         edgesCBST = std::make_unique<CBSTOperations>("edges", payloadCapacity_, 4);
         auto [edgesFlat, edgesOffsets] = flatten2DVector(perEdgeRecords);
         auto [edgesKeys, edgesStarts]  = buildKeysAndOffsets(edgesOffsets);
+        std::vector<int> edgesCounts = rowCounts(perEdgeRecords);
         edgesCBST->construct(edgesKeys.data(), edgesStarts.data(),
                              static_cast<int>(perEdgeRecords.size()),
-                             edgesFlat.data(), static_cast<int>(edgesFlat.size()));
+                             edgesFlat.data(), static_cast<int>(edgesFlat.size()),
+                             edgesCounts.data());
 
         // --- outAdjCBST ---
         outAdjCBST = std::make_unique<CBSTOperations>("outAdj", payloadCapacity_, 4);
         auto [outFlat, outOffsets] = flatten2DVector(perVertexOut);
         auto [outKeys, outStarts]  = buildKeysAndOffsets(outOffsets);
+        std::vector<int> outCounts = rowCounts(perVertexOut);
         outAdjCBST->construct(outKeys.data(), outStarts.data(),
                               static_cast<int>(perVertexOut.size()),
-                              outFlat.data(), static_cast<int>(outFlat.size()));
+                              outFlat.data(), static_cast<int>(outFlat.size()),
+                              outCounts.data());
 
         // --- inAdjCBST ---
         inAdjCBST = std::make_unique<CBSTOperations>("inAdj", payloadCapacity_, 4);
         auto [inFlat, inOffsets] = flatten2DVector(perVertexIn);
         auto [inKeys, inStarts]  = buildKeysAndOffsets(inOffsets);
+        std::vector<int> inCounts = rowCounts(perVertexIn);
         inAdjCBST->construct(inKeys.data(), inStarts.data(),
                              static_cast<int>(perVertexIn.size()),
-                             inFlat.data(), static_cast<int>(inFlat.size()));
+                             inFlat.data(), static_cast<int>(inFlat.size()),
+                             inCounts.data());
     }
 };
 
@@ -263,6 +278,15 @@ void DynamicGraph::insertEdges(const std::vector<EdgeInsert>& edges) {
         }
         if (static_cast<int>(e.weights.size()) != K) {
             throw escher::EscherError("insertEdges: weights must have numObjectives entries");
+        }
+        // Guard against parallel-edge leaks: re-inserting an existing (src,dst)
+        // previously allocated a second edge record and orphaned the first one
+        // in the (src,dst)->id map. Upsert semantics are handled one level up
+        // (updateGraphWithESCHER deletes before inserting); reaching this point
+        // with a duplicate is a caller bug, so fail loudly instead of leaking.
+        if (pImpl->edgeIdBySrcDst.count(packSrcDst(e.src, e.dst)) != 0) {
+            throw escher::EscherError(
+                "insertEdges: edge already exists (delete it first for upsert)");
         }
     }
 

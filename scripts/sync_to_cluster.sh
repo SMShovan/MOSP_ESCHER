@@ -19,7 +19,9 @@ rsync -avz --delete --progress \
     --exclude 'output/' \
     --exclude 'tests/tmp/' \
     --exclude 'tests/testCase*/' \
+    --exclude 'tests/local/local_tests' \
     --exclude 'docs/html/' \
+    --exclude 'results/' \
     --exclude '.DS_Store' \
     "$ROOT/" \
     "$REMOTE_HOST:$REMOTE_PATH"
