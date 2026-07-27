@@ -44,9 +44,12 @@ echo "=== H-SOSP pipeline: suite=$SUITE results=$RESULTS reps=$REPS exp=$EXP see
 date
 
 # ---- 0. environment --------------------------------------------------------
-if command -v module >/dev/null 2>&1; then
+# Try the CUDA module names of the clusters we use (mill: cuda-toolkit/12.5,
+# Hellbender: cuda). Harmless if nvcc is already on the PATH.
+if command -v module >/dev/null 2>&1 && ! command -v nvcc >/dev/null 2>&1; then
     module load cuda-toolkit/12.5 2>/dev/null || \
-        echo "[env] cuda-toolkit module not loaded (nvcc must be on PATH)"
+    module load cuda 2>/dev/null || \
+        echo "[env] no CUDA module loaded (nvcc must be on PATH)"
 fi
 nvcc --version | tail -1
 nvidia-smi -L 2>/dev/null || echo "[env] nvidia-smi unavailable"
