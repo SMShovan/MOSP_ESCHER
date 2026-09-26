@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <map>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -28,32 +27,51 @@ double msSince(Clock::time_point t0) {
         .count();
 }
 
-/** Group raw (rowKey, value) pairs and issue one batched fill / unfill. */
-void flushGrouped(const std::vector<std::pair<int, int>>& rawOps,
-                  CBSTOperations& cbst, bool isFill) {
-    if (rawOps.empty()) return;
-    // std::map keeps keys sorted, which keeps the CBST call deterministic.
-    std::map<int, std::vector<int>> byRow;
-    for (const auto& op : rawOps) byRow[op.first].push_back(op.second);
-
+/** Rows of a batched fill / unfill: row keys, their values back to back
+ *  and the inclusive prefix of the value counts (the CBST call format). */
+struct GroupedOps {
     std::vector<int> keys;
     std::vector<int> payload;
     std::vector<int> prefix;
-    keys.reserve(byRow.size());
-    prefix.reserve(byRow.size());
-    int run = 0;
-    for (auto& kv : byRow) {
-        keys.push_back(kv.first);
-        for (int v : kv.second) payload.push_back(v);
-        run += static_cast<int>(kv.second.size());
-        prefix.push_back(run);
+
+    /** Appends @p value to row @p key (a new row unless it is the last). */
+    void add(int key, int value) {
+        if (keys.empty() || keys.back() != key) {
+            keys.push_back(key);
+            prefix.push_back(prefix.empty() ? 0 : prefix.back());
+        }
+        payload.push_back(value);
+        ++prefix.back();
     }
+};
+
+void flush(const GroupedOps& g, CBSTOperations& cbst, bool isFill) {
+    if (g.keys.empty()) return;
     if (isFill) {
-        cbst.fill(keys, payload, prefix);
+        cbst.fill(g.keys, g.payload, g.prefix);
     } else {
-        unfillCBST(keys, payload, prefix,
+        unfillCBST(g.keys, g.payload, g.prefix,
                    const_cast<CBSTContext&>(cbst.context()));
     }
+}
+
+/** Groups raw (rowKey, value) pairs by row (a stable sort, so the values of
+ *  a row keep their order and the call is deterministic) and issues one
+ *  batched fill / unfill. (The original grouped through a std::map of
+ *  vectors: about 330 ms per call for the 2.5M h2h pairs of a 50K DBLP
+ *  batch.) */
+void flushGrouped(std::vector<std::pair<int, int>>& rawOps,
+                  CBSTOperations& cbst, bool isFill) {
+    if (rawOps.empty()) return;
+    std::stable_sort(rawOps.begin(), rawOps.end(),
+                     [](const std::pair<int, int>& a,
+                        const std::pair<int, int>& b) {
+                         return a.first < b.first;
+                     });
+    GroupedOps g;
+    g.payload.reserve(rawOps.size());
+    for (const auto& op : rawOps) g.add(op.first, op.second);
+    flush(g, cbst, isFill);
 }
 
 /** Build flatten inputs + occupancy counts and construct a CBST sized to
@@ -98,6 +116,9 @@ struct DynamicHypergraph::Impl {
 
     /// heId -> key of its row in the h2h CBST (0 = none).
     std::vector<int> h2hKeyOfHe;
+    /// finishBatch scratch: heId -> index in the batch's new hyperedges
+    /// (-1 between batches).
+    std::vector<int> newSlotOfHe;
 };
 
 DynamicHypergraph::DynamicHypergraph(int numVertices, const Caps& caps)
@@ -331,16 +352,17 @@ double DynamicHypergraph::finishBatch(
 
     // h2h operations from the line-graph delta: directed keys
     // row << 33 | isInsert << 32 | col (0-based), sorted, so every row's
-    // changes are one run with its deletions first. Rows of dead
+    // changes are one run with its deletions first and the fill / unfill
+    // groups come out in row order without a further sort. Rows of dead
     // hyperedges are erased below (no unfill); rows of new hyperedges are
     // inserted whole (no fill).
-    std::vector<char> isNew(hg.maxId() + 1, 0);
-    for (int id : newHe) isNew[id] = 1;
-    std::vector<std::pair<int, int>> h2hUnfill, h2hFill;
-    // Rows of new hyperedges: runs of newRowVals (keys of one row are
-    // contiguous).
-    std::vector<int> newRowStart(hg.maxId() + 1, -1);
-    std::vector<int> newRowLen(hg.maxId() + 1, 0);
+    std::vector<int>& newSlot = im.newSlotOfHe;
+    if (static_cast<int>(newSlot.size()) <= hg.maxId())
+        newSlot.resize(hg.maxId() + 1, -1);
+    for (std::size_t i = 0; i < newHe.size(); ++i)
+        newSlot[newHe[i]] = static_cast<int>(i);
+    GroupedOps h2hUnfill, h2hFill;
+    std::vector<int> newRowStart(newHe.size(), 0), newRowLen(newHe.size(), 0);
     std::vector<int> newRowVals;
     long long insKeys = 0, delKeys = 0;
     for (std::uint64_t k : directedKeys) {
@@ -351,27 +373,28 @@ double DynamicHypergraph::finishBatch(
             ++delKeys;
             if (hg.alive[row - 1]) {
                 const int key = im.h2hKeyOfHe[row];
-                if (key > 0) h2hUnfill.emplace_back(key, val);
+                if (key > 0) h2hUnfill.add(key, val);
             }
         } else {
             ++insKeys;
-            if (isNew[row]) {
-                if (newRowStart[row] < 0)
-                    newRowStart[row] = static_cast<int>(newRowVals.size());
-                ++newRowLen[row];
+            const int slot = newSlot[row];
+            if (slot >= 0) {
+                if (newRowLen[slot]++ == 0)
+                    newRowStart[slot] = static_cast<int>(newRowVals.size());
                 newRowVals.push_back(val);
             } else {
                 const int key = im.h2hKeyOfHe[row];
-                if (key > 0) h2hFill.emplace_back(key, val);
+                if (key > 0) h2hFill.add(key, val);
             }
         }
     }
+    for (int id : newHe) newSlot[id] = -1;
     im.host.h2hPairCount += (insKeys - delKeys) / 2;
 
     // Horizontal removals.
     flushGrouped(res.ops.h2vUnfill, *im.h2v, /*isFill=*/false);
     flushGrouped(res.ops.v2hUnfill, *im.v2h, /*isFill=*/false);
-    flushGrouped(h2hUnfill, *im.h2h, /*isFill=*/false);
+    flush(h2hUnfill, *im.h2h, /*isFill=*/false);
 
     // Vertical deletes on h2h.
     if (!deadHe.empty()) {
@@ -390,7 +413,7 @@ double DynamicHypergraph::finishBatch(
     // Horizontal additions.
     flushGrouped(res.ops.h2vFill, *im.h2v, /*isFill=*/true);
     flushGrouped(res.ops.v2hFill, *im.v2h, /*isFill=*/true);
-    flushGrouped(h2hFill, *im.h2h, /*isFill=*/true);
+    flush(h2hFill, *im.h2h, /*isFill=*/true);
 
     // Vertical inserts on h2h: one row per new hyperedge with its final
     // neighbour list; adopt whatever keys the best-fit returns.
@@ -400,14 +423,14 @@ double DynamicHypergraph::finishBatch(
         std::vector<int> prefix;
         tentative.reserve(newHe.size());
         int run = 0;
-        for (int id : newHe) {
-            tentative.push_back(id);
-            if (newRowLen[id] > 0)
-                payload.insert(payload.end(),
-                               newRowVals.begin() + newRowStart[id],
-                               newRowVals.begin() + newRowStart[id] +
-                                   newRowLen[id]);
-            run += newRowLen[id];
+        payload.reserve(newRowVals.size());
+        for (std::size_t i = 0; i < newHe.size(); ++i) {
+            tentative.push_back(newHe[i]);
+            payload.insert(payload.end(),
+                           newRowVals.begin() + newRowStart[i],
+                           newRowVals.begin() + newRowStart[i] +
+                               newRowLen[i]);
+            run += newRowLen[i];
             prefix.push_back(run);
         }
         InsertMapping mapping = im.h2h->insert(tentative, payload, prefix);

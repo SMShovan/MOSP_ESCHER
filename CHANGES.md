@@ -361,3 +361,13 @@ medians of three runs are in [results/README.md](results/README.md).
   batch (240 batches) and checks the emulated update against the oracle,
   parents included. Mutation: dropping the post-batch candidate pass made
   `test_h2h_delta` and `hsospStress` fail (device CSR rows).
+- **P4a grouping of the CBST fill / unfill inputs**
+  (`hypergraph/src/DynamicHypergraph.cpp`). Every batched fill and unfill
+  grouped its (row, value) pairs through a `std::map<int, vector<int>>`:
+  about 330 ms for each of the h2h fill and unfill calls of a 50K DBLP
+  batch (2.5M pairs, 1M rows), against 10-20 ms for the CBST kernels
+  themselves. The h2h groups are now built in one pass over the sorted
+  net delta (already grouped by row), and the h2v / v2h groups with a
+  stable sort; the calls receive the same rows and values.
+  DBLP 50K: ESCHER maintenance 0.92-1.13 s → 120-135 ms (333 ms on the
+  first batch, see P4b); dynamic time per batch 1.03-1.24 s → 0.22-0.44 s.
