@@ -125,75 +125,85 @@ __global__ void applyRowChangesKernel(
 }
 
 /**
- * Node-weighted variant of updateDistancesKernel: recompute the best parent
- * of each candidate from its (symmetric) neighbor list; every in-edge of v
- * costs nodeW[v]. Candidates are unique (dedup at enqueue), so the
- * dist/parent writes are race-free; dist reads of neighbors are the benign
- * chaotic-relaxation race of the original kernel.
+ * Pull step of the recompute, one warp per candidate v: the best parent
+ * over v's (symmetric) neighbour list, read with coalesced strided loads
+ * and a shuffle min-reduction; every in-edge of v costs nodeW[v], and ties
+ * go to the lowest parent id (canonical tree). Candidates are unique
+ * (dedup at enqueue), so the dist / parent writes are race-free; reading
+ * the neighbours' distances while other warps lower them is the benign
+ * chaotic-relaxation race (a changed node re-enqueues its neighbours).
+ * (The original ran one thread per candidate over the whole row with
+ * dependent loads; rows of the DBLP line graph have up to 3,000 entries.)
  */
-__global__ void updateDistancesNW(
+__global__ void pullDistancesWarp(
     const int* candList, int numCand, const long long* rowStart,
     const int* deg, const int* colInd, const long long* nodeW,
     long long* dist, int* parent, int* isCandidate, int* isAffected,
     int* affList, int* affCount, int source) {
 
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= numCand) return;
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= numCand) return;
 
-    const int v = candList[tid];
-    isCandidate[v] = 0;
+    const int v = candList[warp];
+    if (lane == 0) isCandidate[v] = 0;
     if (v == source) return;
 
     long long best = INF_VALUE;
     int bestP = -1;
     const long long base = rowStart[v];
     const int d = deg[v];
-    for (int e = 0; e < d; ++e) {
+    const long long wv = nodeW[v];
+    for (int e = lane; e < d; e += 32) {
         const int p = colInd[base + e];
         const long long dp = dist[p];
         if (dp >= INF_VALUE / 2) continue;
-        const long long cd = dp + nodeW[v];
-        // Ties go to the lowest parent id (canonical tree), independent of
-        // the order of the row.
+        const long long cd = dp + wv;
         if (cd < best || (cd == best && p < bestP)) {
             best = cd;
             bestP = p;
         }
     }
-
-    const bool changed = (best != dist[v]);
-    parent[v] = bestP;
-    dist[v] = best;
-
-    if (changed) {
-        if (atomicCAS(&isAffected[v], 0, 1) == 0) {
-            const int pos = atomicAdd(affCount, 1);
-            affList[pos] = v;
+    for (int o = 16; o > 0; o >>= 1) {
+        const long long ob = __shfl_xor_sync(0xffffffffu, best, o);
+        const int op = __shfl_xor_sync(0xffffffffu, bestP, o);
+        if (ob < best || (ob == best && op < bestP)) {
+            best = ob;
+            bestP = op;
         }
+    }
+    if (lane == 0) {
+        const bool changed = (best != dist[v]);
+        parent[v] = bestP;
+        dist[v] = best;
+        if (changed && atomicCAS(&isAffected[v], 0, 1) == 0)
+            affList[atomicAdd(affCount, 1)] = v;
     }
 }
 
-/** Node-weighted variant of collectCandidatesKernel. */
-__global__ void collectCandidatesNW(const int* affList, int numAff,
-                                    const long long* rowStart, const int* deg,
-                                    const int* colInd, int* isCandidate,
-                                    int* candList, int* candCount,
-                                    int* isAffected, int source) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= numAff) return;
+/** Collect step, one warp per changed node: its neighbours become the next
+ *  candidates. A plain read of isCandidate skips the atomicCAS for nodes
+ *  that are already listed (the flag only goes 0 -> 1 in this kernel). */
+__global__ void collectCandidatesWarp(const int* affList, int numAff,
+                                      const long long* rowStart,
+                                      const int* deg, const int* colInd,
+                                      int* isCandidate, int* candList,
+                                      int* candCount, int* isAffected,
+                                      int source) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= numAff) return;
 
-    const int u = affList[tid];
-    isAffected[u] = 0;
+    const int u = affList[warp];
+    if (lane == 0) isAffected[u] = 0;
 
     const long long base = rowStart[u];
     const int d = deg[u];
-    for (int e = 0; e < d; ++e) {
+    for (int e = lane; e < d; e += 32) {
         const int nb = colInd[base + e];
         if (nb == source) continue;
-        if (atomicCAS(&isCandidate[nb], 0, 1) == 0) {
-            const int pos = atomicAdd(candCount, 1);
-            candList[pos] = nb;
-        }
+        if (isCandidate[nb] == 0 && atomicCAS(&isCandidate[nb], 0, 1) == 0)
+            candList[atomicAdd(candCount, 1)] = nb;
     }
 }
 
@@ -971,7 +981,7 @@ int propagate(const DeviceH2H& dev, HsospState& st,
     if (!startWithCandidates) {
         // Prime: collect candidates from the initial affected list.
         HSOSP_CUDA_CHECK(cudaMemset(d_candCount, 0, sizeof(int)));
-        collectCandidatesNW<<<gridFor(listCount, block), block>>>(
+        collectCandidatesWarp<<<gridFor(32LL * listCount, block), block>>>(
             st.d_affList, listCount, dev.d_rowStart, dev.d_deg, dev.d_colInd,
             st.d_isCandidate, st.d_candList, d_candCount, st.d_isAffected,
             source0);
@@ -988,7 +998,7 @@ int propagate(const DeviceH2H& dev, HsospState& st,
         maxFrontier = std::max(maxFrontier, candCount);
 
         HSOSP_CUDA_CHECK(cudaMemset(d_affCount, 0, sizeof(int)));
-        updateDistancesNW<<<gridFor(candCount, block), block>>>(
+        pullDistancesWarp<<<gridFor(32LL * candCount, block), block>>>(
             st.d_candList, candCount, dev.d_rowStart, dev.d_deg, dev.d_colInd,
             dev.d_nodeW, st.d_dist, st.d_parent, st.d_isCandidate,
             st.d_isAffected, st.d_affList, d_affCount, source0);
@@ -1003,7 +1013,7 @@ int propagate(const DeviceH2H& dev, HsospState& st,
         }
 
         HSOSP_CUDA_CHECK(cudaMemset(d_candCount, 0, sizeof(int)));
-        collectCandidatesNW<<<gridFor(affCount, block), block>>>(
+        collectCandidatesWarp<<<gridFor(32LL * affCount, block), block>>>(
             st.d_affList, affCount, dev.d_rowStart, dev.d_deg, dev.d_colInd,
             st.d_isCandidate, st.d_candList, d_candCount, st.d_isAffected,
             source0);

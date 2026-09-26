@@ -294,3 +294,23 @@ test with other seeds, 0 failures.
   rebuild, the CSV has `fallback_iters`, `invalidated`, `update_work` and
   `static_iters` next to `iters`, and the columns are documented in
   `docs/HSOSP.md` (`--work-budget` sets the update budget).
+
+## Performance
+
+Paper metric per batch = ESCHER maintenance + unification (line-graph delta)
++ CSR apply + SOSP update, as the paper defines its dynamic time
+(`t_dynamic_total_ms`); the static baseline is the GPU recompute alone
+(`t_static_ms`). Numbers in this section are single runs on coauth-DBLP
+50K hyperedge batches taken while developing; the before/after tables with
+medians of three runs are in [results/README.md](results/README.md).
+
+- **P3 warp-cooperative pull kernels** (`hsospDevice.cu`). The recompute
+  (static baseline, initial SSSP and the update's fallback) ran one thread
+  per candidate over its whole row with dependent loads (DBLP line-graph
+  rows: mean 102, max 3,016 entries) and an atomicCAS per neighbour. It now
+  runs one warp per candidate with coalesced row reads and a shuffle
+  min-reduction (ties to the lowest id), and the collect step reads the
+  candidate flag before the atomicCAS. Same algorithm and fixed point.
+  DBLP static recompute: 332-334 ms → 81-83 ms (4.1x). This speeds up the
+  baseline the dynamic time is compared with (the paper compares against
+  "the same GPU kernels"), so the reported speedup becomes smaller.
