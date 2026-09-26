@@ -157,3 +157,10 @@ pass: after every batch the three CBSTs hold exactly the host model's rows.
   results were not affected (its CSR files come from the host shadow).
   Regression: `test_dynamicgraph_roundtrip` (delete / insert rounds with
   `DynamicGraph::checkEscher`).
+- **E9 `buildDeviceH2H` headroom** (`hsosp/src/hsospDevice.cu`). An
+  `entryHeadroom` below 1 made the colInd capacity smaller than the row
+  layout and the host fill overran its vector (0.0: segmentation fault,
+  0.5: heap corruption). Values below 1 (and NaN) are now rejected with
+  `std::invalid_argument`, and the capacity is never below the layout.
+  Regression: `test_h2h_construction`; `test_h2h_delta` builds every third
+  configuration with headroom 1 so the overflow-rebuild path runs.

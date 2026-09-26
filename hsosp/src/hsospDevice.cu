@@ -283,6 +283,12 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
         throw std::runtime_error(
             "buildDeviceH2H: maxNodes too small for current hypergraph");
     }
+    // !(x >= 1) also rejects NaN. Below 1 the colInd capacity is smaller
+    // than the row layout and the host fill below overran its vector.
+    if (!(entryHeadroom >= 1.0)) {
+        throw std::invalid_argument(
+            "buildDeviceH2H: entryHeadroom must be >= 1");
+    }
     dev.free();
     dev.maxNodes = maxNodes;
     dev.numNodes = m;
@@ -305,7 +311,8 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
     }
     dev.usedEntries = cursor;
     dev.capEntries =
-        static_cast<long long>(static_cast<double>(cursor) * entryHeadroom) +
+        std::max(cursor, static_cast<long long>(static_cast<double>(cursor) *
+                                                entryHeadroom)) +
         4096;
 
     std::vector<int> colInd(static_cast<std::size_t>(dev.capEntries), 0);

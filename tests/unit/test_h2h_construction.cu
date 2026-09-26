@@ -7,6 +7,8 @@
  */
 
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -54,6 +56,28 @@ int main() {
             std::printf("FAIL cfg %d: device CSR != rebuilt line graph\n",
                         cfg);
             ++failures;
+        }
+    }
+    // entryHeadroom below 1 (or NaN) must be rejected, not overrun memory.
+    {
+        std::vector<std::vector<int>> rows = {{0}, {0, 1}, {1, 2}, {2}};
+        DynamicHypergraph::Caps caps;
+        caps.maxHyperedges = 16;
+        DynamicHypergraph dh(3, caps);
+        dh.bulkLoad(std::move(rows), {0, 3, 4, 0}, 1, 4);
+        for (double bad : {0.0, 0.5, std::nan("")}) {
+            hsosp::DeviceH2H dev;
+            bool threw = false;
+            try {
+                hsosp::buildDeviceH2H(dev, dh.host(), caps.maxHyperedges,
+                                      bad);
+            } catch (const std::invalid_argument&) {
+                threw = true;
+            }
+            if (!threw) {
+                std::printf("FAIL: entryHeadroom %g accepted\n", bad);
+                ++failures;
+            }
         }
     }
     std::printf("test_h2h_construction: %s\n",

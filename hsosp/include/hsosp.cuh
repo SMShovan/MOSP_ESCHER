@@ -66,8 +66,9 @@ struct DeviceH2H {
  *
  * @param hg            host hypergraph (adjacency + weights + liveness).
  * @param maxNodes      node capacity; must cover every id the run will see.
- * @param entryHeadroom colInd capacity = ceil(initial slack entries *
- *                      entryHeadroom); growth room for relocations.
+ * @param entryHeadroom colInd capacity = initial slack entries *
+ *                      entryHeadroom (+4096); growth room for relocations.
+ *                      Must be >= 1 (std::invalid_argument otherwise).
  */
 void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
                     double entryHeadroom);

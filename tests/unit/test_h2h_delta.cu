@@ -18,6 +18,7 @@
 using namespace escher_mosp;
 
 static int failures = 0;
+static int rebuilds = 0;
 
 int main() {
     std::mt19937_64 meta(31337);
@@ -40,8 +41,11 @@ int main() {
                     g.targetHe);
         HostHypergraph& hg = dh.host();
 
+        // Every third configuration has no spare CSR capacity (headroom 1),
+        // so rows relocate into a full tail and the overflow rebuild runs.
+        const double headroom = (cfg % 3 == 0) ? 1.0 : 1.3;
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.3);
+        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, headroom);
 
         for (int bi = 0; bi < 6 && failures == 0; ++bi) {
             BatchParams bp;
@@ -54,7 +58,8 @@ int main() {
 
             DynamicHypergraph::BatchResult br = dh.applyBatch(batch);
             if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
-                hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.3);
+                ++rebuilds;
+                hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, headroom);
             }
 
             LineGraphCSR lg = rebuildLineGraph(hg);
@@ -72,6 +77,7 @@ int main() {
             }
         }
     }
+    std::printf("device CSR overflow rebuilds: %d\n", rebuilds);
     std::printf("test_h2h_delta: %s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }
