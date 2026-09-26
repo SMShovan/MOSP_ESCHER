@@ -316,8 +316,7 @@ BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
     }
 
     t0 = Clock::now();
-    o.us = hsosp::hsospUpdate(ds.dev, ds.stateA, o.br.delta.seeds,
-                              o.br.delta.deadHe, hg.sourceHe, ucfg);
+    o.us = hsosp::hsospUpdate(ds.dev, ds.stateA, hg.sourceHe, ucfg);
     o.sospMs = msSince(t0);
 
     // ---- static baseline (timed) ---------------------------------------

@@ -415,7 +415,10 @@ int emulateLoop(const HostHypergraph& hg, std::vector<long long>& dist,
                 long long dp = dist[p - 1];
                 if (dp >= INF / 2) continue;
                 long long cd = dp + hg.heW[v - 1];
-                if (cd < best) { best = cd; bestP = p; }
+                if (cd < best || (cd == best && p < bestP)) {
+                    best = cd;
+                    bestP = p;
+                }
             }
             if (best != dist[v - 1]) {
                 dist[v - 1] = best;
@@ -454,29 +457,75 @@ int emulateSospRecompute(const HostHypergraph& hg,
 }
 
 int emulateSospUpdate(const HostHypergraph& hg, std::vector<long long>& dist,
-                      std::vector<int>& parent, const std::vector<int>& seeds,
-                      int maxIterations) {
-    // Arrays may need to grow when the batch introduced fresh ids.
-    if (static_cast<int>(dist.size()) < hg.maxId()) {
-        dist.resize(hg.maxId(), HostHypergraph::INF);
-        parent.resize(hg.maxId(), -1);
+                      std::vector<int>& parent, const H2HDelta& delta) {
+    const long long INF = HostHypergraph::INF;
+    const int m = hg.maxId();
+    if (static_cast<int>(dist.size()) < m) {
+        dist.resize(m, INF);
+        parent.resize(m, -1);
     }
-    // Dead nodes drop out of every adjacency list; pin them at INF.
-    for (int id = 1; id <= hg.maxId(); ++id) {
-        if (!hg.alive[id - 1]) {
-            dist[id - 1] = HostHypergraph::INF;
+    // Roots (pre-batch tree): deleted tree edges, new / recreated / dead.
+    std::vector<std::uint8_t> inv(m + 1, 0);
+    for (auto [a, b] : delta.delEdges) {
+        if (parent[b - 1] == a) inv[b] = 1;
+        if (parent[a - 1] == b) inv[a] = 1;
+    }
+    for (int id : delta.newHe) inv[id] = 1;
+    for (int id : delta.deadHe) inv[id] = 1;
+    // Subtrees of the roots (children lists of the pre-batch tree).
+    std::vector<std::vector<int>> children(m + 1);
+    for (int id = 1; id <= m; ++id)
+        if (parent[id - 1] >= 1) children[parent[id - 1]].push_back(id);
+    std::vector<int> stack;
+    for (int id = 1; id <= m; ++id)
+        if (inv[id]) stack.push_back(id);
+    while (!stack.empty()) {
+        const int u = stack.back();
+        stack.pop_back();
+        for (int c : children[u])
+            if (!inv[c]) {
+                inv[c] = 1;
+                stack.push_back(c);
+            }
+    }
+    int invalidated = 0;
+    for (int id = 1; id <= m; ++id) {
+        if (inv[id] && id != hg.sourceHe) {
+            dist[id - 1] = INF;
             parent[id - 1] = -1;
+            ++invalidated;
         }
     }
-    int it = emulateLoop(hg, dist, parent, seeds, maxIterations);
-    if (it < 0) {
-        // Convergence cap hit (stale-loop in a disconnected component).
-        // Fall back to a full recompute, exactly like the device path.
-        emulateSospRecompute(hg, dist, parent,
-                             std::max(maxIterations, hg.maxId() + 1));
-        return -1;
+    // (distance, parent id) comparisons: ties go to the lower id.
+    using Key = std::pair<long long, int>;
+    std::priority_queue<std::pair<Key, int>, std::vector<std::pair<Key, int>>,
+                        std::greater<std::pair<Key, int>>>
+        pq;
+    auto offer = [&](int v, long long d, int p) {
+        if (v == hg.sourceHe || !hg.alive[v - 1]) return;
+        if (Key(d, p) < Key(dist[v - 1], parent[v - 1] < 0 ? INT32_MAX
+                                                          : parent[v - 1])) {
+            dist[v - 1] = d;
+            parent[v - 1] = p;
+            pq.push({Key(d, p), v});
+        }
+    };
+    for (int id = 1; id <= m; ++id) {
+        if (!inv[id] || !hg.alive[id - 1]) continue;
+        for (int p : hg.h2h[id - 1])
+            if (dist[p - 1] < INF) offer(id, dist[p - 1] + hg.heW[id - 1], p);
     }
-    return it;
+    for (auto [a, b] : delta.insEdges) {
+        if (dist[a - 1] < INF) offer(b, dist[a - 1] + hg.heW[b - 1], a);
+        if (dist[b - 1] < INF) offer(a, dist[b - 1] + hg.heW[a - 1], b);
+    }
+    while (!pq.empty()) {
+        const auto [key, u] = pq.top();
+        pq.pop();
+        if (key != Key(dist[u - 1], parent[u - 1])) continue;
+        for (int v : hg.h2h[u - 1]) offer(v, dist[u - 1] + hg.heW[v - 1], u);
+    }
+    return invalidated;
 }
 
 } // namespace escher_mosp

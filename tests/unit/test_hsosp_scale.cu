@@ -76,8 +76,7 @@ int main() {
                 DynamicHypergraph::BatchResult br = dh.applyBatch(batch);
                 if (!hsosp::applyDeltaToDevice(dev, hg, br.delta))
                     hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.5);
-                hsosp::hsospUpdate(dev, st, br.delta.seeds, br.delta.deadHe,
-                                   hg.sourceHe, ucfg);
+                hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
             }
             LineGraphCSR lg = rebuildLineGraph(hg);
             const long long rowBad =

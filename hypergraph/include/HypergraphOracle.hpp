@@ -50,11 +50,11 @@ struct SospCheck {
 
 /**
  * Compares @p dist (indexed by id - 1) with @p reference and checks the
- * shortest-path tree: every reachable alive node other than the source has
- * a parent (0-based node index, the device convention; -1 = none) that is
- * alive, adjacent in @p lg and satisfies dist[v] = dist[parent] + w[v];
- * unreachable nodes have no parent. Pass an empty @p parent0 to skip the
- * tree check.
+ * shortest-path tree: the parent (0-based node index, the device
+ * convention; -1 = none) of every reachable alive node other than the
+ * source must be its canonical parent, the lowest-id neighbour p in @p lg
+ * with dist[v] = dist[p] + w[v]; unreachable nodes have no parent. Pass an
+ * empty @p parent0 to skip the tree check.
  */
 SospCheck checkSosp(const HostHypergraph& hg, const LineGraphCSR& lg,
                     const std::vector<long long>& reference,

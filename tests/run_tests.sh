@@ -60,6 +60,9 @@ run_case test_h2h_delta                  "$BIN/test_h2h_delta"
 run_case test_hsosp_matches_dijkstra     "$BIN/test_hsosp_matches_dijkstra"
 run_case test_hsosp_scale                "$BIN/test_hsosp_scale"
 
+echo "=== H-SOSP host core without a GPU (tests/local) ==="
+run_case local_tests bash -c "make -s -C '$ROOT/tests/local' && '$ROOT/tests/local/local_tests'"
+
 echo "=== H-SOSP randomized stress (pipeline vs independent oracle) ==="
 run_case hsospStress        "$BIN/hsospStress" --configs 50
 run_case hsospStress_escher "$BIN/hsospStress" --configs 20 --seed 11 \

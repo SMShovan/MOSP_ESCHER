@@ -63,17 +63,6 @@ __global__ void scatterLLKernel(const int* idx, const long long* vals, int n,
     if (tid < n) arr[idx[tid]] = vals[tid];
 }
 
-__global__ void markDeadKernel(const int* idx, int n, int* deg,
-                               long long* dist, int* parent) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < n) {
-        int v = idx[tid];
-        deg[v] = 0;
-        dist[v] = INF_VALUE;
-        parent[v] = -1;
-    }
-}
-
 /**
  * One thread per touched row: apply that row's deletions (swap-remove) then
  * insertions (append; relocate to the tail region on overflow). Race-free
@@ -164,7 +153,9 @@ __global__ void updateDistancesNW(
         const long long dp = dist[p];
         if (dp >= INF_VALUE / 2) continue;
         const long long cd = dp + nodeW[v];
-        if (cd < best) {
+        // Ties go to the lowest parent id (canonical tree), independent of
+        // the order of the row.
+        if (cd < best || (cd == best && p < bestP)) {
             best = cd;
             bestP = p;
         }
@@ -218,7 +209,244 @@ int gridFor(long long n, int block) {
     return static_cast<int>((n + block - 1) / block);
 }
 
+// ---------------------------------------------------------------------------
+// Incremental update kernels (hsospUpdate)
+// ---------------------------------------------------------------------------
+//
+// The update works on packed words (dist << 32 | parent): a 64-bit
+// atomicMin then keeps the smaller distance and, among equal distances,
+// the lower parent id. PACKED_INF marks an unreachable node; the source is
+// (0 << 32 | 0xffffffff). Distances must stay below PACKED_DIST_LIMIT; a
+// larger candidate raises the overflow counter and the update falls back
+// to the 64-bit recompute.
+
+using u64 = unsigned long long;
+constexpr u64 PACKED_INF = ~0ull;
+constexpr long long PACKED_DIST_LIMIT = 0xffffffffLL;
+
+// Update counters (device, mirrored to pinned host memory).
+enum UpdCounter {
+    kCntList = 0,     // invalidated nodes
+    kCntNext = 1,     // size of the next frontier
+    kCntActive = 2,   // pointer jumping still active
+    kCntWork = 3,     // edge relaxations
+    kCntOverflow = 4, // a distance did not fit 32 bits
+};
+
+__device__ __forceinline__ u64 packDist(long long d, int parent) {
+    return (static_cast<u64>(d) << 32) | static_cast<unsigned>(parent);
+}
+__device__ __forceinline__ long long packedDist(u64 x) {
+    return static_cast<long long>(x >> 32);
+}
+__device__ __forceinline__ int packedParent(u64 x) {
+    return static_cast<int>(static_cast<unsigned>(x & 0xffffffffu));
+}
+
+__global__ void packStateKernel(const long long* dist, const int* parent,
+                                u64* packed, int n, u64* counters) {
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    const long long d = dist[v];
+    if (d >= INF_VALUE / 2) {
+        packed[v] = PACKED_INF;
+    } else {
+        if (d >= PACKED_DIST_LIMIT) atomicAdd(&counters[kCntOverflow], 1ull);
+        packed[v] = packDist(d, parent[v]);
+    }
+}
+
+__global__ void unpackStateKernel(const u64* packed, long long* dist,
+                                  int* parent, int n) {
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    const u64 x = packed[v];
+    if (x == PACKED_INF) {
+        dist[v] = INF_VALUE;
+        parent[v] = -1;
+    } else {
+        dist[v] = packedDist(x);
+        parent[v] = packedParent(x);
+    }
+}
+
+// Roots: b of a deleted pair (a, b) whose tree parent was a (and vice
+// versa), from the pre-batch packed state.
+__global__ void markDeletedTreeEdgesKernel(const int2* pairs, int nDel,
+                                           const u64* packed, int* inv) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nDel) return;
+    const int a = pairs[i].x, b = pairs[i].y;
+    const u64 pa = packed[a], pb = packed[b];
+    if (pb != PACKED_INF && packedParent(pb) == a) inv[b] = 1;
+    if (pa != PACKED_INF && packedParent(pa) == b) inv[a] = 1;
+}
+
+__global__ void markIdsKernel(const int* ids, int n, int* inv) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) inv[ids[i]] = 1;
+}
+
+__global__ void zeroDegreeKernel(const int* ids, int n, int* deg) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) deg[ids[i]] = 0;
+}
+
+__global__ void initJumpKernel(const u64* packed, int* jump, int n) {
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    const u64 x = packed[v];
+    const int p = (x == PACKED_INF) ? -1 : packedParent(x);
+    jump[v] = (p == -1) ? -1 : p;
+}
+
+// One pointer-jumping round (double buffered): a node is invalidated if it
+// or its current ancestor is; otherwise its ancestor pointer doubles. After
+// ceil(log2(depth)) + 1 rounds every descendant of a root is marked.
+__global__ void jumpKernel(const int* invIn, int* invOut, const int* jumpIn,
+                           int* jumpOut, int n, u64* counters) {
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    const int iv = invIn[v];
+    const int j = jumpIn[v];
+    if (iv || j < 0) {
+        invOut[v] = iv;
+        jumpOut[v] = -1;
+        return;
+    }
+    const int ij = invIn[j];
+    const int jj = jumpIn[j];
+    invOut[v] = ij;
+    jumpOut[v] = ij ? -1 : jj;
+    if (!ij && jj >= 0) counters[kCntActive] = 1;
+}
+
+__global__ void invalidateKernel(const int* inv, u64* packed, int* list,
+                                 u64* counters, int n, int source) {
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    if (inv[v] && v != source) {
+        packed[v] = PACKED_INF;
+        list[atomicAdd(&counters[kCntList], 1ull)] = v;
+    }
+}
+
+// Enqueues v for the frontier of epoch ep unless it already is (epoch
+// stamps instead of a reset flag, which raced with concurrent pushes).
+__device__ __forceinline__ void enqueue(int v, int* stamp, int ep, int* next,
+                                        u64* counters) {
+    if (atomicMax(&stamp[v], ep) < ep)
+        next[atomicAdd(&counters[kCntNext], 1ull)] = v;
+}
+
+// Relaxes v with the candidate word c; enqueues v when it improved.
+__device__ __forceinline__ void relax(u64* packed, int v, u64 c, int* stamp,
+                                      int ep, int* next, u64* counters) {
+    if (c < packed[v]) {
+        const u64 old = atomicMin(&packed[v], c);
+        if (c < old) enqueue(v, stamp, ep, next, counters);
+    }
+}
+
+// One warp per invalidated node: best (distance, id) over its neighbours.
+__global__ void pullInvalidatedKernel(const int* list, int nList,
+                                      const long long* rowStart,
+                                      const int* deg, const int* colInd,
+                                      const long long* nodeW, u64* packed,
+                                      int* stamp, int ep, int* next,
+                                      u64* counters) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= nList) return;
+    const int v = list[warp];
+    const long long base = rowStart[v];
+    const int d = deg[v];
+    const long long wv = nodeW[v];
+    u64 best = PACKED_INF;
+    bool overflow = false;
+    for (int e = lane; e < d; e += 32) {
+        const int p = colInd[base + e];
+        const u64 x = packed[p];
+        if (x == PACKED_INF) continue;
+        const long long cd = packedDist(x) + wv;
+        if (cd >= PACKED_DIST_LIMIT) {
+            overflow = true;
+            continue;
+        }
+        const u64 c = packDist(cd, p);
+        if (c < best) best = c;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const u64 y = __shfl_xor_sync(0xffffffffu, best, o);
+        if (y < best) best = y;
+    }
+    overflow = __any_sync(0xffffffffu, overflow);
+    if (lane == 0) {
+        atomicAdd(&counters[kCntWork], static_cast<u64>(d));
+        if (overflow) atomicAdd(&counters[kCntOverflow], 1ull);
+        if (best != PACKED_INF) relax(packed, v, best, stamp, ep, next, counters);
+    }
+}
+
+// Both directions of every inserted pair.
+__global__ void relaxInsertedKernel(const int2* pairs, int nIns,
+                                    const long long* nodeW, u64* packed,
+                                    int* stamp, int ep, int* next,
+                                    u64* counters, int source) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nIns) return;
+    const int ab[2] = {pairs[i].x, pairs[i].y};
+    for (int k = 0; k < 2; ++k) {
+        const int u = ab[k], v = ab[1 - k];
+        if (v == source) continue;
+        const u64 x = packed[u];
+        if (x == PACKED_INF) continue;
+        const long long cd = packedDist(x) + nodeW[v];
+        if (cd >= PACKED_DIST_LIMIT) {
+            atomicAdd(&counters[kCntOverflow], 1ull);
+            continue;
+        }
+        relax(packed, v, packDist(cd, u), stamp, ep, next, counters);
+    }
+}
+
+// One warp per frontier node: push its current word to the neighbours
+// (decrease-only).
+__global__ void pushKernel(const int* front, int nFront,
+                           const long long* rowStart, const int* deg,
+                           const int* colInd, const long long* nodeW,
+                           u64* packed, int* stamp, int ep, int* next,
+                           u64* counters, int source) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= nFront) return;
+    const int u = front[warp];
+    const u64 x = packed[u];
+    if (x == PACKED_INF) return;
+    const long long du = packedDist(x);
+    const long long base = rowStart[u];
+    const int d = deg[u];
+    bool overflow = false;
+    for (int e = lane; e < d; e += 32) {
+        const int v = colInd[base + e];
+        if (v == source) continue;
+        const long long cd = du + nodeW[v];
+        if (cd >= PACKED_DIST_LIMIT) {
+            overflow = true;
+            continue;
+        }
+        relax(packed, v, packDist(cd, u), stamp, ep, next, counters);
+    }
+    overflow = __any_sync(0xffffffffu, overflow);
+    if (lane == 0) {
+        atomicAdd(&counters[kCntWork], static_cast<u64>(d));
+        if (overflow) atomicAdd(&counters[kCntOverflow], 1ull);
+    }
+}
+
 } // namespace
+
+constexpr int kUpdCounters = 8;
 
 // ---------------------------------------------------------------------------
 // DeviceH2H
@@ -241,7 +469,34 @@ void DeviceH2H::free() {
     d_overflowFlag = nullptr;
 }
 
-DeviceH2H::~DeviceH2H() { free(); }
+void DeviceDelta::reserve(long long pairs, long long ids) {
+    if (pairs > pairCapacity) {
+        if (d_pairs) cudaFree(d_pairs);
+        pairCapacity = pairs + pairs / 2 + 1024;
+        HSOSP_CUDA_CHECK(cudaMalloc(&d_pairs, sizeof(int2) * pairCapacity));
+    }
+    if (ids > idCapacity) {
+        if (d_ids) cudaFree(d_ids);
+        idCapacity = ids + ids / 2 + 1024;
+        HSOSP_CUDA_CHECK(cudaMalloc(&d_ids, sizeof(int) * idCapacity));
+    }
+}
+
+void DeviceDelta::free() {
+    if (d_pairs) cudaFree(d_pairs);
+    if (d_ids) cudaFree(d_ids);
+    d_pairs = nullptr;
+    d_ids = nullptr;
+    pairCapacity = idCapacity = 0;
+    numDel = numIns = numNew = numDead = 0;
+}
+
+// free() releases the graph arrays only: buildDeviceH2H (also used to
+// rebuild after a tail overflow) keeps the last delta for hsospUpdate.
+DeviceH2H::~DeviceH2H() {
+    free();
+    delta.free();
+}
 
 DeviceH2H::DeviceH2H(DeviceH2H&& o) noexcept { *this = std::move(o); }
 
@@ -259,6 +514,10 @@ DeviceH2H& DeviceH2H::operator=(DeviceH2H&& o) noexcept {
         d_nodeW = o.d_nodeW;
         d_tailCursor = o.d_tailCursor;
         d_overflowFlag = o.d_overflowFlag;
+        numEntries = o.numEntries;
+        delta.free();
+        delta = o.delta;
+        o.delta = DeviceDelta{};
         o.d_rowStart = nullptr;
         o.d_deg = nullptr;
         o.d_cap = nullptr;
@@ -299,9 +558,11 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
     std::vector<long long> nodeW(maxNodes, 0);
 
     long long cursor = 0;
+    dev.numEntries = 0;
     for (int id = 1; id <= m; ++id) {
         const int d =
             hg.alive[id - 1] ? static_cast<int>(hg.h2h[id - 1].size()) : 0;
+        dev.numEntries += d;
         const int c = rowCapacityFor(d);
         rowStart[id - 1] = cursor;
         deg[id - 1] = d;
@@ -380,6 +641,35 @@ bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
 
     const int nRows = static_cast<int>(rowOps.size());
     dev.numNodes = m;
+    dev.numEntries += 2LL * (static_cast<long long>(delta.insEdges.size()) -
+                             static_cast<long long>(delta.delEdges.size()));
+
+    // Keep the delta on the device for hsospUpdate (0-based indices).
+    {
+        DeviceDelta& dd = dev.delta;
+        std::vector<int2> pairs;
+        pairs.reserve(delta.delEdges.size() + delta.insEdges.size());
+        for (auto [a, b] : delta.delEdges) pairs.push_back(make_int2(a - 1, b - 1));
+        for (auto [a, b] : delta.insEdges) pairs.push_back(make_int2(a - 1, b - 1));
+        std::vector<int> ids;
+        ids.reserve(delta.newHe.size() + delta.deadHe.size());
+        for (int id : delta.newHe) ids.push_back(id - 1);
+        for (int id : delta.deadHe) ids.push_back(id - 1);
+        dd.reserve(static_cast<long long>(pairs.size()),
+                   static_cast<long long>(ids.size()));
+        if (!pairs.empty())
+            HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_pairs, pairs.data(),
+                                        sizeof(int2) * pairs.size(),
+                                        cudaMemcpyHostToDevice));
+        if (!ids.empty())
+            HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_ids, ids.data(),
+                                        sizeof(int) * ids.size(),
+                                        cudaMemcpyHostToDevice));
+        dd.numDel = static_cast<int>(delta.delEdges.size());
+        dd.numIns = static_cast<int>(delta.insEdges.size());
+        dd.numNew = static_cast<int>(delta.newHe.size());
+        dd.numDead = static_cast<int>(delta.deadHe.size());
+    }
 
     if (nRows > 0) {
         std::vector<int> rows;
@@ -517,6 +807,22 @@ void HsospState::free() {
     if (d_candList) cudaFree(d_candList);
     if (d_affList) cudaFree(d_affList);
     if (d_counters) cudaFree(d_counters);
+    if (d_packed) cudaFree(d_packed);
+    if (d_invA) cudaFree(d_invA);
+    if (d_invB) cudaFree(d_invB);
+    if (d_jumpA) cudaFree(d_jumpA);
+    if (d_jumpB) cudaFree(d_jumpB);
+    if (d_front) cudaFree(d_front);
+    if (d_next) cudaFree(d_next);
+    if (d_stamp) cudaFree(d_stamp);
+    if (d_updCounters) cudaFree(d_updCounters);
+    if (h_updCounters) cudaFreeHost(h_updCounters);
+    d_packed = nullptr;
+    d_invA = d_invB = d_jumpA = d_jumpB = nullptr;
+    d_front = d_next = d_stamp = nullptr;
+    d_updCounters = nullptr;
+    h_updCounters = nullptr;
+    epoch = 0;
     d_dist = nullptr;
     d_parent = nullptr;
     d_isAffected = nullptr;
@@ -541,6 +847,22 @@ HsospState& HsospState::operator=(HsospState&& o) noexcept {
         d_candList = o.d_candList;
         d_affList = o.d_affList;
         d_counters = o.d_counters;
+        d_packed = o.d_packed;
+        d_invA = o.d_invA;
+        d_invB = o.d_invB;
+        d_jumpA = o.d_jumpA;
+        d_jumpB = o.d_jumpB;
+        d_front = o.d_front;
+        d_next = o.d_next;
+        d_stamp = o.d_stamp;
+        d_updCounters = o.d_updCounters;
+        h_updCounters = o.h_updCounters;
+        epoch = o.epoch;
+        o.d_packed = nullptr;
+        o.d_invA = o.d_invB = o.d_jumpA = o.d_jumpB = nullptr;
+        o.d_front = o.d_next = o.d_stamp = nullptr;
+        o.d_updCounters = nullptr;
+        o.h_updCounters = nullptr;
         o.d_dist = nullptr;
         o.d_parent = nullptr;
         o.d_isAffected = nullptr;
@@ -562,6 +884,20 @@ void HsospState::allocate(int n) {
     HSOSP_CUDA_CHECK(cudaMalloc(&d_candList, sizeof(int) * n));
     HSOSP_CUDA_CHECK(cudaMalloc(&d_affList, sizeof(int) * n));
     HSOSP_CUDA_CHECK(cudaMalloc(&d_counters, sizeof(int) * 2));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_packed, sizeof(unsigned long long) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_invA, sizeof(int) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_invB, sizeof(int) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_jumpA, sizeof(int) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_jumpB, sizeof(int) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_front, sizeof(int) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_next, sizeof(int) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_stamp, sizeof(int) * n));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_updCounters,
+                                sizeof(unsigned long long) * kUpdCounters));
+    HSOSP_CUDA_CHECK(cudaMallocHost(&h_updCounters,
+                                    sizeof(unsigned long long) * kUpdCounters));
+    HSOSP_CUDA_CHECK(cudaMemset(d_stamp, 0, sizeof(int) * n));
+    epoch = 0;
 
     const int block = 256;
     fillLLKernel<<<gridFor(n, block), block>>>(d_dist, n, INF_VALUE);
@@ -573,8 +909,9 @@ void HsospState::allocate(int n) {
 
 long long HsospState::deviceBytes() const {
     return static_cast<long long>(maxNodes) *
-               (sizeof(long long) + 5 * sizeof(int)) +
-           2 * sizeof(int);
+               (sizeof(long long) + 5 * sizeof(int) +
+                sizeof(unsigned long long) + 8 * sizeof(int)) +
+           2 * sizeof(int) + kUpdCounters * sizeof(unsigned long long);
 }
 
 void HsospState::downloadDistances(std::vector<long long>& dist,
@@ -712,51 +1049,131 @@ UpdateStats hsospRecompute(const DeviceH2H& dev, HsospState& st, int sourceId,
     return stats;
 }
 
-UpdateStats hsospUpdate(const DeviceH2H& dev, HsospState& st,
-                        const std::vector<int>& seedIds,
-                        const std::vector<int>& deadIds, int sourceId,
+UpdateStats hsospUpdate(const DeviceH2H& dev, HsospState& st, int sourceId,
                         const UpdateConfig& cfg) {
     UpdateStats stats;
+    const int n = dev.numNodes;
     const int source0 = sourceId - 1;
-    stats.seedCount = static_cast<long long>(seedIds.size());
+    const int block = 256;
+    const DeviceDelta& dd = dev.delta;
+    const int2* delPairs = dd.d_pairs;
+    const int2* insPairs = dd.d_pairs + dd.numDel;
+    const int* newIds = dd.d_ids;
+    const int* deadIds = dd.d_ids + dd.numNew;
+    u64* cnt = st.d_updCounters;
+    u64* hcnt = st.h_updCounters;
+    auto readCounters = [&]() {
+        HSOSP_CUDA_CHECK(cudaMemcpy(hcnt, cnt, sizeof(u64) * kUpdCounters,
+                                    cudaMemcpyDeviceToHost));
+    };
 
-    // Dead nodes: distance INF, no parent, degree already zeroed by the
-    // delta (their edges are all in delEdges); force deg=0 anyway.
-    if (!deadIds.empty()) {
-        std::vector<int> idx;
-        idx.reserve(deadIds.size());
-        for (int id : deadIds) idx.push_back(id - 1);
-        int* d_idx = nullptr;
-        HSOSP_CUDA_CHECK(cudaMalloc(&d_idx, idx.size() * sizeof(int)));
-        HSOSP_CUDA_CHECK(cudaMemcpy(d_idx, idx.data(),
-                                    idx.size() * sizeof(int),
-                                    cudaMemcpyHostToDevice));
-        const int block = 256;
-        markDeadKernel<<<gridFor(idx.size(), block), block>>>(
-            d_idx, static_cast<int>(idx.size()), dev.d_deg, st.d_dist,
-            st.d_parent);
+    // Dead nodes have no edges left (all their pairs are in the delta);
+    // zero their degree anyway so they can never be pushed from.
+    if (dd.numDead > 0)
+        zeroDegreeKernel<<<gridFor(dd.numDead, block), block>>>(
+            deadIds, dd.numDead, dev.d_deg);
+
+    // 1. Pack the pre-batch state; mark the roots.
+    HSOSP_CUDA_CHECK(cudaMemset(cnt, 0, sizeof(u64) * kUpdCounters));
+    packStateKernel<<<gridFor(n, block), block>>>(st.d_dist, st.d_parent,
+                                                  st.d_packed, n, cnt);
+    HSOSP_CUDA_CHECK(cudaMemset(st.d_invA, 0, sizeof(int) * n));
+    if (dd.numDel > 0)
+        markDeletedTreeEdgesKernel<<<gridFor(dd.numDel, block), block>>>(
+            delPairs, dd.numDel, st.d_packed, st.d_invA);
+    if (dd.numNew + dd.numDead > 0)
+        markIdsKernel<<<gridFor(dd.numNew + dd.numDead, block), block>>>(
+            newIds, dd.numNew + dd.numDead, st.d_invA);
+    HSOSP_CUDA_CHECK(cudaGetLastError());
+
+    // 2. Invalidate the subtrees of the roots by pointer jumping. A parent
+    //    cycle cannot occur with positive weights; the round cap only
+    //    guards against a corrupt tree (then: fall back).
+    initJumpKernel<<<gridFor(n, block), block>>>(st.d_packed, st.d_jumpA, n);
+    int* invIn = st.d_invA;
+    int* invOut = st.d_invB;
+    int* jumpIn = st.d_jumpA;
+    int* jumpOut = st.d_jumpB;
+    bool treeOk = false;
+    for (int round = 0; round < 64; ++round) {
+        HSOSP_CUDA_CHECK(
+            cudaMemset(cnt + kCntActive, 0, sizeof(u64)));
+        jumpKernel<<<gridFor(n, block), block>>>(invIn, invOut, jumpIn,
+                                                 jumpOut, n, cnt);
         HSOSP_CUDA_CHECK(cudaGetLastError());
-        HSOSP_CUDA_CHECK(cudaDeviceSynchronize());
-        cudaFree(d_idx);
+        std::swap(invIn, invOut);
+        std::swap(jumpIn, jumpOut);
+        ++stats.jumpRounds;
+        readCounters();
+        if (hcnt[kCntActive] == 0) {
+            treeOk = true;
+            break;
+        }
+    }
+    const double workLimit =
+        cfg.workBudget * static_cast<double>(std::max(1LL, dev.numEntries));
+    bool budgetExceeded = !treeOk;
+
+    if (!budgetExceeded) {
+        invalidateKernel<<<gridFor(n, block), block>>>(
+            invIn, st.d_packed, st.d_front, cnt, n, source0);
+        readCounters();
+        const int nInv = static_cast<int>(hcnt[kCntList]);
+        stats.seedCount = nInv;
+
+        // 3. Pull for the invalidated nodes, relax the inserted pairs; the
+        //    improved nodes form the first frontier (epoch stamps).
+        const int ep0 = ++st.epoch;
+        HSOSP_CUDA_CHECK(cudaMemset(cnt + kCntNext, 0, sizeof(u64)));
+        if (nInv > 0)
+            pullInvalidatedKernel<<<gridFor(32LL * nInv, block), block>>>(
+                st.d_front, nInv, dev.d_rowStart, dev.d_deg, dev.d_colInd,
+                dev.d_nodeW, st.d_packed, st.d_stamp, ep0, st.d_next, cnt);
+        if (dd.numIns > 0)
+            relaxInsertedKernel<<<gridFor(dd.numIns, block), block>>>(
+                insPairs, dd.numIns, dev.d_nodeW, st.d_packed, st.d_stamp,
+                ep0, st.d_next, cnt, source0);
+        HSOSP_CUDA_CHECK(cudaGetLastError());
+        readCounters();
+
+        // 4. Push until no distance decreases (or the budget is spent).
+        int frontier = static_cast<int>(hcnt[kCntNext]);
+        stats.maxFrontier = frontier;
+        while (frontier > 0) {
+            if (stats.iterations >= cfg.maxIterations ||
+                static_cast<double>(hcnt[kCntWork]) > workLimit ||
+                hcnt[kCntOverflow] != 0) {
+                budgetExceeded = true;
+                break;
+            }
+            ++stats.iterations;
+            std::swap(st.d_front, st.d_next);
+            const int ep = ++st.epoch;
+            HSOSP_CUDA_CHECK(cudaMemset(cnt + kCntNext, 0, sizeof(u64)));
+            pushKernel<<<gridFor(32LL * frontier, block), block>>>(
+                st.d_front, frontier, dev.d_rowStart, dev.d_deg,
+                dev.d_colInd, dev.d_nodeW, st.d_packed, st.d_stamp, ep,
+                st.d_next, cnt, source0);
+            HSOSP_CUDA_CHECK(cudaGetLastError());
+            readCounters();
+            frontier = static_cast<int>(hcnt[kCntNext]);
+            stats.maxFrontier = std::max(stats.maxFrontier, frontier);
+        }
+        stats.work = static_cast<long long>(hcnt[kCntWork]);
+        if (hcnt[kCntOverflow] != 0) budgetExceeded = true;
     }
 
-    if (seedIds.empty()) return stats;
-
-    std::vector<int> seeds0;
-    seeds0.reserve(seedIds.size());
-    for (int id : seedIds) seeds0.push_back(id - 1);
-
-    int it = propagate(dev, st, seeds0, /*startWithCandidates=*/true, source0,
-                       cfg, &stats.maxFrontier);
-    if (it < 0) {
-        // Stale-loop in a disconnected region: fall back to the (always
-        // convergent) recompute, exactly like the host emulation.
+    if (budgetExceeded) {
+        // Exact fallback: recompute from scratch (64-bit distances).
         stats.fallbackRecompute = true;
         UpdateStats rs = hsospRecompute(dev, st, sourceId, cfg);
-        stats.iterations = rs.iterations;
+        stats.fallbackIterations = rs.iterations;
         stats.maxFrontier = std::max(stats.maxFrontier, rs.maxFrontier);
     } else {
-        stats.iterations = it;
+        unpackStateKernel<<<gridFor(n, block), block>>>(
+            st.d_packed, st.d_dist, st.d_parent, n);
+        HSOSP_CUDA_CHECK(cudaGetLastError());
+        HSOSP_CUDA_CHECK(cudaDeviceSynchronize());
     }
     return stats;
 }

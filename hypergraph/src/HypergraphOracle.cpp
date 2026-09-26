@@ -130,9 +130,14 @@ SospCheck checkSosp(const HostHypergraph& hg, const LineGraphCSR& lg,
             if (p != 0) ++c.parentErrors;
             continue;
         }
-        if (p < 1 || p > m || !hg.alive[p - 1] || !lg.adjacent(id, p) ||
-            reference[p - 1] + hg.heW[id - 1] != reference[id - 1])
-            ++c.parentErrors;
+        // The canonical parent: the lowest-id neighbour on a shortest path
+        // (rows are sorted, so the first tight neighbour).
+        int canonical = 0;
+        const int* r = lg.row(id);
+        for (long long k = 0; k < lg.degree(id) && canonical == 0; ++k)
+            if (reference[r[k] - 1] + hg.heW[id - 1] == reference[id - 1])
+                canonical = r[k];
+        if (p != canonical) ++c.parentErrors;
     }
     return c;
 }

@@ -253,3 +253,36 @@ test with other seeds, 0 failures.
   selects the batches the independent oracle checks (all / first / none).
   On coauth-DBLP this gives 2,466,792 hyperedges and 1,924,991 vertices
   (the paper lists 2,466,661 / 1,924,991).
+- **S1 count-to-infinity and the every-batch fallback**
+  (`hsosp/src/hsospDevice.cu`). The update re-evaluated seed nodes by pull
+  with no invalidation: after a deletion, nodes that lost their tree path
+  kept stale finite distances that rose by at least 1 per iteration and
+  never converged, so every batch with a disconnection ran 512 capped
+  iterations and then a full recompute (all baseline DBLP batches did;
+  the update was never cheaper than the recompute it is compared with).
+  `hsospUpdate` is now exact and incremental: roots (the endpoint of every
+  deleted tree edge; new, recreated and dead nodes) → pointer-jumping
+  invalidation of their pre-batch subtrees → one warp-cooperative pull per
+  invalidated node and relaxation of both directions of every inserted pair
+  → push to convergence with a packed 64-bit atomicMin on
+  (distance << 32 | parent) and epoch-stamped frontiers. After invalidation
+  every finite distance is realised by a path of the new graph, so values
+  only decrease and no cap is needed. A work budget (default: as many edge
+  relaxations as the graph has adjacency entries) and an iteration budget
+  (4,096) fall back to the recompute, whose time is part of the reported
+  update time; so does a distance that would not fit 32 bits (the packed
+  word). Ties go to the lowest parent id in the update and the recompute,
+  so parents are canonical and the oracle now checks them exactly. The
+  host emulation (`emulateSospUpdate`, GPU-free `tests/local`) implements
+  the same algorithm. The update needs the batch's pairs on the device;
+  `applyDeltaToDevice` keeps them in `DeviceH2H::delta` (the seeds list is
+  no longer used).
+  DBLP, 50K hyperedge batches (other stages unchanged at this commit): SOSP
+  stage 5.1-5.8 ms (batches 2-3; 12-13 push iterations, no fallback) against
+  473-482 ms for the original (512 capped iterations + recompute); batch 1
+  still pays a ~0.38 s host allocator stall (see P5). All three batches
+  matched the oracle (distances and canonical parents).
+  Regression: `hsospStress` (1,500 batches, budget disabled so every batch
+  takes the incremental path; 0 failures), `test_hsosp_matches_dijkstra`
+  (alternating batches with a zero budget exercise the fallback),
+  `test_hsosp_scale`.

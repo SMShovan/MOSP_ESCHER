@@ -156,19 +156,21 @@ private:
 };
 
 /**
- * @brief Sequential emulation of the device SOSP update loop.
+ * @brief Sequential emulation of the device SOSP update (hsospUpdate).
  *
- * Mirrors hsospUpdate()'s semantics exactly (recompute-best-parent per
- * candidate, propagate while distances change, iteration cap with
- * recompute-from-blank fallback) so the algorithm's correctness against
- * Dijkstra can be validated without a GPU. Returns the iteration count
- * actually used, or -1 if the fallback recompute was taken.
+ * Same steps as the device, so the algorithm can be validated without a
+ * GPU: invalidate the pre-batch subtree of every deleted tree edge and of
+ * every new, recreated or dead node (distance INF), pull the best
+ * (distance, id) for the invalidated nodes, relax both directions of the
+ * inserted pairs, then propagate the decreases (in Dijkstra order; the
+ * device pushes in frontiers, which gives the same result). Parents are
+ * 1-based ids (-1 = none) and ties go to the lowest id. Returns the number
+ * of invalidated nodes.
  */
 int emulateSospUpdate(const HostHypergraph& hg,
                       std::vector<long long>& dist,
                       std::vector<int>& parent,
-                      const std::vector<int>& seeds,
-                      int maxIterations);
+                      const H2HDelta& delta);
 
 /** Sequential emulation of recompute-from-blank (static baseline). */
 int emulateSospRecompute(const HostHypergraph& hg,

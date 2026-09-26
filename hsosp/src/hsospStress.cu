@@ -11,6 +11,9 @@
  * --check-escher) of the ESCHER CBST contents; non-zero exit and a
  * reproduction seed on the first failure.
  *
+ * The update budget is disabled, so every batch runs the incremental
+ * update (a fallback would be a from-scratch recompute).
+ *
  * Usage: hsospStress [--configs N] [--seed S] [--check-escher]
  */
 
@@ -80,7 +83,10 @@ int main(int argc, char** argv) {
         st.allocate(caps.maxHyperedges);
 
         hsosp::UpdateConfig ucfg;
-        ucfg.maxIterations = 256;
+        // No update budget: every batch exercises the incremental path (the
+        // budget fallback is the recompute, tested on its own).
+        ucfg.maxIterations = 1 << 30;
+        ucfg.workBudget = 1e30;
         hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
 
         // Initial solve must already match the oracle.
@@ -128,8 +134,7 @@ int main(int argc, char** argv) {
             if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
                 hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.5);
             }
-            hsosp::UpdateStats us = hsosp::hsospUpdate(
-                dev, st, br.delta.seeds, br.delta.deadHe, hg.sourceHe, ucfg);
+            hsosp::UpdateStats us = hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
             if (us.fallbackRecompute) ++fallbacks;
 
             // Oracle: line graph rebuilt from the incidence lists.

@@ -18,6 +18,7 @@
 using namespace escher_mosp;
 
 static int failures = 0;
+static int fallbacksTaken = 0;
 
 static bool distsMatch(const hsosp::HsospState& st,
                        const HostHypergraph& hg, const char* what, int cfg) {
@@ -36,8 +37,11 @@ static bool distsMatch(const hsosp::HsospState& st,
 
 int main() {
     std::mt19937_64 meta(777);
+    // No budget: the incremental path runs on every batch; the budget
+    // fallback is tested separately below.
     hsosp::UpdateConfig ucfg;
-    ucfg.maxIterations = 256;
+    ucfg.maxIterations = 1 << 30;
+    ucfg.workBudget = 1e30;
 
     // ---- randomized configurations --------------------------------------
     for (int cfg = 0; cfg < 20 && failures == 0; ++cfg) {
@@ -81,9 +85,16 @@ int main() {
             if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
                 hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
             }
-            hsosp::hsospUpdate(dev, st, br.delta.seeds, br.delta.deadHe,
-                               hg.sourceHe, ucfg);
-            if (!distsMatch(st, hg, "update", cfg)) break;
+            // Every other batch with a zero budget: the fallback recompute
+            // (taken unless the batch needs no propagation) must give the
+            // same canonical result.
+            hsosp::UpdateConfig c = ucfg;
+            if (bi % 2 == 1) c.workBudget = 0.0;
+            hsosp::UpdateStats us =
+                hsosp::hsospUpdate(dev, st, hg.sourceHe, c);
+            fallbacksTaken += us.fallbackRecompute ? 1 : 0;
+            if (!distsMatch(st, hg, bi % 2 ? "fallback" : "update", cfg))
+                break;
         }
     }
 
@@ -111,9 +122,13 @@ int main() {
         if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
             hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
         }
-        hsosp::hsospUpdate(dev, st, br.delta.seeds, br.delta.deadHe,
-                           hg.sourceHe, ucfg);
+        hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
         distsMatch(st, hg, "disconnect", 9999);
+    }
+
+    if (fallbacksTaken == 0) {
+        std::printf("FAIL: the zero budget never triggered the fallback\n");
+        ++failures;
     }
 
     // ---- targeted placement deletes SOSP-tree parents ------------------

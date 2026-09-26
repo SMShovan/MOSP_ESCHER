@@ -53,7 +53,7 @@ int main() {
     std::mt19937_64 metaRng(20260725);
 
     const int CONFIGS = 60;
-    int totalBatches = 0, fallbacks = 0;
+    int totalBatches = 0;
 
     for (int cfg = 0; cfg < CONFIGS; ++cfg) {
         GenParams gp;
@@ -150,8 +150,7 @@ int main() {
                   pairs / 2, hg.h2hPairCount);
 
             // ---- 4. dynamic update == dijkstra --------------------------
-            int it = emulateSospUpdate(hg, dist, parent, delta.seeds, 512);
-            if (it < 0) ++fallbacks;
+            emulateSospUpdate(hg, dist, parent, delta);
             auto truth = hg.dijkstra(hg.sourceHe);
             for (int id = 1; id <= hg.maxId(); ++id) {
                 if (truth[id - 1] != dist[id - 1]) {
@@ -211,8 +210,7 @@ int main() {
         H2HDelta delta;
         EscherHorizOps ops;
         hg.applyBatch(batch, {}, delta, ops);
-        int it = emulateSospUpdate(hg, dist, parent, delta.seeds, 512);
-        (void)it;
+        emulateSospUpdate(hg, dist, parent, delta);
         CHECK(dist[4] >= HostHypergraph::INF / 2 &&
                   dist[5] >= HostHypergraph::INF / 2 &&
                   dist[6] >= HostHypergraph::INF / 2,
@@ -221,8 +219,8 @@ int main() {
         CHECK(truth == dist, "forced: update != dijkstra after disconnect");
     }
 
-    std::printf("local_tests: %d configs, %d batches, %d fallbacks, "
+    std::printf("local_tests: %d configs, %d batches, "
                 "%d failures\n",
-                CONFIGS, totalBatches, fallbacks, failures);
+                CONFIGS, totalBatches, failures);
     return failures == 0 ? 0 : 1;
 }

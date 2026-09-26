@@ -35,6 +35,25 @@
 namespace escher_mosp {
 namespace hsosp {
 
+/**
+ * The last batch delta in device memory (0-based node indices), uploaded
+ * by applyDeltaToDevice and read by hsospUpdate: deleted pairs first, then
+ * inserted pairs; ids = new (inserted or recreated) nodes, then dead ones.
+ */
+struct DeviceDelta {
+    int2* d_pairs = nullptr;
+    int* d_ids = nullptr;
+    long long pairCapacity = 0;
+    long long idCapacity = 0;
+    int numDel = 0;
+    int numIns = 0;
+    int numNew = 0;
+    int numDead = 0;
+
+    void reserve(long long pairs, long long ids);
+    void free();
+};
+
 /** Resident device h2h graph. Node index = heId - 1. */
 struct DeviceH2H {
     int maxNodes = 0;              ///< capacity of the node-indexed arrays
@@ -49,6 +68,9 @@ struct DeviceH2H {
     long long* d_nodeW = nullptr;
     unsigned long long* d_tailCursor = nullptr;
     int* d_overflowFlag = nullptr;
+    long long numEntries = 0;      ///< live adjacency entries (2 x pairs)
+
+    DeviceDelta delta;             ///< last applied batch delta
 
     DeviceH2H() = default;
     ~DeviceH2H();
@@ -74,10 +96,12 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
                     double entryHeadroom);
 
 /**
- * Apply a net H2HDelta to the resident device graph.
+ * Apply a net H2HDelta to the resident device graph and keep the delta on
+ * the device (dev.delta) for the following hsospUpdate.
  *
  * @return false if the tail region overflowed (caller must rebuild via
- *         buildDeviceH2H; the graph contents are unspecified until then).
+ *         buildDeviceH2H, which keeps dev.delta; the graph contents are
+ *         unspecified until then).
  */
 bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
                         const H2HDelta& delta);
@@ -96,6 +120,22 @@ struct HsospState {
     int* d_candList = nullptr;
     int* d_affList = nullptr;
     int* d_counters = nullptr;   // [0] = affected, [1] = candidates
+
+    // Incremental update (hsospUpdate): packed (dist << 32 | parent) words,
+    // invalidation marks and pointer-jumping ancestors (double buffered),
+    // frontier lists with epoch stamps, device counters and their pinned
+    // host mirror.
+    unsigned long long* d_packed = nullptr;
+    int* d_invA = nullptr;
+    int* d_invB = nullptr;
+    int* d_jumpA = nullptr;
+    int* d_jumpB = nullptr;
+    int* d_front = nullptr;
+    int* d_next = nullptr;
+    int* d_stamp = nullptr;
+    unsigned long long* d_updCounters = nullptr;
+    unsigned long long* h_updCounters = nullptr;
+    int epoch = 0;
 
     HsospState() = default;
     ~HsospState();
@@ -118,30 +158,49 @@ struct HsospState {
 };
 
 struct UpdateConfig {
-    int maxIterations = 512;   ///< convergence cap before the fallback
+    /// Update budget: push iterations before falling back to a recompute.
+    int maxIterations = 4096;
+    /// Update budget: edge relaxations (pull + push) before falling back,
+    /// as a multiple of the live adjacency entries.
+    double workBudget = 1.0;
     int blockSize = 256;
 };
 
 struct UpdateStats {
-    int iterations = 0;
+    int iterations = 0;          ///< update: push iterations; recompute: rounds
     bool fallbackRecompute = false;
+    int fallbackIterations = 0;  ///< rounds of the fallback recompute
     int maxFrontier = 0;
-    long long seedCount = 0;
+    long long seedCount = 0;     ///< update: invalidated nodes
+    int jumpRounds = 0;          ///< pointer-jumping rounds
+    long long work = 0;          ///< edge relaxations of the update
 };
 
 /**
- * Dynamic SOSP update after a batch: seeds are the delta's touched nodes
- * (1-based he ids); dead nodes get dist=INF first. If the propagation does
- * not converge within cfg.maxIterations (stale loop in a disconnected
- * region), falls back to a full recompute and reports it in the stats.
+ * Exact dynamic SOSP update for the delta last applied by
+ * applyDeltaToDevice (dev.delta):
+ *  1. roots: the endpoint b of every deleted pair (a, b) whose tree parent
+ *     was a, and every new, recreated or dead node;
+ *  2. every descendant of a root in the pre-batch shortest-path tree is
+ *     invalidated (pointer jumping over the parent array): its distance
+ *     becomes INF, so every finite distance left is realised by a path of
+ *     the new graph (no stale value can count to infinity);
+ *  3. every invalidated node pulls the best (distance, id) over its
+ *     neighbours, and both directions of every inserted pair are relaxed;
+ *  4. improved nodes push to their neighbours with a packed 64-bit
+ *     atomicMin on (distance << 32 | parent) until no distance decreases.
+ * Distances only decrease after step 2, so the loop needs no cap; ties go
+ * to the lowest parent id, so a canonical input tree gives the canonical
+ * tree of the new graph. If the update exceeds its budget (cfg) or a
+ * distance does not fit 32 bits, it falls back to hsospRecompute; the
+ * fallback is reported in the stats and included in the call's time.
  */
-UpdateStats hsospUpdate(const DeviceH2H& dev, HsospState& st,
-                        const std::vector<int>& seedIds,
-                        const std::vector<int>& deadIds, int sourceId,
+UpdateStats hsospUpdate(const DeviceH2H& dev, HsospState& st, int sourceId,
                         const UpdateConfig& cfg);
 
 /** Static baseline: recompute from blank (GPU Bellman-Ford with frontier
- *  dedup, seeded at the source), on the current device graph. */
+ *  dedup, seeded at the source), on the current device graph. Parent ties
+ *  go to the lowest node id (canonical tree). */
 UpdateStats hsospRecompute(const DeviceH2H& dev, HsospState& st, int sourceId,
                            const UpdateConfig& cfg);
 
