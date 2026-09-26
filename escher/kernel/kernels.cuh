@@ -15,9 +15,6 @@ __global__ void placeNodeRecords(CBSTNode *nodes, const CBSTNode *sortedRecords,
                                  int n);
 
 // Payload ops
-__global__ void insertNode(CBSTNode *nodes, int *flatValues, int *insertIndices,
-                           int *insertValues, int *insertSizes, int insertSize,
-                           int *partialSolution);
 __global__ void allocateSpace(int *partialSolution, int *flatValues,
                               int spaceAvailableFrom, int *insertIndices,
                               int *insertValues, int *insertSizes,
@@ -96,10 +93,7 @@ __global__ void fixupOverflowMetadata(CBSTNode *nodes, int *insertIndices,
                                       int *insertSizes, int *partialSolution,
                                       int spaceAvailableFrom, int insertSize);
 
-// Unfill (original + degree-binned)
-__global__ void unfillKernel(CBSTNode *nodes, int *flatValues, int *keys,
-                             int *valuesToRemove, int *removePrefixSizes,
-                             int K);
+// Unfill (degree-binned)
 __global__ void unfill_thread(CBSTNode *nodes, int *flatValues, int *keys,
                               int *valuesToRemove, int *removePrefixSizes,
                               int *binIndices, int binCount);

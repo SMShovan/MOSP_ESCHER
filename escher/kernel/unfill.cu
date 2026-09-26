@@ -1,71 +1,6 @@
 #include "kernels.cuh"
 #include <climits>
 
-// ── Original thread-level unfillKernel (kept for small bins) ────────────
-__global__ void unfillKernel(CBSTNode *nodes, int *flatValues, int *keys,
-                             int *valuesToRemove, int *removePrefixSizes,
-                             int K) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid >= K)
-    return;
-  int key = keys[tid];
-  CBSTNode *cur = nodes;
-  while (cur != nullptr && cur->index != key) {
-    cur = (cur->index > key) ? cur->left : cur->right;
-  }
-  if (cur == nullptr)
-    return;
-  int segBase = cur->value;
-  int start = (tid == 0) ? 0 : removePrefixSizes[tid - 1];
-  int end = removePrefixSizes[tid];
-  int totalRemoved = 0;
-  for (;;) {
-    int w = 0;
-    int i = 0;
-    for (;;) {
-      int val = flatValues[segBase + i];
-      if (val == INT_MIN || val == 0 || val < 0)
-        break;
-      bool removeIt = false;
-      for (int r = start; r < end; ++r) {
-        if (valuesToRemove[r] == val) {
-          removeIt = true;
-          break;
-        }
-      }
-      if (!removeIt) {
-        flatValues[segBase + w] = val;
-        ++w;
-      } else {
-        ++totalRemoved;
-      }
-      ++i;
-    }
-    int endVal = flatValues[segBase + i];
-    if (endVal == INT_MIN) {
-      flatValues[segBase + w] = INT_MIN;
-      for (int z = w + 1; z < i; ++z)
-        flatValues[segBase + z] = 0;
-      break;
-    } else if (endVal < 0) {
-      flatValues[segBase + w] = endVal;
-      for (int z = w + 1; z < i; ++z)
-        flatValues[segBase + z] = 0;
-      segBase = -endVal;
-      continue;
-    } else {
-      flatValues[segBase + w] = INT_MIN;
-      for (int z = w + 1; z < i; ++z)
-        flatValues[segBase + z] = 0;
-      break;
-    }
-  }
-  // Update occupancy metadata
-  cur->occupancy -= totalRemoved;
-  if (cur->occupancy < 0)
-    cur->occupancy = 0;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Degree-binned unfill kernels (using occupancy/tailBase/tailCapacity)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -79,27 +14,17 @@ static __device__ CBSTNode *unfillBstFind(CBSTNode *nodes, int key) {
   return current;
 }
 
-// ── Thread-level unfill with metadata (small bins) ──────────────────────
-// Same logic as original but uses binIndices for dispatch.
-__global__ void unfill_thread(CBSTNode *nodes, int *flatValues, int *keys,
-                              int *valuesToRemove, int *removePrefixSizes,
-                              int *binIndices, int binCount) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid >= binCount)
-    return;
-
-  int origIdx = binIndices[tid];
-  int key = keys[origIdx];
-  int start = (origIdx == 0) ? 0 : removePrefixSizes[origIdx - 1];
-  int end = removePrefixSizes[origIdx];
-  int numRemovals = end - start;
-
-  CBSTNode *cur = unfillBstFind(nodes, key);
-  if (cur == nullptr)
-    return;
-
-  int segBase = cur->value;
-  int totalRemoved = 0;
+// ── Serial unfill of one row (all segments) ─────────────────────────────
+// Removes valuesToRemove[start, end) from the row of `node`, compacting each
+// segment in place and keeping the chain pointers. Returns the number of
+// live entries left in the tail segment, which is what `occupancy` counts:
+// fill appends at tailBase + occupancy. (The original subtracted removals
+// from every segment from the tail occupancy, so a later fill overwrote
+// live entries of the tail segment.)
+static __device__ int unfillRowSerial(const CBSTNode *node, int *flatValues,
+                                      const int *valuesToRemove, int start,
+                                      int end) {
+  int segBase = node->value;
   for (;;) {
     int w = 0;
     int i = 0;
@@ -117,33 +42,37 @@ __global__ void unfill_thread(CBSTNode *nodes, int *flatValues, int *keys,
       if (!removeIt) {
         flatValues[segBase + w] = val;
         ++w;
-      } else {
-        ++totalRemoved;
       }
       ++i;
     }
     int endVal = flatValues[segBase + i];
-    if (endVal == INT_MIN) {
-      flatValues[segBase + w] = INT_MIN;
-      for (int z = w + 1; z < i; ++z)
-        flatValues[segBase + z] = 0;
-      break;
-    } else if (endVal < 0) {
-      flatValues[segBase + w] = endVal;
-      for (int z = w + 1; z < i; ++z)
-        flatValues[segBase + z] = 0;
-      segBase = -endVal;
-      continue;
-    } else {
-      flatValues[segBase + w] = INT_MIN;
-      for (int z = w + 1; z < i; ++z)
-        flatValues[segBase + z] = 0;
-      break;
-    }
+    bool chained = endVal < 0 && endVal != INT_MIN;
+    flatValues[segBase + w] = chained ? endVal : INT_MIN;
+    for (int z = w + 1; z <= i; ++z)
+      flatValues[segBase + z] = 0;
+    if (!chained)
+      return w;
+    segBase = -endVal;
   }
-  cur->occupancy -= totalRemoved;
-  if (cur->occupancy < 0)
-    cur->occupancy = 0;
+}
+
+// ── Thread-level unfill with metadata (small bins) ──────────────────────
+__global__ void unfill_thread(CBSTNode *nodes, int *flatValues, int *keys,
+                              int *valuesToRemove, int *removePrefixSizes,
+                              int *binIndices, int binCount) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= binCount)
+    return;
+
+  int origIdx = binIndices[tid];
+  int key = keys[origIdx];
+  int start = (origIdx == 0) ? 0 : removePrefixSizes[origIdx - 1];
+  int end = removePrefixSizes[origIdx];
+
+  CBSTNode *cur = unfillBstFind(nodes, key);
+  if (cur == nullptr)
+    return;
+  cur->occupancy = unfillRowSerial(cur, flatValues, valuesToRemove, start, end);
 }
 
 // ── Warp-level unfill (medium bins, 32 <= occupancy < 1024) ─────────────
@@ -163,7 +92,6 @@ __global__ void unfill_warp(CBSTNode *nodes, int *flatValues, int *keys,
   int key = keys[origIdx];
   int remStart = (origIdx == 0) ? 0 : removePrefixSizes[origIdx - 1];
   int remEnd = removePrefixSizes[origIdx];
-  int numRemovals = remEnd - remStart;
 
   // All lanes do BST traversal (same key, same result)
   CBSTNode *cur = unfillBstFind(nodes, key);
@@ -176,61 +104,15 @@ __global__ void unfill_warp(CBSTNode *nodes, int *flatValues, int *keys,
   // For single-segment nodes (tailBase == value), do cooperative compaction.
   // For multi-segment (overflow chain), fall back to lane 0 doing serial work.
   if (cur->tailBase != cur->value) {
-    // Multi-segment: lane 0 does full serial work
-    if (lane == 0) {
-      int sb = cur->value;
-      int totalRemoved = 0;
-      for (;;) {
-        int w = 0, i = 0;
-        for (;;) {
-          int val = flatValues[sb + i];
-          if (val == INT_MIN || val == 0 || val < 0)
-            break;
-          bool rm = false;
-          for (int r = remStart; r < remEnd; ++r) {
-            if (valuesToRemove[r] == val) {
-              rm = true;
-              break;
-            }
-          }
-          if (!rm) {
-            flatValues[sb + w] = val;
-            ++w;
-          } else {
-            ++totalRemoved;
-          }
-          ++i;
-        }
-        int ev = flatValues[sb + i];
-        if (ev == INT_MIN) {
-          flatValues[sb + w] = INT_MIN;
-          for (int z = w + 1; z < i; ++z)
-            flatValues[sb + z] = 0;
-          break;
-        } else if (ev < 0) {
-          flatValues[sb + w] = ev;
-          for (int z = w + 1; z < i; ++z)
-            flatValues[sb + z] = 0;
-          sb = -ev;
-          continue;
-        } else {
-          flatValues[sb + w] = INT_MIN;
-          for (int z = w + 1; z < i; ++z)
-            flatValues[sb + z] = 0;
-          break;
-        }
-      }
-      cur->occupancy -= totalRemoved;
-      if (cur->occupancy < 0)
-        cur->occupancy = 0;
-    }
+    if (lane == 0)
+      cur->occupancy =
+          unfillRowSerial(cur, flatValues, valuesToRemove, remStart, remEnd);
     return;
   }
 
   // Single-segment cooperative compaction using ballot
   // Process elements in warp-sized chunks
-  int writeOffset = 0; // Accumulated across chunks (broadcast from lane 0)
-  int totalRemoved = 0;
+  int writeOffset = 0; // Accumulated across chunks (identical in all lanes)
 
   for (int chunk = 0; chunk < occ; chunk += 32) {
     int elemIdx = chunk + lane;
@@ -263,9 +145,7 @@ __global__ void unfill_warp(CBSTNode *nodes, int *flatValues, int *keys,
       flatValues[segBase + writeOffset + myPos] = val;
     }
 
-    // Broadcast writeOffset update
     writeOffset += keptInChunk;
-    totalRemoved += (min(occ - chunk, 32) - keptInChunk);
   }
 
   // Lane 0 writes sentinel and zeros, updates metadata
@@ -317,53 +197,9 @@ __global__ void unfill_block(CBSTNode *nodes, int *flatValues, int *keys,
 
   // Multi-segment fallback: thread 0 does serial
   if (sh_node->tailBase != sh_node->value) {
-    if (threadIdx.x == 0) {
-      int sb = sh_node->value;
-      int totalRemoved = 0;
-      for (;;) {
-        int w = 0, i = 0;
-        for (;;) {
-          int val = flatValues[sb + i];
-          if (val == INT_MIN || val == 0 || val < 0)
-            break;
-          bool rm = false;
-          for (int r = sh_remStart; r < sh_remEnd; ++r) {
-            if (valuesToRemove[r] == val) {
-              rm = true;
-              break;
-            }
-          }
-          if (!rm) {
-            flatValues[sb + w] = val;
-            ++w;
-          } else {
-            ++totalRemoved;
-          }
-          ++i;
-        }
-        int ev = flatValues[sb + i];
-        if (ev == INT_MIN) {
-          flatValues[sb + w] = INT_MIN;
-          for (int z = w + 1; z < i; ++z)
-            flatValues[sb + z] = 0;
-          break;
-        } else if (ev < 0) {
-          flatValues[sb + w] = ev;
-          for (int z = w + 1; z < i; ++z)
-            flatValues[sb + z] = 0;
-          sb = -ev;
-          continue;
-        } else {
-          flatValues[sb + w] = INT_MIN;
-          for (int z = w + 1; z < i; ++z)
-            flatValues[sb + z] = 0;
-          break;
-        }
-      }
-      sh_node->occupancy -= totalRemoved;
-      if (sh_node->occupancy < 0)
-        sh_node->occupancy = 0;
-    }
+    if (threadIdx.x == 0)
+      sh_node->occupancy = unfillRowSerial(sh_node, flatValues, valuesToRemove,
+                                           sh_remStart, sh_remEnd);
     return;
   }
 

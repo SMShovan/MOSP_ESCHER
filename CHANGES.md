@@ -130,3 +130,16 @@ made there; these commits port those fixes, adapted to this copy's API
   goes to the slot the prefix-max matching chose, which always fits; the
   rest of a reused slot is cleared. Regression: `test_cbst_ops bestfit`
   (and `reuse`, which also needed E4).
+- **E7 unfill and the tail occupancy** (`kernel/unfill.cu`). On a chained
+  row, unfill subtracted the removals from every segment from `occupancy`,
+  which counts the live entries of the tail segment only; the next fill
+  wrote at `tailBase + occupancy` over live data (row [1,2] + fill 3,4,5 +
+  unfill 1 + fill 6 read back as [2,3,4,6]). `occupancy` is now set from the
+  compacted tail segment (one serial helper shared by the thread, warp and
+  block kernels). The unused `unfillKernel` and `insertNode` kernels, which
+  carried the same defects, were removed. Regression:
+  `test_cbst_ops unfill-chain`.
+
+With E1-E7, every `test_cbst_ops` scenario (including the random sequences
+at 70,000 records), `test_hsosp_scale` and `hsospStress --check-escher`
+pass: after every batch the three CBSTs hold exactly the host model's rows.
