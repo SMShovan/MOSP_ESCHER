@@ -17,6 +17,14 @@
 #include <thrust/sort.h>
 
 // Functor for thrust predicate: returns true when value < threshold
+// Max functor for the prefix-max scan (thrust::maximum is deprecated in
+// CUDA 13).
+struct MaxInt {
+  __host__ __device__ int operator()(int a, int b) const {
+    return a > b ? a : b;
+  }
+};
+
 struct LessThan {
   int threshold;
   __host__ __device__ bool operator()(int x) const { return x < threshold; }
@@ -498,7 +506,7 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     thrust::device_ptr<int> b_ptr = thrust::device_pointer_cast(d_lo);
     thrust::device_ptr<int> pmax_ptr = thrust::device_pointer_cast(d_prefixMax);
     thrust::inclusive_scan(b_ptr, b_ptr + reuseK, pmax_ptr,
-                           thrust::maximum<int>());
+                           MaxInt());
 
     // Step 8: assigned[i] = i + prefix_max[i] (rank of the slot for sorted
     // item i; strictly increasing, and >= lo[i] so the slot fits the item)
