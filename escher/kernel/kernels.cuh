@@ -103,3 +103,13 @@ __global__ void unfill_warp(CBSTNode *nodes, int *flatValues, int *keys,
 __global__ void unfill_block(CBSTNode *nodes, int *flatValues, int *keys,
                              int *valuesToRemove, int *removePrefixSizes,
                              int *binIndices, int binCount);
+
+// Payload compaction (two passes, one warp per node)
+__global__ void compactSizesKernel(const CBSTNode *nodes, const int *avail,
+                                   int n, const int *flat, int limit,
+                                   int *liveCount, long long *slotsByRank);
+__global__ void compactCopyKernel(CBSTNode *nodes, const int *avail, int n,
+                                  const int *flat, int limit,
+                                  const int *liveCount,
+                                  const long long *offsetByRank, int *dst,
+                                  int *startOffsets);

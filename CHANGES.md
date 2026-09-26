@@ -218,6 +218,31 @@ pass: after every batch the three CBSTs hold exactly the host model's rows.
   `std::invalid_argument`, and the capacity is never below the layout.
   Regression: `test_h2h_construction`; `test_h2h_delta` builds every third
   configuration with headroom 1 so the overflow-rebuild path runs.
+- **Payload space was never reclaimed** (`operations.cu`,
+  `kernel/payload.cu`). The CBST payload is a bump allocator: fill appends
+  only into a row's tail segment and places overflow segments at the bump
+  pointer, and unfill compacts each segment in place. The space unfill
+  frees in earlier segments, and the segments an overflowing tail leaves
+  behind, were never used again, so the payload grew with the total fill
+  volume, not with the live data, and a steady-size workload eventually
+  threw `fillCBST [h2h]: payload overflow` (4 rows of 8 values in 2,000
+  slots after 4 fill / unfill rounds; the paper-style Geology vertex run
+  with 50K batches after 85 batches while the line graph shrank).
+  `compactCBST` rewrites every row as one segment in key order (two passes
+  of one warp per node: count, then copy through a temporary buffer; a
+  live row of L values gets the next multiple of 4 above L, a deleted row
+  keeps its reusable first segment) and moves the bump pointer back.
+  `fillCBST` and `insertCBST` compact when the new segments do not fit
+  behind the bump pointer (fill then re-fills the values that did not fit
+  into their rows' tails) and throw only when the live rows plus the new
+  values do not fit. Compaction runs only then, so a run that never fills
+  its payload is unchanged. On Geology the compaction took 9 ms (h2h, 130M
+  slots to 69M) and the 400-batch vertex run completes. Regression:
+  `test_cbst_ops churn` (500 fill / unfill rounds in 2,000 slots, 300
+  random rounds with erases and inserts in 1.5x the initial payload, an
+  insert whose new rows need a compaction, and growth that must throw)
+  and a 300-batch vertex churn in tight payloads in
+  `test_hsosp_matches_dijkstra`.
 
 ## Correctness: MOSP half (`mosp/`)
 

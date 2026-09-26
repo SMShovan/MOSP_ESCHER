@@ -286,9 +286,65 @@ void constructCBST(int *keys, int *startOffsets, int numRecords,
 #endif
 }
 
-void fillCBST(const std::vector<int> &insertKeys,
-              const std::vector<int> &insertPayload,
-              const std::vector<int> &insertPrefixSizes, CBSTContext &ctx) {
+int compactCBST(CBSTContext &ctx) {
+  const int n = ctx.numRecords;
+  if (n <= 0 || ctx.d_nodes == nullptr)
+    return ctx.initialPayloadSize;
+  const int blockSize = 256;
+  const int warpBlocks =
+      static_cast<int>((32LL * n + blockSize - 1) / blockSize);
+  const int limit = ctx.initialPayloadSize;
+
+  // Pass 1: live values and compacted slots per row; offsets by key order.
+  TempBuffer<int> liveCount(n);
+  TempBuffer<long long> offsets(static_cast<size_t>(n) + 1);
+  checkCuda(cudaMemsetAsync(offsets.get() + n, 0, sizeof(long long), 0));
+  compactSizesKernel<<<warpBlocks, blockSize>>>(
+      ctx.d_nodes, ctx.d_avail, n, ctx.d_flatPayload, limit, liveCount.get(),
+      offsets.get());
+  checkCuda(cudaGetLastError());
+  thrust::device_ptr<long long> off_ptr(offsets.get());
+  thrust::exclusive_scan(off_ptr, off_ptr + n + 1, off_ptr);
+  long long total = 0;
+  checkCuda(cudaMemcpy(&total, offsets.get() + n, sizeof(long long),
+                       cudaMemcpyDeviceToHost));
+  if (total > ctx.fixedSize) {
+    throw ::escher::EscherError(
+        std::string("compactCBST [") +
+        (ctx.datasetName ? ctx.datasetName : "?") +
+        "]: the live rows need " + std::to_string(total) +
+        " payload slots, more than the capacity " +
+        std::to_string(ctx.fixedSize) + ". Increase payloadCapacity.");
+  }
+
+  // Pass 2: copy every row into a zeroed buffer at its new offset, then
+  // back to the front of the payload; the rest of the used prefix is
+  // cleared so the tail beyond the new bump pointer is zero again.
+  TempBuffer<int> compacted(static_cast<size_t>(total));
+  checkCuda(cudaMemsetAsync(compacted.get(), 0,
+                            static_cast<size_t>(total) * sizeof(int), 0));
+  compactCopyKernel<<<warpBlocks, blockSize>>>(
+      ctx.d_nodes, ctx.d_avail, n, ctx.d_flatPayload, limit, liveCount.get(),
+      offsets.get(), compacted.get(), ctx.d_startOffsets);
+  checkCuda(cudaGetLastError());
+  checkCuda(cudaMemcpyAsync(ctx.d_flatPayload, compacted.get(),
+                            static_cast<size_t>(total) * sizeof(int),
+                            cudaMemcpyDeviceToDevice, 0));
+  if (total < limit)
+    checkCuda(cudaMemsetAsync(ctx.d_flatPayload + total, 0,
+                              static_cast<size_t>(limit - total) * sizeof(int),
+                              0));
+  ctx.initialPayloadSize = static_cast<int>(total);
+  return ctx.initialPayloadSize;
+}
+
+// Fill; when the overflow segments do not fit behind the bump pointer and
+// @p allowCompact, the payload is compacted and the values that did not
+// fit into their rows' tails are filled again (once, without compaction).
+static void fillImpl(const std::vector<int> &insertKeys,
+                     const std::vector<int> &insertPayload,
+                     const std::vector<int> &insertPrefixSizes,
+                     CBSTContext &ctx, bool allowCompact) {
   if (insertKeys.empty())
     return;
   int K = static_cast<int>(insertKeys.size());
@@ -350,7 +406,35 @@ void fillCBST(const std::vector<int> &insertKeys,
   printVector(relocationPlanHostOut, "Cumulative Relocation Plan");
 #endif
 
-  if (ctx.initialPayloadSize + totalAppended > ctx.fixedSize) {
+  if (static_cast<long long>(ctx.initialPayloadSize) + totalAppended >
+          ctx.fixedSize &&
+      allowCompact) {
+    // The insertNode kernels have already written the values that fit into
+    // each row's tail (such a row's tail is now full and still ends in its
+    // terminator slot); plan[3i + 1] is how many of item i's values that
+    // was, and item i overflowed iff its padded overflow size (the
+    // cumulative plan[3i + 2]) is non-zero.
+    std::vector<int> plan(3 * static_cast<size_t>(K));
+    checkCuda(cudaMemcpy(plan.data(), ctx.d_relocationPlan,
+                         plan.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<int> restKeys, restPayload, restPrefix;
+    for (int i = 0; i < K; ++i) {
+      const int before = i == 0 ? 0 : plan[3 * (i - 1) + 2];
+      if (plan[3 * i + 2] == before)
+        continue;
+      const int start = i == 0 ? 0 : insertPrefixSizes[i - 1];
+      restKeys.push_back(insertKeys[i]);
+      restPayload.insert(restPayload.end(),
+                         insertPayload.begin() + start + plan[3 * i + 1],
+                         insertPayload.begin() + insertPrefixSizes[i]);
+      restPrefix.push_back(static_cast<int>(restPayload.size()));
+    }
+    compactCBST(ctx);
+    fillImpl(restKeys, restPayload, restPrefix, ctx, false);
+    return;
+  }
+  if (static_cast<long long>(ctx.initialPayloadSize) + totalAppended >
+      ctx.fixedSize) {
     throw ::escher::EscherError(
         std::string("fillCBST [") + (ctx.datasetName ? ctx.datasetName : "?") +
         "]: payload overflow (" +
@@ -383,6 +467,12 @@ void fillCBST(const std::vector<int> &insertKeys,
                        ctx.fixedSize * sizeof(int), cudaMemcpyDeviceToHost));
   printVector(updatedFlat, "Updated Flattened Values (vec1d)");
 #endif
+}
+
+void fillCBST(const std::vector<int> &insertKeys,
+              const std::vector<int> &insertPayload,
+              const std::vector<int> &insertPrefixSizes, CBSTContext &ctx) {
+  fillImpl(insertKeys, insertPayload, insertPrefixSizes, ctx, true);
 }
 
 void deleteCBST(const std::vector<int> &deleteKeys, CBSTContext &ctx) {
@@ -599,6 +689,16 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     // rows are packed on the host and appended with one copy (the original
     // issued two or three copies per row: 220 ms for the 25K new rows of a
     // DBLP batch).
+    // Compact the payload first if the new rows do not fit behind the bump
+    // pointer (the best-fit reuse above is already complete).
+    long long surplusSlots = 0;
+    for (int globalIdx : surplusIndices) {
+      int len = newPrefixSizes[globalIdx] -
+                (globalIdx == 0 ? 0 : newPrefixSizes[globalIdx - 1]);
+      surplusSlots += nextMultiple(len, ctx.alignment) + 1;
+    }
+    if (ctx.initialPayloadSize + surplusSlots > ctx.fixedSize)
+      compactCBST(ctx);
     std::vector<CBSTNode> surplusRecords(surplus);
     std::vector<int> packed;
     int cursor = ctx.initialPayloadSize;
@@ -816,6 +916,8 @@ void CBSTOperations::fill(const std::vector<int> &insertKeys,
 void CBSTOperations::erase(const std::vector<int> &deleteKeys) {
   deleteCBST(deleteKeys, ctx_);
 }
+
+int CBSTOperations::compact() { return compactCBST(ctx_); }
 
 void CBSTOperations::findAndPrint(const std::vector<int> &ids) const {
   if (ids.empty())

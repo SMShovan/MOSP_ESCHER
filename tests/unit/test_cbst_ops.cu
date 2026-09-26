@@ -25,6 +25,11 @@
  *                decremented by removals from every segment)
  *   random       random erase / insert / fill / unfill sequences with rows
  *                of 1..3,000 values (thread, warp and block kernels)
+ *   churn        balanced fill / unfill and erase / insert for hundreds of
+ *                rounds in a tight payload: the space unfill frees must be
+ *                reclaimed (the payload was a bump allocator that threw
+ *                "payload overflow" with 32 live values in 2,000 slots),
+ *                and only live data that really does not fit may throw
  */
 
 #include <algorithm>
@@ -137,6 +142,12 @@ public:
                !model_[key - 1].empty();
     }
     int numKeys() const { return static_cast<int>(model_.size()); }
+    const CBSTContext& context() const { return op_.context(); }
+    long long liveValues() const {
+        long long n = 0;
+        for (const auto& r : model_) n += static_cast<long long>(r.size());
+        return n;
+    }
     const std::vector<int>& row(int key) const { return model_[key - 1]; }
 
     long long errors = 0;
@@ -335,6 +346,165 @@ long long scenarioRandom() {
     return errors;
 }
 
+long long scenarioChurn() {
+    long long errors = 0;
+    // 1. Four rows of 8 values in 2,000 slots; every round each row gets 4
+    //    new values and loses its 4 oldest (the reported reproduction).
+    {
+        std::vector<std::vector<int>> rows(4);
+        int next = 1;
+        for (auto& r : rows) r = iotaRow((next += 8) - 8, 8);
+        Harness h("churn-small", 2000);
+        h.construct(rows);
+        int compactions = 0, lastUsed = h.context().initialPayloadSize;
+        for (int round = 0; round < 500 && h.errors == 0; ++round) {
+            std::map<int, std::vector<int>> add, rem;
+            for (int k = 1; k <= 4; ++k) {
+                add[k] = iotaRow(next, 4);
+                next += 4;
+                rem[k].assign(h.row(k).begin(), h.row(k).begin() + 4);
+            }
+            h.fill(add);
+            h.unfill(rem);
+            const int used = h.context().initialPayloadSize;
+            compactions += used < lastUsed;
+            lastUsed = used;
+            if (round % 25 == 0 || round == 499)
+                h.check("round " + std::to_string(round));
+        }
+        if (compactions == 0) {
+            std::cout << "churn-small: the payload was never compacted\n";
+            ++h.errors;
+        }
+        errors += h.errors;
+    }
+    // 2. Random balanced churn on 2,000 rows (thread- and warp-sized rows,
+    //    chains of several segments) in 1.5x the initial payload: fills,
+    //    unfills, erases and inserts (reused slots and surplus rows).
+    if (errors == 0) {
+        std::mt19937_64 rng(99);
+        auto rnd = [&](int lo, int hi) {
+            return lo + static_cast<int>(rng() % (hi - lo + 1));
+        };
+        int nextValue = 1;
+        auto freshRow = [&](int len) {
+            std::vector<int> r(len);
+            for (int& v : r) v = nextValue++;
+            return r;
+        };
+        auto rowLen = [&]() {
+            return rnd(0, 9) < 9 ? rnd(1, 12) : rnd(32, 120);
+        };
+        const int n = 2000;
+        std::vector<std::vector<int>> rows(n);
+        for (auto& r : rows) r = freshRow(rowLen());
+        auto [flat, offsets] = flatten2DVector(rows);
+        Harness h("churn-random", static_cast<long long>(flat.size()) * 3 / 2);
+        h.construct(rows);
+        int compactions = 0, lastUsed = h.context().initialPayloadSize;
+        for (int round = 0; round < 300 && h.errors == 0; ++round) {
+            // Remove about as many values as the fill below adds.
+            std::map<int, std::vector<int>> add, rem;
+            long long added = 0, removed = 0;
+            for (int i = 0; i < n / 10; ++i) {
+                int k = rnd(1, h.numKeys());
+                if (!h.live(k) || add.count(k)) continue;
+                add[k] = freshRow(rnd(1, 3) * (h.row(k).size() > 32 ? 8 : 1));
+                added += static_cast<long long>(add[k].size());
+            }
+            for (int tries = 0; removed < added && tries < 4 * n; ++tries) {
+                int k = rnd(1, h.numKeys());
+                if (!h.live(k) || add.count(k) || rem.count(k)) continue;
+                const auto& r = h.row(k);
+                if (r.size() < 2) continue;
+                const std::size_t take =
+                    std::min<std::size_t>(r.size() - 1, 1 + rng() % 8);
+                rem[k].assign(r.begin(), r.begin() + take);
+                removed += static_cast<long long>(take);
+            }
+            h.fill(add);
+            h.unfill(rem);
+            // Erase and insert a few rows of similar sizes.
+            std::set<int> er;
+            std::vector<std::vector<int>> items;
+            for (int i = 0; i < 5; ++i) {
+                int k = rnd(1, h.numKeys());
+                if (!h.live(k) || add.count(k) || rem.count(k) ||
+                    !er.insert(k).second)
+                    continue;
+                items.push_back(freshRow(static_cast<int>(h.row(k).size())));
+            }
+            h.erase(std::vector<int>(er.begin(), er.end()));
+            h.insert(items);
+            const int used = h.context().initialPayloadSize;
+            compactions += used < lastUsed;
+            lastUsed = used;
+            if (round % 20 == 0 || round == 299)
+                h.check("round " + std::to_string(round));
+        }
+        if (compactions == 0) {
+            std::cout << "churn-random: the payload was never compacted\n";
+            ++h.errors;
+        }
+        errors += h.errors;
+    }
+    // 2b. Surplus rows of an insert that do not fit behind the bump pointer
+    //     (the insert threw "surplus insert exceeds payload capacity").
+    if (errors == 0) {
+        Harness h("churn-insert", 200);
+        h.construct({iotaRow(1, 8), iotaRow(100, 8)});
+        int next = 1000;
+        for (int round = 0; round < 100 &&
+                            h.context().initialPayloadSize <= 200 - 40;
+             ++round) {
+            std::map<int, std::vector<int>> add, rem;
+            for (int k = 1; k <= 2; ++k) {
+                add[k] = iotaRow(next, 4);
+                next += 4;
+                rem[k].assign(h.row(k).begin(), h.row(k).begin() + 4);
+            }
+            h.fill(add);
+            h.unfill(rem);
+        }
+        const int before = h.context().initialPayloadSize;
+        h.insert({iotaRow(5000, 8), iotaRow(5100, 8), iotaRow(5200, 8),
+                  iotaRow(5300, 8)});
+        h.check("insert 4 rows with the bump pointer at " +
+                std::to_string(before) + " of 200");
+        if (before <= 200 - 40) {
+            std::cout << "churn-insert: the bump pointer never came close "
+                         "to the capacity\n";
+            ++h.errors;
+        }
+        errors += h.errors;
+    }
+    // 3. Growth: live data that no longer fits must throw, and only then.
+    if (errors == 0) {
+        Harness h("churn-growth", 256);
+        h.construct({iotaRow(1, 8), iotaRow(100, 8)});
+        int next = 1000;
+        bool threw = false;
+        long long liveAtThrow = 0;
+        for (int round = 0; round < 200 && !threw; ++round) {
+            try {
+                h.fill({{1 + round % 2, iotaRow(next, 3)}});
+                next += 3;
+            } catch (const escher::EscherError&) {
+                threw = true;
+                liveAtThrow = h.liveValues();
+            }
+        }
+        // Rows of L values need at most L + 4 slots once compacted.
+        if (!threw || liveAtThrow + 3 + 2 * 4 <= 256) {
+            std::cout << "churn-growth: " << (threw ? "threw" : "no throw")
+                      << " with " << liveAtThrow << " live values in 256 "
+                      << "slots\n";
+            ++errors;
+        }
+    }
+    return errors;
+}
+
 struct Scenario {
     const char* name;
     long long (*run)();
@@ -345,6 +515,7 @@ const Scenario kScenarios[] = {
     {"terminator", scenarioTerminator}, {"erase", scenarioErase},
     {"surplus", scenarioSurplus},   {"bestfit", scenarioBestFit},
     {"unfill-chain", scenarioUnfillChain}, {"random", scenarioRandom},
+    {"churn", scenarioChurn},
 };
 
 } // namespace

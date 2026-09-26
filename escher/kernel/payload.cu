@@ -318,3 +318,94 @@ __global__ void fixupOverflowMetadata(CBSTNode *nodes, int *insertIndices,
     current->occupancy = overflowCount;
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Payload compaction (compactCBST)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Fill only appends into a row's tail segment and overflow segments are
+// bump-allocated, so space freed by unfill in earlier segments, and the
+// segments left behind by an overflowing tail, is never used again.
+// Compaction rewrites every row as one segment in key order. A live row of
+// L values gets the smallest multiple of 4 above L (the construct-time
+// padding of flatten2DVector); a deleted row keeps its first segment of
+// `length` slots, its reusable best-fit slot, and drops its chain.
+
+// Walks the row starting at `base` with one warp: values are > 0, 0 or
+// INT_MIN end the row and any other negative value -p continues it at p.
+// Copies the values to dst (when not null) and returns their number (in
+// every lane). Reads at or past `limit` count as the end of the row.
+static __device__ int warpWalkRow(const int *flat, int limit, int base,
+                                  int *dst) {
+  const int lane = threadIdx.x & 31;
+  int count = 0;
+  int seg = base;
+  int c = 0;
+  for (;;) {
+    const long long p = static_cast<long long>(seg) + c + lane;
+    const int v = (p >= 0 && p < limit) ? flat[p] : 0;
+    const unsigned endMask = __ballot_sync(0xFFFFFFFFu, v <= 0);
+    const int n = endMask ? __ffs(endMask) - 1 : 32;
+    if (dst != nullptr && lane < n)
+      dst[count + lane] = v;
+    count += n;
+    if (endMask == 0) {
+      c += 32;
+      continue;
+    }
+    const int endVal = __shfl_sync(0xFFFFFFFFu, v, n);
+    if (endVal < 0 && endVal != INT_MIN) {
+      seg = -endVal;
+      c = 0;
+    } else {
+      return count;
+    }
+  }
+}
+
+// Pass 1, one warp per node: live values of the row and the slots of its
+// compacted segment, stored by in-order rank (key order).
+__global__ void compactSizesKernel(const CBSTNode *nodes, const int *avail,
+                                   int n, const int *flat, int limit,
+                                   int *liveCount, long long *slotsByRank) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  if (warp >= n)
+    return;
+  const CBSTNode &node = nodes[warp];
+  const bool live = avail[warp] == 0;
+  const int count = live ? warpWalkRow(flat, limit, node.value, nullptr) : 0;
+  if ((threadIdx.x & 31) == 0) {
+    liveCount[warp] = count;
+    const int slots = live ? (count + 4) / 4 * 4 : node.length;
+    slotsByRank[cbstRankOfPosition(warp, n)] = slots;
+  }
+}
+
+// Pass 2, one warp per node: copies the row to its compacted offset in
+// `dst` (zero-filled) and points the node at it: one segment, the tail.
+__global__ void compactCopyKernel(CBSTNode *nodes, const int *avail, int n,
+                                  const int *flat, int limit,
+                                  const int *liveCount,
+                                  const long long *offsetByRank, int *dst,
+                                  int *startOffsets) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  if (warp >= n)
+    return;
+  CBSTNode &node = nodes[warp];
+  const int rank = cbstRankOfPosition(warp, n);
+  const int base = static_cast<int>(offsetByRank[rank]);
+  const int slots = static_cast<int>(offsetByRank[rank + 1] - base);
+  const int count = liveCount[warp];
+  if (avail[warp] == 0)
+    warpWalkRow(flat, limit, node.value, dst + base);
+  __syncwarp();
+  if ((threadIdx.x & 31) == 0) {
+    dst[base + count] = INT_MIN;
+    node.value = base;
+    node.length = slots;
+    node.tailBase = base;
+    node.tailCapacity = slots - 1;
+    node.occupancy = count;
+    startOffsets[rank] = base;
+  }
+}

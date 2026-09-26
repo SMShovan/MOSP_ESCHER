@@ -221,6 +221,62 @@ int main() {
         }
     }
 
+    // ---- long balanced vertex churn in tight CBST payloads ---------------
+    // (The payloads were bump allocators: space freed by unfill was never
+    // reused, so a steady-size workload eventually threw "fillCBST [h2h]:
+    // payload overflow"; the paper-style DBLP / Geology vertex runs did
+    // after 85 batches.)
+    {
+        GenParams gp;
+        gp.numHyperedges = 3000;
+        gp.numVertices = 2500;
+        gp.cMin = 2;
+        gp.cMax = 8;
+        gp.poolSize = 64;
+        gp.bridgeFrac = 0.05;
+        gp.seed = 404;
+        GeneratedHypergraph g = generateHypergraph(gp);
+        DynamicHypergraph::Caps caps;
+        caps.maxHyperedges = static_cast<int>(g.rows.size()) + 64;
+        caps.headroomFactor = 1.25;
+        caps.extraPayloadInts = 0;
+        DynamicHypergraph dh(g.numVertices, caps);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(g.rows),
+                                       std::move(g.weights), g.sourceHe,
+                                       g.targetHe);
+        HostHypergraph& hg = dh.host();
+        hsosp::DeviceH2H dev;
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.5);
+        hsosp::HsospState st;
+        st.allocate(caps.maxHyperedges);
+        hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
+        int bi = 0;
+        try {
+            for (; bi < 300 && failures == 0; ++bi) {
+                BatchParams bp;
+                bp.size = 400;
+                bp.delPct = 50;
+                bp.kind = BatchKind::Vertex;
+                bp.seed = 7000 + bi;
+                HgBatch batch = generateBatch(hg, gp, bp, {}, {});
+                hsosp::applyBatch(dh, dev, batch, 1.5);
+                hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
+                if (bi % 50 == 49) {
+                    distsMatch(st, hg, "vertex churn", bi);
+                    std::ostringstream log;
+                    if (dh.checkEscher(rebuildLineGraph(hg), log) != 0) {
+                        std::printf("FAIL: vertex churn batch %d: ESCHER "
+                                    "contents\n%s", bi, log.str().c_str());
+                        ++failures;
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            std::printf("FAIL: vertex churn batch %d: %s\n", bi, e.what());
+            ++failures;
+        }
+    }
+
     // ---- recompute block size -------------------------------------------
     // The recompute runs one warp per node: other multiples of 32 must give
     // the same result, anything else must be rejected (a block of 48 or 100

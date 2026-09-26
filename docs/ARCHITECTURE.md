@@ -22,7 +22,8 @@ not just MOSP.
   slot's key rather than the requested key).
 - `class CBSTOperations` — RAII wrapper owning a `CBSTContext`. Provides
   `construct`, `insert` (with best-fit slot reuse), `fill` (append-only),
-  `erase` (delete by key) and `findAndPrint` (debug).
+  `erase` (delete by key), `compact` (reclaim payload space) and
+  `findAndPrint` (debug).
 
 ### Operations (`escher/structure/operations.cu`)
 
@@ -37,6 +38,12 @@ not just MOSP.
 - `unfillCBST` — scan payloads and zero out specific values (used by
   `DynamicGraph::deleteEdges` to remove edge IDs from an adjacency list
   without erasing the whole vertex record).
+- `compactCBST` — the payload is a bump allocator (fill appends overflow
+  segments at `initialPayloadSize`; space freed by unfill is not reused in
+  place). Compaction rewrites every row as one segment in key order and
+  moves the bump pointer back; `fillCBST` and `insertCBST` call it when
+  their new segments would not fit, and throw only if the live data
+  itself does not fit.
 
 ### Kernels (`escher/kernel/`)
 
@@ -49,7 +56,8 @@ not just MOSP.
   bounded-hops `readFlat` chain walker (was previously in the motif-specific
   `motif_utils.cuh`; see `MIGRATION_NOTES.md`).
 - `payload.cu` — `insertNode*` family and `allocateSpace` for appending to
-  full tail segments.
+  full tail segments; the two compaction passes (`compactSizesKernel`,
+  `compactCopyKernel`).
 - `insert_reuse.cu` — GPU best-fit reuse (locateReusableSlots,
   lowerBoundKernel, applyReuse variants).
 - `delete_avail.cu` — locate and apply deletes, reduce availability

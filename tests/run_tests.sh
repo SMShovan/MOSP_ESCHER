@@ -48,7 +48,7 @@ run_case() {
 echo "=== ESCHER CBST: contents vs a host model after every operation ==="
 run_case test_cbst_smoke                 "$BIN/test_cbst_smoke"
 for scenario in scale reuse terminator erase surplus bestfit unfill-chain \
-                random; do
+                random churn; do
     run_case "cbst_$scenario" "$BIN/test_cbst_ops" "$scenario"
 done
 

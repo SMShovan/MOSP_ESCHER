@@ -67,6 +67,21 @@ void deleteCBST(const std::vector<int>& deleteKeys, CBSTContext& ctx);
 InsertMapping insertCBST(const std::vector<int>& newKeys, const std::vector<int>& newPayload, const std::vector<int>& newPrefixSizes, CBSTContext& ctx);
 void unfillCBST(const std::vector<int>& keysToUnfill, const std::vector<int>& valuesToRemove, const std::vector<int>& removePrefixSizes, CBSTContext& ctx);
 
+// Payload compaction. Fill appends only into a row's tail segment and
+// overflow segments are bump-allocated at initialPayloadSize, so the space
+// unfill frees in earlier segments, and the segments an overflowing tail
+// leaves behind, is not reused by later fills. compactCBST rewrites every
+// row as a single segment in key order: a live row of L values gets the
+// smallest multiple of 4 above L (the padding of flatten2DVector), a
+// deleted row keeps its first segment (its reusable best-fit slot) and
+// drops its chain. Keys, node positions and availability are unchanged;
+// initialPayloadSize becomes the compacted size, which is returned.
+// fillCBST and insertCBST compact on their own, and only when the new
+// segments would not fit behind the bump pointer (so a structure that never
+// fills up behaves exactly as without compaction); they throw only if the
+// live rows plus the new values do not fit the capacity.
+int compactCBST(CBSTContext& ctx);
+
 // OO wrapper to manage CBST lifecycle and operations
 struct CBSTOperations {
     explicit CBSTOperations(const char* datasetName, int payloadCapacity, int alignment = 4);
@@ -80,6 +95,7 @@ struct CBSTOperations {
     InsertMapping insert(const std::vector<int>& insertKeys, const std::vector<int>& insertPayload, const std::vector<int>& insertPrefixSizes);
     void fill(const std::vector<int>& insertKeys, const std::vector<int>& insertPayload, const std::vector<int>& insertPrefixSizes);
     void erase(const std::vector<int>& deleteKeys);
+    int compact();
     void findAndPrint(const std::vector<int>& ids) const;
 
     // Accessor to underlying device-resident context (read-only)
