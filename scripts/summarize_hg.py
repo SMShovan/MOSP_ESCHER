@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Summarize hsospBench --hg runs (see results/README.md).
 
-Input: directories with one <kind>_<batch>_r<run>.csv (+ .log) per run,
-each run = load + consecutive batches. Per (kind, batch size) and build it
-reports medians over the runs of the per-run mean over the batches:
-dynamic time (the paper's metric: ESCHER maintenance + unification + CSR
-apply + update) and its stages, the static recompute, fallbacks and
-iterations, and the end-to-end numbers of the [e2e] log line (load time,
-sum of the dynamic times, process wall time).
+Input per build, either
+  - a directory with one <kind>_<batch>_r<run>.csv (+ .log) per run, each
+    run = load + consecutive batches, as hsospBench writes them; or
+  - a merged CSV (all rows with a leading run column, as --merge writes
+    them, e.g. results/data/dblp_final.csv) and, next to it, the
+    end-to-end numbers of every run in <name>_e2e.csv (kind, batch, run,
+    load_ms, batches, dynamic_ms, static_ms, wall_ms).
+Per (kind, batch size) and build it reports medians over the runs of the
+per-run mean over the batches: dynamic time (the paper's metric: ESCHER
+maintenance + unification + CSR apply + update) and its stages, the
+static recompute, fallbacks and iterations, and the end-to-end numbers of
+the [e2e] log line (load time, sum of the dynamic times, process wall
+time).
 
-  summarize_hg.py --build NAME DIR [--build NAME DIR ...] [--merge OUTDIR]
+  summarize_hg.py --build NAME PATH [--build NAME PATH ...] [--merge OUTDIR]
 
---merge writes one CSV per build (all rows, with a leading run column).
+--merge writes, per build, NAME.csv (all rows, with a leading run column)
+and NAME_e2e.csv, the two files a merged-CSV build reads.
 """
 import argparse
 import csv
@@ -25,7 +32,37 @@ E2E_RE = re.compile(r"\[e2e\].*load (\d+) ms, (\d+) batches: dynamic (\d+) ms, "
                     r"static (\d+) ms, wall (\d+) ms")
 
 
+E2E_FIELDS = ["kind", "batch", "run", "load_ms", "batches", "dynamic_ms",
+              "static_ms", "wall_ms"]
+
+
+def e2e_path(csv_path):
+    return csv_path[:-len(".csv")] + "_e2e.csv"
+
+
+def load_merged(path):
+    """A merged CSV plus its _e2e.csv (see the module docstring)."""
+    runs = defaultdict(dict)   # (kind, size) -> run -> dict
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            key = (r["batch_kind"], int(r["batch_size"]))
+            run = int(r["run"])
+            d = runs[key].setdefault(run, {"rows": [], "e2e": None,
+                                           "file": path})
+            d["rows"].append({k: v for k, v in r.items() if k != "run"})
+    if os.path.exists(e2e_path(path)):
+        with open(e2e_path(path)) as fh:
+            for r in csv.DictReader(fh):
+                key = (r["kind"], int(r["batch"]))
+                d = runs.get(key, {}).get(int(r["run"]))
+                if d is not None:
+                    d["e2e"] = [int(r[k]) for k in E2E_FIELDS[3:]]
+    return runs
+
+
 def load(dirname):
+    if os.path.isfile(dirname):
+        return load_merged(dirname)
     runs = defaultdict(dict)   # (kind, size) -> run -> dict
     for f in sorted(os.listdir(dirname)):
         m = FILE_RE.match(f)
@@ -125,8 +162,11 @@ def main():
         for n in names:
             path = os.path.join(a.merge, f"{n}.csv")
             header = None
-            with open(path, "w", newline="") as fh:
+            with open(path, "w", newline="") as fh, \
+                    open(e2e_path(path), "w", newline="") as eh:
                 w = None
+                ew = csv.writer(eh)
+                ew.writerow(E2E_FIELDS)
                 for k in keys:
                     for run, d in sorted(data[n].get(k, {}).items()):
                         for r in d["rows"]:
@@ -135,6 +175,8 @@ def main():
                                 w = csv.DictWriter(fh, fieldnames=header)
                                 w.writeheader()
                             w.writerow({"run": run, **r})
+                        if d["e2e"]:
+                            ew.writerow([k[0], k[1], run] + d["e2e"])
 
 
 if __name__ == "__main__":

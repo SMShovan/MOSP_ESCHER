@@ -12,11 +12,21 @@ average about 8 during the runs), CUDA 12.9 (final build) and 13.1
   CBST rank that overflows above 65,535 records, and E2, the stale subtree
   counts after insert; see [CHANGES.md](../CHANGES.md)), plus the
   real-hypergraph mode of `hsospBench` (loader, paper batch model,
-  oracle) so that it runs the same batches. Original build flags (`-O2`,
-  `-arch=sm_86`). The unmodified original does not complete: it aborts on
-  the first batch (colliding hyperedge id) or crashes in construct.
-  Its results are correct only because every batch falls back to a full
-  recompute; its ESCHER contents are not (CHANGES.md, E3-E7).
+  oracle) so that it runs the same batch model. Original build flags
+  (`-O2`, `-arch=sm_86`), CUDA 13.1. The unmodified original does not
+  complete: it aborts on the first batch (colliding hyperedge id) or
+  crashes in construct. Its results are correct only because every batch
+  falls back to a full recompute; its ESCHER contents are not
+  (CHANGES.md, E3-E7). The build is
+  [baseline_original_E1E2.patch](baseline_original_E1E2.patch) applied to
+  the tag:
+
+  ```bash
+  git worktree add ../baseline baseline-2026-09
+  git -C ../baseline apply "$PWD/results/baseline_original_E1E2.patch"
+  make -C ../baseline CUDA_ARCH=sm_86 NVCC=/usr/local/cuda-13.1/bin/nvcc \
+      bin/hsospBench
+  ```
 - **final**: this branch, measured at commit `07bbceb` (later commits
   only zero allocations for the sanitizer, replace a deprecated functor
   and change documentation).
@@ -164,13 +174,37 @@ coauth-MAG-Geology:
 
 - `data/<dataset>_original_E1E2.csv`, `data/<dataset>_final.csv`: every
   batch of the timing runs (column `run` = 1..3, `rep` = batch index).
-  The baseline CSVs have the original column set.
+  The baseline CSVs lack the final build's columns `fallback_iters`,
+  `invalidated`, `update_work` and `static_iters`; they already carry
+  `oracle`, `mismatch_static`, `mismatch_oracle` and `parent_errors`,
+  which the benchmark's real-hypergraph mode added to both builds.
+- `data/<dataset>_<build>_e2e.csv`: the `[e2e]` line of every timing run
+  (load time, batches, sums of the dynamic and static times, process wall
+  time; ms), the source of the load columns.
 - `data/<dataset>_verify.csv`: the oracle runs (`verified` = 1).
+- `baseline_original_E1E2.patch`: the original+E1E2 build (see Builds).
+
+The inputs are Benson et al.'s coauth-DBLP-full and coauth-MAG-Geology-full
+simplicial datasets, which list a simplex once per timestamp. The paper
+uses each distinct simplex once, and `hsospBench` does not remove repeated
+lines, so `scripts/benson_to_hg.py` writes one line per distinct vertex
+set (vertices sorted and renumbered 1..V in id order): DBLP 3,700,681
+simplices → 2,467,389 lines, Geology 1,203,895 lines. `--maxcard 25`
+(the default) then keeps 2,466,792 and 1,203,895 hyperedges.
 
 ```bash
-# one configuration (DBLP file: one hyperedge per line)
+./scripts/benson_to_hg.py coauth-DBLP-full/coauth-DBLP-full coauth.hg
+# one run of one configuration; the sweep ran every kind x batch size for
+# runs r1..r3 with each build
 ./bin/hsospBench --hg coauth.hg --kind hyperedge --batch 50000 --batches 3 \
-    --verify none --out hyperedge_50000_r1.csv 2> hyperedge_50000_r1.log
-# tables from a directory of <kind>_<batch>_r<run>.csv/.log files
-./scripts/summarize_hg.py --build original+E1E2 base/ --build final final/
+    --verify none --out final/hyperedge_50000_r1.csv \
+    2> final/hyperedge_50000_r1.log
+# the tables above, from the committed data
+./scripts/summarize_hg.py \
+    --build original+E1E2 results/data/dblp_original_E1E2.csv \
+    --build final results/data/dblp_final.csv
+# the same from directories of <kind>_<batch>_r<run>.csv / .log files;
+# --merge writes the merged CSVs and the _e2e.csv files of results/data
+./scripts/summarize_hg.py --build dblp_original_E1E2 base/ \
+    --build dblp_final final/ --merge merged/
 ```

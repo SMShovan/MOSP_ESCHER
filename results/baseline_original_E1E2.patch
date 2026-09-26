@@ -1,0 +1,1098 @@
+diff --git a/Makefile b/Makefile
+index 99d352a..e0343e1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -25,7 +25,7 @@ CUDA_ARCH ?= sm_70
+ INCLUDES  := -Iescher/include -Iescher/kernel -Igraph/include -Imosp/headers \
+              -Ihypergraph/include -Ihsosp/include
+ 
+-NVFLAGS   := -std=c++17 -O2 --extended-lambda -arch=$(CUDA_ARCH) $(INCLUDES)
++NVFLAGS   := -std=c++17 -O2 -Xcompiler -fopenmp --extended-lambda -arch=$(CUDA_ARCH) $(INCLUDES)
+ CXXFLAGS  := -std=c++17 -O2 -Wall $(INCLUDES)
+ 
+ BUILDDIR  := build
+@@ -88,6 +88,7 @@ MOSP_PSTRESS_OBJS := $(MOSP_PSTRESS:%=$(BUILDDIR)/%.o)
+ HYPERGRAPH_SRCS := \
+     hypergraph/src/HostHypergraph.cpp \
+     hypergraph/src/HypergraphGen.cpp \
++    hypergraph/src/HypergraphOracle.cpp \
+     hypergraph/src/DynamicHypergraph.cpp
+ HSOSP_DEV_SRCS  := hsosp/src/hsospDevice.cu
+ 
+diff --git a/escher/kernel/build_tree.cu b/escher/kernel/build_tree.cu
+index 651aeae..075a000 100644
+--- a/escher/kernel/build_tree.cu
++++ b/escher/kernel/build_tree.cu
+@@ -19,12 +19,7 @@ __global__ void storeItemsIntoNodes(CBSTNode *nodes, int *indices, int *values,
+                                     int n, int totalSize) {
+   int tid = threadIdx.x + blockIdx.x * blockDim.x;
+   if (tid < n) {
+-    int log2_tid = floor_log2(tid + 1);
+-    int log2_n = floor_log2(n);
+-    int index = ((2 * (tid + 1 - (1 << log2_tid))) + 1) * (1 << log2_n) /
+-                (1 << log2_tid);
+-    int index2 = min(index, index - (index / 2) + (n + 1 - (1 << log2_n)));
+-    index2--;
++    int index2 = cbstRankOfPosition(tid, n);
+     nodes[tid].size = totalSize;
+     if (index2 < n) {
+       nodes[tid].index = indices[index2];
+diff --git a/escher/kernel/device_utils.cuh b/escher/kernel/device_utils.cuh
+index 68aa756..2b08f61 100644
+--- a/escher/kernel/device_utils.cuh
++++ b/escher/kernel/device_utils.cuh
+@@ -35,4 +35,17 @@ static inline __device__ int floor_log2(int x) {
+     return log;
+ }
+ 
+-
++// In-order rank (0-based index into the sorted keys) of the node stored at
++// heap position `pos` of a complete binary search tree with n nodes (the
++// CBST layout). (2*(pos+1-2^k)+1) * 2^log2_n / 2^k is evaluated as a 64-bit
++// shift: the int32 product of the original formula overflowed for
++// n > 65,535, which broke the BST order (keys unreachable) and produced
++// negative ranks that indexed the key / offset arrays out of bounds.
++static inline __device__ int cbstRankOfPosition(int pos, int n) {
++    int k = floor_log2(pos + 1);
++    int log2_n = floor_log2(n);
++    long long index = (2LL * (pos + 1 - (1LL << k)) + 1) << (log2_n - k);
++    long long index2 =
++        min(index, index - (index / 2) + (n + 1 - (1LL << log2_n)));
++    return static_cast<int>(index2 - 1);
++}
+diff --git a/escher/kernel/insert_reuse.cu b/escher/kernel/insert_reuse.cu
+index 9f4d918..fe515eb 100644
+--- a/escher/kernel/insert_reuse.cu
++++ b/escher/kernel/insert_reuse.cu
+@@ -105,14 +105,7 @@ __global__ void extractKeysFromPositions(int *d_keys, int *positions,
+     outKeys[tid] = 0;
+     return;
+   }
+-  int log2_pos = floor_log2(pos + 1);
+-  int log2_n = floor_log2(numRecords);
+-  int index =
+-      ((2 * (pos + 1 - (1 << log2_pos))) + 1) * (1 << log2_n) / (1 << log2_pos);
+-  int index2 =
+-      min(index, index - (index / 2) + (numRecords + 1 - (1 << log2_n)));
+-  index2--;
+-  outKeys[tid] = d_keys[index2];
++  outKeys[tid] = d_keys[cbstRankOfPosition(pos, numRecords)];
+ }
+ 
+ // ── Phase 2: Apply reuse ────────────────────────────────────────────────
+diff --git a/escher/structure/operations.cu b/escher/structure/operations.cu
+index 45f06ab..dad8a11 100644
+--- a/escher/structure/operations.cu
++++ b/escher/structure/operations.cu
+@@ -50,12 +50,7 @@ __global__ void setInitialOccupancy(CBSTNode *nodes, const int *rowOccupancy,
+                                     int n) {
+   int tid = threadIdx.x + blockIdx.x * blockDim.x;
+   if (tid < n) {
+-    int log2_tid = floor_log2(tid + 1);
+-    int log2_n = floor_log2(n);
+-    int index = ((2 * (tid + 1 - (1 << log2_tid))) + 1) * (1 << log2_n) /
+-                (1 << log2_tid);
+-    int index2 = min(index, index - (index / 2) + (n + 1 - (1 << log2_n)));
+-    index2--;
++    int index2 = cbstRankOfPosition(tid, n);
+     if (index2 < n) {
+       nodes[tid].occupancy = rowOccupancy[index2];
+     }
+@@ -865,8 +860,7 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
+   int levelStart = lastLevelStart - 1;
+   if (levelStart >= ctx.numRecords)
+     levelStart = (lastLevelStart >> 1) - 1;
+-  for (int levelEnd = ctx.numRecords - 1; levelStart >= 0;
+-       levelStart = (levelStart - 1) / 2) {
++  for (int levelEnd = ctx.numRecords - 1; levelStart >= 0;) {
+     int start = levelStart;
+     int end = levelEnd;
+     int count = end - start + 1;
+diff --git a/hsosp/src/hsospBench.cu b/hsosp/src/hsospBench.cu
+index 1395145..7e53d4a 100644
+--- a/hsosp/src/hsospBench.cu
++++ b/hsosp/src/hsospBench.cu
+@@ -7,6 +7,13 @@
+  *   hsospBench --suite smoke --out results/results.csv
+  *   hsospBench --suite full  --out results/results.csv
+  *   hsospBench --suite full  --exp E1,E3 --reps 3 --seed 42
++ *   hsospBench --hg coauth.hg --kind hyperedge --batch 50000 --batches 3
++ *
++ * --hg runs a real hypergraph (one hyperedge per line) with the paper's
++ * preprocessing and batch model (Section VI; see loadHypergraphFile and
++ * generatePaperBatch): consecutive batches of --batch changes, --del %
++ * deletions, of --kind hyperedge or vertex, one CSV row per batch. The
++ * oracle checks the batches selected by --verify (all, first, none).
+  *
+  * Experiments (see docs/HSOSP.md):
+  *   E1 time vs changed-batch size (hyperedge + incident-vertex batches)
+@@ -27,6 +34,8 @@
+ #include <cstring>
+ #include <ctime>
+ #include <fstream>
++#include <memory>
++#include <random>
+ #include <iostream>
+ #include <sstream>
+ #include <string>
+@@ -34,6 +43,7 @@
+ 
+ #include "DynamicHypergraph.hpp"
+ #include "HypergraphGen.hpp"
++#include "HypergraphOracle.hpp"
+ #include "hsosp.cuh"
+ 
+ using namespace escher_mosp;
+@@ -51,10 +61,22 @@ struct CliOptions {
+     std::string out = "results/results.csv";
+     std::string experiments = "E1,E2,E3,E4,E5,E7";
+     int reps = 3;
+-    long long verifyMax = 300000;   ///< host-Dijkstra gate on hyperedge count
++    /// Independent oracle (Dijkstra on the line graph rebuilt from the
++    /// incidence lists) for every batch of a hypergraph with at most this
++    /// many hyperedge ids.
++    long long verifyMax = 5000000;
+     int maxIterations = 512;
+     unsigned long long seed = 20260725ull;
+     bool listOnly = false;
++    // Real-hypergraph mode (--hg).
++    std::string hgPath;
++    int maxCardinality = 25;
++    BatchKind kind = BatchKind::Hyperedge;
++    int batchSize = 50000;
++    int batches = 3;
++    double delPct = 50.0;
++    double replaceFrac = 0.3;
++    std::string verifyMode = "first";   ///< all | first | none
+ };
+ 
+ struct DatasetCfg {
+@@ -128,7 +150,8 @@ public:
+                     "t_csr_apply_ms,t_sosp_update_ms,t_dynamic_total_ms,"
+                     "t_static_ms,speedup,iters,fallback,seeds,max_frontier,"
+                     "overflow_rebuilds,dev_mem_mb,escher_mb,graph_mb,"
+-                    "reachable_frac,verified,correct\n";
++                    "reachable_frac,verified,correct,oracle,"
++                    "mismatch_static,mismatch_oracle,parent_errors\n";
+             out_.flush();
+         }
+     }
+@@ -164,30 +187,24 @@ struct LoadedDataset {
+ 
+ int globalFailures = 0;
+ 
+-std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
+-                                           const CliOptions& opt,
+-                                           unsigned long long seed,
+-                                           int plannedInsertTotal) {
+-    GenParams gen = toGenParams(d, seed);
+-    std::fprintf(stderr,
+-                 "[load] %s: m=%lld n=%d c=[%d,%d] pool=%d degTarget=%d\n",
+-                 d.name.c_str(), gen.numHyperedges, gen.numVertices, gen.cMin,
+-                 gen.cMax, gen.poolSize, d.degTarget);
+-
++/** Builds ESCHER, the device CSR and the initial SOSP for @p g. */
++std::unique_ptr<LoadedDataset> buildDataset(const std::string& name,
++                                            GeneratedHypergraph&& g,
++                                            const GenParams& gen,
++                                            const CliOptions& opt,
++                                            int plannedInsertTotal,
++                                            long long payloadPerInsert) {
+     auto t0 = Clock::now();
+-    GeneratedHypergraph g = generateHypergraph(gen);
+-
+     DynamicHypergraph::Caps caps;
+     caps.maxHyperedges =
+         static_cast<int>(g.rows.size()) + plannedInsertTotal + 1024;
+     caps.headroomFactor = 1.3;
+     // Growth headroom: every planned insert appends into h2v/v2h/h2h.
+     caps.extraPayloadInts =
+-        static_cast<long long>(plannedInsertTotal) *
+-            (gen.cMax + d.degTarget * 2 + 16) +
++        static_cast<long long>(plannedInsertTotal) * payloadPerInsert +
+         (8LL << 20);
+ 
+-    auto ds = std::make_unique<LoadedDataset>(gen.numVertices, caps);
++    auto ds = std::make_unique<LoadedDataset>(g.numVertices, caps);
+     ds->gen = gen;
+     ds->dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
+                     g.targetHe);
+@@ -196,7 +213,7 @@ std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
+     HostHypergraph& hg = ds->dh.host();
+     std::fprintf(stderr,
+                  "[load] %s: built in %.0f ms; h2h pairs=%lld avgDeg=%.1f\n",
+-                 d.name.c_str(), loadMs, hg.h2hPairCount,
++                 name.c_str(), loadMs, hg.h2hPairCount,
+                  hg.aliveCount ? 2.0 * hg.h2hPairCount / hg.aliveCount : 0.0);
+ 
+     t0 = Clock::now();
+@@ -211,7 +228,7 @@ std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
+     std::fprintf(stderr,
+                  "[load] %s: device build+initial SOSP in %.0f ms "
+                  "(%d iterations)\n",
+-                 d.name.c_str(), msSince(t0), is.iterations);
++                 name.c_str(), msSince(t0), is.iterations);
+ 
+     // Reachable fraction from the initial solve.
+     {
+@@ -224,17 +241,167 @@ std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
+         ds->reachableFrac =
+             hg.aliveCount ? static_cast<double>(reach) / hg.aliveCount : 0.0;
+         std::fprintf(stderr, "[load] %s: reachable fraction %.3f\n",
+-                     d.name.c_str(), ds->reachableFrac);
++                     name.c_str(), ds->reachableFrac);
+     }
+     return ds;
+ }
+ 
+-void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
+-                 const Scenario& sc, const CliOptions& opt, CsvWriter& csv) {
++std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
++                                           const CliOptions& opt,
++                                           unsigned long long seed,
++                                           int plannedInsertTotal) {
++    GenParams gen = toGenParams(d, seed);
++    std::fprintf(stderr,
++                 "[load] %s: m=%lld n=%d c=[%d,%d] pool=%d degTarget=%d\n",
++                 d.name.c_str(), gen.numHyperedges, gen.numVertices, gen.cMin,
++                 gen.cMax, gen.poolSize, d.degTarget);
++    GeneratedHypergraph g = generateHypergraph(gen);
++    return buildDataset(d.name, std::move(g), gen, opt, plannedInsertTotal,
++                        gen.cMax + d.degTarget * 2 + 16);
++}
++
++/** Timings, counters and checks of one batch. */
++struct BatchOutcome {
++    bool ok = false;             ///< false: the pipeline threw
++    DynamicHypergraph::BatchResult br;
++    double csrMs = 0.0, sospMs = 0.0, staticMs = 0.0;
++    hsosp::UpdateStats us;
++    long long mismatchStatic = 0;
++    bool oracleRan = false;
++    SospCheck oracle;
++    bool correct() const {
++        return ok && mismatchStatic == 0 && (!oracleRan || oracle.ok());
++    }
++    bool verified() const { return ok && oracleRan && oracle.ok(); }
++    double dynamicMs() const {
++        return br.escherMs + br.deltaMs + csrMs + sospMs;
++    }
++};
++
++/**
++ * Runs one batch: the dynamic pipeline (timed: ESCHER maintenance +
++ * unification + CSR apply + SOSP update, the paper's dynamic time), the
++ * static recompute baseline (timed separately) and the checks: update ==
++ * recompute always, and the independent oracle when @p verify.
++ */
++BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
++                      const CliOptions& opt, bool verify,
++                      const std::string& what) {
++    BatchOutcome o;
+     HostHypergraph& hg = ds.dh.host();
+     hsosp::UpdateConfig ucfg;
+     ucfg.maxIterations = opt.maxIterations;
+ 
++    // ---- dynamic pipeline (timed) --------------------------------------
++    try {
++        o.br = ds.dh.applyBatch(batch);
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "[error] %s: applyBatch failed: %s\n",
++                     what.c_str(), e.what());
++        ++globalFailures;
++        return o;
++    }
++
++    auto t0 = Clock::now();
++    bool ok = hsosp::applyDeltaToDevice(ds.dev, hg, o.br.delta);
++    o.csrMs = msSince(t0);
++    if (!ok) {
++        // Tail exhausted: rebuild from the shadow (counted, not timed
++        // as part of the update) and re-run this batch's CSR stage as
++        // a rebuild (the rebuild itself installs the post-batch state).
++        ++ds.overflowRebuilds;
++        std::fprintf(stderr, "[warn] %s: device CSR overflow, rebuilding\n",
++                     what.c_str());
++        hsosp::buildDeviceH2H(ds.dev, hg, ds.stateA.maxNodes, 1.6);
++    }
++
++    t0 = Clock::now();
++    o.us = hsosp::hsospUpdate(ds.dev, ds.stateA, o.br.delta.seeds,
++                              o.br.delta.deadHe, hg.sourceHe, ucfg);
++    o.sospMs = msSince(t0);
++
++    // ---- static baseline (timed) ---------------------------------------
++    t0 = Clock::now();
++    hsosp::hsospRecompute(ds.dev, ds.stateB, hg.sourceHe, ucfg);
++    o.staticMs = msSince(t0);
++
++    // ---- correctness ---------------------------------------------------
++    // update == static recompute (same kernels, so not independent),
++    // and, when the oracle runs, update == Dijkstra on the line graph
++    // rebuilt from the incidence lists, with a valid shortest-path tree.
++    o.mismatchStatic =
++        hsosp::compareDistances(ds.stateA, ds.stateB, hg.maxId());
++    o.oracleRan = verify;
++    if (verify) {
++        LineGraphCSR lg = rebuildLineGraph(hg);
++        std::vector<long long> got;
++        std::vector<int> par;
++        ds.stateA.downloadDistances(got, hg.maxId());
++        ds.stateA.downloadParents(par, hg.maxId());
++        o.oracle = checkSosp(hg, lg, referenceDistances(hg, lg, hg.sourceHe),
++                             got, par);
++    }
++    o.ok = true;
++    if (!o.correct()) {
++        ++globalFailures;
++        std::fprintf(stderr,
++                     "[FAIL] %s: %lld mismatches vs static, %lld vs oracle, "
++                     "%lld parent errors\n",
++                     what.c_str(), o.mismatchStatic, o.oracle.distMismatches,
++                     o.oracle.parentErrors);
++    }
++    return o;
++}
++
++/** Appends the CSV row of one batch. */
++void writeRow(CsvWriter& csv, const CliOptions& opt, const std::string& exp,
++              const std::string& dataset, const LoadedDataset& ds,
++              BatchKind kind, int batchSize, double delPct, Placement pl,
++              int rep, unsigned long long seed, const BatchOutcome& o) {
++    const HostHypergraph& hg = ds.dh.host();
++    const double dynTotal = o.dynamicMs();
++    const double avgDeg =
++        hg.aliveCount ? 2.0 * hg.h2hPairCount / hg.aliveCount : 0.0;
++    auto& r = csv.row();
++    r << nowString() << "," << opt.suite << "," << exp << "," << dataset
++      << "," << ds.gen.numHyperedges << "," << ds.gen.numVertices << ","
++      << ds.gen.cMin << "," << ds.gen.cMax << "," << ds.gen.poolSize << ","
++      << ds.gen.bridgeFrac << "," << avgDeg << "," << hg.h2hPairCount << ","
++      << toString(kind) << "," << batchSize << "," << delPct << ","
++      << toString(pl) << "," << rep << "," << seed << "," << o.br.escherMs
++      << "," << o.br.deltaMs << "," << o.csrMs << "," << o.sospMs << ","
++      << dynTotal << "," << o.staticMs << ","
++      << (dynTotal > 0 ? o.staticMs / dynTotal : 0.0) << ","
++      << o.us.iterations << "," << (o.us.fallbackRecompute ? 1 : 0) << ","
++      << o.us.seedCount << "," << o.us.maxFrontier << ","
++      << ds.overflowRebuilds << "," << deviceMemUsedMB() << ","
++      << ds.dh.escherDeviceBytes() / (1024.0 * 1024.0) << ","
++      << (ds.dev.deviceBytes() + ds.stateA.deviceBytes() +
++          ds.stateB.deviceBytes()) /
++             (1024.0 * 1024.0)
++      << "," << ds.reachableFrac << "," << (o.verified() ? 1 : 0) << ","
++      << (o.correct() ? 1 : 0) << "," << (o.oracleRan ? "host" : "none")
++      << "," << o.mismatchStatic << ","
++      << (o.oracleRan ? o.oracle.distMismatches : -1) << ","
++      << (o.oracleRan ? o.oracle.parentErrors : -1);
++    csv.endRow();
++    std::fprintf(stderr,
++                 "[row] %s %s %s dE=%d del=%.0f %s rep=%d: "
++                 "dyn=%.1fms (escher=%.1f delta=%.1f csr=%.1f "
++                 "sosp=%.1f) static=%.1fms speedup=%.2f iters=%d%s%s\n",
++                 dataset.c_str(), exp.c_str(), toString(kind), batchSize,
++                 delPct, toString(pl), rep, dynTotal, o.br.escherMs,
++                 o.br.deltaMs, o.csrMs, o.sospMs, o.staticMs,
++                 dynTotal > 0 ? o.staticMs / dynTotal : 0.0, o.us.iterations,
++                 o.us.fallbackRecompute ? " FALLBACK" : "",
++                 o.oracleRan ? (o.verified() ? " verified" : " ORACLE-FAIL")
++                             : "");
++}
++
++void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
++                 const Scenario& sc, const CliOptions& opt, CsvWriter& csv) {
++    HostHypergraph& hg = ds.dh.host();
++
+     for (int rep = 0; rep < opt.reps; ++rep) {
+         unsigned long long bseed = mixSeed(
+             opt.seed, std::hash<std::string>{}(dcfg.name + sc.experiment +
+@@ -249,6 +416,7 @@ void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
+         if (sc.placement != Placement::Random) {
+             ds.stateA.downloadDistances(distSnapshot, hg.maxId());
+             ds.stateA.downloadParents(parentSnapshot, hg.maxId());
++            for (int& p : parentSnapshot) if (p >= 0) p += 1;
+         }
+         BatchParams bp;
+         bp.size = sc.batchSize;
+@@ -259,107 +427,68 @@ void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
+         HgBatch batch =
+             generateBatch(hg, ds.gen, bp, distSnapshot, parentSnapshot);
+ 
+-        // ---- dynamic pipeline (timed) ----------------------------------
+-        double csrMs = 0.0, sospMs = 0.0;
+-        DynamicHypergraph::BatchResult br;
+-        try {
+-            br = ds.dh.applyBatch(batch);
+-        } catch (const std::exception& e) {
+-            std::fprintf(stderr, "[error] %s %s: applyBatch failed: %s\n",
+-                         dcfg.name.c_str(), sc.experiment.c_str(), e.what());
+-            ++globalFailures;
+-            return;
+-        }
+-
+-        auto t0 = Clock::now();
+-        bool ok = hsosp::applyDeltaToDevice(ds.dev, hg, br.delta);
+-        csrMs = msSince(t0);
+-        if (!ok) {
+-            // Tail exhausted: rebuild from the shadow (counted, not timed
+-            // as part of the update) and re-run this batch's CSR stage as
+-            // a rebuild (the rebuild itself installs the post-batch state).
+-            ++ds.overflowRebuilds;
+-            std::fprintf(stderr,
+-                         "[warn] %s: device CSR overflow, rebuilding\n",
+-                         dcfg.name.c_str());
+-            hsosp::buildDeviceH2H(ds.dev, hg, ds.stateA.maxNodes, 1.6);
+-        }
+-
+-        t0 = Clock::now();
+-        hsosp::UpdateStats us =
+-            hsosp::hsospUpdate(ds.dev, ds.stateA, br.delta.seeds,
+-                               br.delta.deadHe, hg.sourceHe, ucfg);
+-        sospMs = msSince(t0);
+-
+-        // ---- static baseline (timed) -----------------------------------
+-        t0 = Clock::now();
+-        hsosp::UpdateStats rs =
+-            hsosp::hsospRecompute(ds.dev, ds.stateB, hg.sourceHe, ucfg);
+-        double staticMs = msSince(t0);
+-        (void)rs;
+-
+-        // ---- correctness ----------------------------------------------
+-        long long mismatches =
+-            hsosp::compareDistances(ds.stateA, ds.stateB, hg.maxId());
+-        bool verified = true;
+-        bool correct = (mismatches == 0);
+-        if (hg.maxId() <= opt.verifyMax) {
+-            std::vector<long long> got;
+-            ds.stateA.downloadDistances(got, hg.maxId());
+-            std::vector<long long> truth = hg.dijkstra(hg.sourceHe);
+-            for (int i = 0; i < hg.maxId(); ++i) {
+-                if (got[i] != truth[i]) {
+-                    correct = false;
+-                    break;
+-                }
+-            }
+-        }
+-        if (!correct) {
+-            ++globalFailures;
+-            std::fprintf(stderr,
+-                         "[FAIL] %s %s rep %d: distance mismatch "
+-                         "(%lld vs static)\n",
+-                         dcfg.name.c_str(), sc.experiment.c_str(), rep,
+-                         mismatches);
+-        }
+-
+-        const double dynTotal = br.escherMs + br.deltaMs + csrMs + sospMs;
+-        const double avgDeg =
+-            hg.aliveCount ? 2.0 * hg.h2hPairCount / hg.aliveCount : 0.0;
+-
+-        auto& o = csv.row();
+-        o << nowString() << "," << opt.suite << "," << sc.experiment << ","
+-          << dcfg.name << "," << ds.gen.numHyperedges << ","
+-          << ds.gen.numVertices << "," << ds.gen.cMin << "," << ds.gen.cMax
+-          << "," << ds.gen.poolSize << "," << ds.gen.bridgeFrac << ","
+-          << avgDeg << "," << hg.h2hPairCount << "," << toString(sc.kind)
+-          << "," << sc.batchSize << "," << sc.delPct << ","
+-          << toString(sc.placement) << "," << rep << "," << bseed << ","
+-          << br.escherMs << "," << br.deltaMs << "," << csrMs << ","
+-          << sospMs << "," << dynTotal << "," << staticMs << ","
+-          << (dynTotal > 0 ? staticMs / dynTotal : 0.0) << ","
+-          << us.iterations << "," << (us.fallbackRecompute ? 1 : 0) << ","
+-          << us.seedCount << "," << us.maxFrontier << ","
+-          << ds.overflowRebuilds << "," << deviceMemUsedMB() << ","
+-          << ds.dh.escherDeviceBytes() / (1024.0 * 1024.0) << ","
+-          << (ds.dev.deviceBytes() + ds.stateA.deviceBytes() +
+-              ds.stateB.deviceBytes()) /
+-                 (1024.0 * 1024.0)
+-          << "," << ds.reachableFrac << "," << (verified ? 1 : 0) << ","
+-          << (correct ? 1 : 0);
+-        csv.endRow();
++        const std::string what = dcfg.name + " " + sc.experiment +
++                                 " rep " + std::to_string(rep);
++        BatchOutcome o = runBatch(ds, batch, opt,
++                                  hg.maxId() <= opt.verifyMax, what);
++        if (!o.ok) return;
++        writeRow(csv, opt, sc.experiment, dcfg.name, ds, sc.kind,
++                 sc.batchSize, sc.delPct, sc.placement, rep, bseed, o);
++    }
++}
+ 
+-        std::fprintf(stderr,
+-                     "[row] %s %s %s dE=%d del=%.0f %s rep=%d: "
+-                     "dyn=%.1fms (escher=%.1f delta=%.1f csr=%.1f "
+-                     "sosp=%.1f) static=%.1fms speedup=%.2f iters=%d%s\n",
+-                     dcfg.name.c_str(), sc.experiment.c_str(),
+-                     toString(sc.kind), sc.batchSize, sc.delPct,
+-                     toString(sc.placement), rep, dynTotal, br.escherMs,
+-                     br.deltaMs, csrMs, sospMs, staticMs,
+-                     dynTotal > 0 ? staticMs / dynTotal : 0.0, us.iterations,
+-                     us.fallbackRecompute ? " FALLBACK" : "");
++/** --hg mode: a real hypergraph, the paper's preprocessing and batches. */
++int runRealDataset(const CliOptions& opt, CsvWriter& csv) {
++    auto tStart = Clock::now();
++    auto t0 = Clock::now();
++    GeneratedHypergraph g =
++        loadHypergraphFile(opt.hgPath, opt.maxCardinality, opt.seed);
++    const double readMs = msSince(t0);
++    std::string name = opt.hgPath;
++    const auto slash = name.find_last_of('/');
++    if (slash != std::string::npos) name = name.substr(slash + 1);
++    GenParams gen;
++    gen.numHyperedges = static_cast<long long>(g.rows.size()) - 2;
++    gen.numVertices = g.numVertices;
++    gen.cMin = 1;
++    gen.cMax = opt.maxCardinality;
++    gen.poolSize = 0;
++    gen.bridgeFrac = 0;
++    gen.seed = opt.seed;
++    std::fprintf(stderr,
++                 "[load] %s: %lld hyperedges (cardinality <= %d), %d "
++                 "vertices, read in %.0f ms\n",
++                 name.c_str(), gen.numHyperedges, opt.maxCardinality,
++                 gen.numVertices, readMs);
++    const int plannedInserts =
++        (opt.kind == BatchKind::Hyperedge ? opt.batchSize : 0) * opt.batches +
++        65536;
++    auto ds = buildDataset(name, std::move(g), gen, opt, plannedInserts,
++                           opt.maxCardinality + 2 * 128 + 16);
++    const double loadMs = msSince(tStart);
++
++    std::mt19937_64 rng(mixSeed(opt.seed, 0x5eedull));
++    double dynamicSum = 0.0, staticSum = 0.0;
++    for (int b = 0; b < opt.batches; ++b) {
++        HgBatch batch = generatePaperBatch(ds->dh.host(), opt.kind,
++                                           opt.batchSize, opt.delPct,
++                                           opt.replaceFrac, rng);
++        const bool verify = opt.verifyMode == "all" ||
++                            (opt.verifyMode == "first" && b == 0);
++        BatchOutcome o = runBatch(*ds, batch, opt, verify,
++                                  name + " batch " + std::to_string(b));
++        if (!o.ok) return 1;
++        dynamicSum += o.dynamicMs();
++        staticSum += o.staticMs;
++        writeRow(csv, opt, "paper", name, *ds, opt.kind, opt.batchSize,
++                 opt.delPct, Placement::Random, b, opt.seed, o);
+     }
++    std::fprintf(stderr,
++                 "[e2e] %s: load %.0f ms, %d batches: dynamic %.0f ms, "
++                 "static %.0f ms, wall %.0f ms\n",
++                 name.c_str(), loadMs, opt.batches, dynamicSum, staticSum,
++                 msSince(tStart));
++    return 0;
+ }
+ 
+ bool wantExp(const CliOptions& opt, const char* e) {
+@@ -389,11 +518,57 @@ int main(int argc, char** argv) {
+             opt.maxIterations = std::stoi(next("--maxiter"));
+         else if (a == "--seed") opt.seed = std::stoull(next("--seed"));
+         else if (a == "--list") opt.listOnly = true;
++        else if (a == "--hg") opt.hgPath = next("--hg");
++        else if (a == "--maxcard")
++            opt.maxCardinality = std::stoi(next("--maxcard"));
++        else if (a == "--kind") {
++            std::string k = next("--kind");
++            if (k == "hyperedge") opt.kind = BatchKind::Hyperedge;
++            else if (k == "vertex") opt.kind = BatchKind::Vertex;
++            else {
++                std::fprintf(stderr, "--kind must be hyperedge or vertex\n");
++                return 2;
++            }
++        }
++        else if (a == "--batch") opt.batchSize = std::stoi(next("--batch"));
++        else if (a == "--batches") opt.batches = std::stoi(next("--batches"));
++        else if (a == "--del") opt.delPct = std::stod(next("--del"));
++        else if (a == "--verify") {
++            opt.verifyMode = next("--verify");
++            if (opt.verifyMode != "all" && opt.verifyMode != "first" &&
++                opt.verifyMode != "none") {
++                std::fprintf(stderr, "--verify must be all, first or none\n");
++                return 2;
++            }
++        }
+         else {
+             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
+             return 2;
+         }
+     }
++    if (!opt.hgPath.empty()) {
++        if (opt.batchSize < 1 || opt.batches < 0 || opt.maxCardinality < 1 ||
++            !(opt.delPct >= 0 && opt.delPct <= 100)) {
++            std::fprintf(stderr, "invalid --batch/--batches/--maxcard/--del\n");
++            return 2;
++        }
++        opt.suite = "real";
++        auto slash = opt.out.find_last_of('/');
++        if (slash != std::string::npos) {
++            std::string dir = "mkdir -p " + opt.out.substr(0, slash);
++            int rc = std::system(dir.c_str());
++            (void)rc;
++        }
++        CsvWriter csv(opt.out);
++        int rc = 1;
++        try {
++            rc = runRealDataset(opt, csv);
++        } catch (const std::exception& e) {
++            std::fprintf(stderr, "[error] %s\n", e.what());
++        }
++        if (rc == 0 && globalFailures > 0) rc = 1;
++        return rc;
++    }
+     const bool smoke = (opt.suite == "smoke");
+ 
+     // ---- dataset tables --------------------------------------------------
+diff --git a/hypergraph/include/HypergraphGen.hpp b/hypergraph/include/HypergraphGen.hpp
+index ef0a3c1..1cf4f1b 100644
+--- a/hypergraph/include/HypergraphGen.hpp
++++ b/hypergraph/include/HypergraphGen.hpp
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include <cstdint>
++#include <random>
+ #include <string>
+ #include <vector>
+ 
+@@ -72,13 +73,51 @@ struct BatchParams {
+  * @param bp      batch parameters.
+  * @param dist    current SOSP distances indexed by (heId-1); required for
+  *                Targeted / Near / Far placements (pass empty for Random).
+- * @param parent  current SOSP parents; required for Targeted.
++ * @param parent  current SOSP parents as 1-based hyperedge ids (-1 or 0
++ *                for none), indexed by (heId-1); required for Targeted.
++ *                Device parents are 0-based node indices: download them
++ *                with HsospState::downloadParentIds.
+  */
+ HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
+                       const BatchParams& bp,
+                       const std::vector<long long>& dist,
+                       const std::vector<int>& parent);
+ 
++/**
++ * @brief Loads a real hypergraph with the paper's preprocessing.
++ *
++ * Input: one hyperedge per line, vertex ids separated by spaces, tabs or
++ * commas (e.g. coauth-DBLP). Duplicate vertices of a line are merged,
++ * hyperedges with more than @p maxCardinality vertices are dropped, and the
++ * vertex ids are renumbered 0..n-1 in order of first appearance. Real
++ * hyperedges get weights U[1,100] (seeded; the paper does not say how it
++ * weights real data). The virtual source hyperedge {s} is row 1 (s = a
++ * vertex of maximum degree) and the virtual target {t} the last row (t =
++ * a uniformly random vertex), both with weight 0.
++ *
++ * @throws std::runtime_error if the file cannot be read or has no
++ *         hyperedge within the cardinality bound.
++ */
++GeneratedHypergraph loadHypergraphFile(const std::string& path,
++                                       int maxCardinality,
++                                       std::uint64_t seed);
++
++/**
++ * @brief Change batch following the paper's model (Section VI).
++ *
++ * Hyperedge batch: @p delPct % of @p size are deletions of distinct random
++ * hyperedges; each insertion clones a random hyperedge, replaces about
++ * @p replaceFrac of its vertices by vertices of a neighbouring hyperedge
++ * (one that shares a vertex with it) and draws a weight U[1,100]. Vertex
++ * batch: each change removes a random member of a random hyperedge
++ * (probability @p delPct %) or adds a vertex of a neighbouring hyperedge.
++ * The virtual source and target hyperedges are never changed. Neighbours
++ * are found through the incidence lists (HostHypergraph::v2h).
++ */
++HgBatch generatePaperBatch(const HostHypergraph& hg, BatchKind kind,
++                           int size, double delPct, double replaceFrac,
++                           std::mt19937_64& rng);
++
+ const char* toString(BatchKind k);
+ const char* toString(Placement p);
+ 
+diff --git a/hypergraph/include/HypergraphOracle.hpp b/hypergraph/include/HypergraphOracle.hpp
+new file mode 100644
+index 0000000..4a772da
+--- /dev/null
++++ b/hypergraph/include/HypergraphOracle.hpp
+@@ -0,0 +1,66 @@
++#ifndef ESCHER_MOSP_HYPERGRAPH_ORACLE_HPP
++#define ESCHER_MOSP_HYPERGRAPH_ORACLE_HPP
++
++/**
++ * @file HypergraphOracle.hpp
++ * @brief Test oracle for the H-SOSP pipeline, independent of every
++ *        incrementally maintained structure.
++ *
++ * The line graph is rebuilt from the incidence lists (HostHypergraph::heVerts
++ * and alive flags) alone, so it does not share code or state with the
++ * maintained h2h lists, the ESCHER CBSTs or the device CSR. Distances come
++ * from a textbook binary-heap Dijkstra on that rebuilt graph.
++ */
++
++#include <vector>
++
++#include "HostHypergraph.hpp"
++
++namespace escher_mosp {
++
++/** Line graph in CSR form; row (id - 1) lists the ids of the alive
++ *  hyperedges sharing a vertex with alive hyperedge id, sorted ascending. */
++struct LineGraphCSR {
++    int numIds = 0;                  ///< == hg.maxId() when built
++    std::vector<long long> offset;   ///< numIds + 1 entries
++    std::vector<int> nbr;            ///< 1-based hyperedge ids
++
++    long long degree(int id) const { return offset[id] - offset[id - 1]; }
++    const int* row(int id) const { return nbr.data() + offset[id - 1]; }
++    bool adjacent(int a, int b) const;
++};
++
++/** Rebuilds the line graph from heVerts (OpenMP-parallel). */
++LineGraphCSR rebuildLineGraph(const HostHypergraph& hg);
++
++/** Node-weighted Dijkstra from @p sourceId on @p lg (stepping into h costs
++ *  hg.heW[h-1]); indexed by id - 1, HostHypergraph::INF if unreachable. */
++std::vector<long long> referenceDistances(const HostHypergraph& hg,
++                                          const LineGraphCSR& lg,
++                                          int sourceId);
++
++/** Outcome of comparing an SOSP result with the oracle. */
++struct SospCheck {
++    long long distMismatches = 0;
++    long long parentErrors = 0;
++    int firstBadId = 0;          ///< first id with a wrong distance (or 0)
++    long long firstGot = 0, firstWant = 0;
++    bool ok() const { return distMismatches == 0 && parentErrors == 0; }
++};
++
++/**
++ * Compares @p dist (indexed by id - 1) with @p reference and checks the
++ * shortest-path tree: every reachable alive node other than the source has
++ * a parent (0-based node index, the device convention; -1 = none) that is
++ * alive, adjacent in @p lg and satisfies dist[v] = dist[parent] + w[v];
++ * unreachable nodes have no parent. Pass an empty @p parent0 to skip the
++ * tree check.
++ */
++SospCheck checkSosp(const HostHypergraph& hg, const LineGraphCSR& lg,
++                    const std::vector<long long>& reference,
++                    const std::vector<long long>& dist,
++                    const std::vector<int>& parent0);
++
++} // namespace escher_mosp
++
++#endif // ESCHER_MOSP_HYPERGRAPH_ORACLE_HPP
+diff --git a/hypergraph/src/HypergraphGen.cpp b/hypergraph/src/HypergraphGen.cpp
+index 01f3222..ae3a84b 100644
+--- a/hypergraph/src/HypergraphGen.cpp
++++ b/hypergraph/src/HypergraphGen.cpp
+@@ -7,8 +7,12 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cmath>
++#include <cstdlib>
+ #include <fstream>
+ #include <random>
++#include <stdexcept>
++#include <unordered_map>
+ #include <unordered_set>
+ 
+ namespace escher_mosp {
+@@ -267,4 +271,155 @@ HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
+     return batch;
+ }
+ 
++GeneratedHypergraph loadHypergraphFile(const std::string& path,
++                                       int maxCardinality,
++                                       std::uint64_t seed) {
++    std::ifstream in(path);
++    if (!in) throw std::runtime_error("cannot open hypergraph file " + path);
++    std::vector<std::vector<int>> raw;
++    std::string line;
++    std::vector<int> r;
++    while (std::getline(in, line)) {
++        r.clear();
++        const char* p = line.c_str();
++        while (*p) {
++            while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\r') ++p;
++            if (!*p) break;
++            char* end = nullptr;
++            const long v = std::strtol(p, &end, 10);
++            if (end == p) {
++                throw std::runtime_error("non-numeric token in " + path +
++                                         ": " + line);
++            }
++            r.push_back(static_cast<int>(v));
++            p = end;
++        }
++        if (r.empty()) continue;
++        std::sort(r.begin(), r.end());
++        r.erase(std::unique(r.begin(), r.end()), r.end());
++        if (static_cast<int>(r.size()) > maxCardinality) continue;
++        raw.push_back(r);
++    }
++    if (raw.empty()) {
++        throw std::runtime_error("no hyperedge of at most " +
++                                 std::to_string(maxCardinality) +
++                                 " vertices in " + path);
++    }
++    // Renumber the vertices 0..n-1 in order of first appearance.
++    std::unordered_map<int, int> remap;
++    remap.reserve(raw.size() * 2);
++    for (auto& row : raw)
++        for (int& v : row) {
++            auto it = remap.find(v);
++            if (it == remap.end())
++                it = remap.emplace(v, static_cast<int>(remap.size())).first;
++            v = it->second;
++        }
++    GeneratedHypergraph g;
++    g.numVertices = static_cast<int>(remap.size());
++    std::vector<int> deg(g.numVertices, 0);
++    for (const auto& row : raw)
++        for (int v : row) ++deg[v];
++    std::mt19937_64 rng(seed);
++    g.sourceVertex = static_cast<int>(
++        std::max_element(deg.begin(), deg.end()) - deg.begin());
++    g.targetVertex =
++        std::uniform_int_distribution<int>(0, g.numVertices - 1)(rng);
++    std::uniform_int_distribution<long long> wDist(1, 100);
++    g.rows.reserve(raw.size() + 2);
++    g.weights.reserve(raw.size() + 2);
++    g.rows.push_back({g.sourceVertex});
++    g.weights.push_back(0);
++    for (auto& row : raw) {
++        g.rows.push_back(std::move(row));
++        g.weights.push_back(wDist(rng));
++    }
++    g.rows.push_back({g.targetVertex});
++    g.weights.push_back(0);
++    g.sourceHe = 1;
++    g.targetHe = static_cast<int>(g.rows.size());
++    return g;
++}
++
++HgBatch generatePaperBatch(const HostHypergraph& hg, BatchKind kind,
++                           int size, double delPct, double replaceFrac,
++                           std::mt19937_64& rng) {
++    HgBatch b;
++    std::vector<int> pool;
++    pool.reserve(hg.aliveCount);
++    for (int id = 1; id <= hg.maxId(); ++id)
++        if (hg.alive[id - 1] && id != hg.sourceHe && id != hg.targetHe)
++            pool.push_back(id);
++    if (pool.empty() || size <= 0) return b;
++    std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
++    std::uniform_int_distribution<long long> wDist(1, 100);
++    std::uniform_real_distribution<double> unif(0.0, 1.0);
++    auto randomOf = [&](const std::vector<int>& v) {
++        return v[std::uniform_int_distribution<std::size_t>(0, v.size() - 1)(
++            rng)];
++    };
++    // A hyperedge sharing a vertex with id (through a random vertex of id).
++    auto randomNeighbor = [&](int id) -> int {
++        const std::vector<int>& verts = hg.heVerts[id - 1];
++        for (int tries = 0; tries < 8 && !verts.empty(); ++tries) {
++            const std::vector<int>& inc = hg.v2h[randomOf(verts)];
++            if (inc.size() < 2) continue;
++            const int x = randomOf(inc);
++            if (x != id && x != hg.sourceHe && x != hg.targetHe) return x;
++        }
++        return 0;
++    };
++    const int nDel = static_cast<int>(size * delPct / 100.0 + 0.5);
++    const int nIns = size - nDel;
++    if (kind == BatchKind::Hyperedge) {
++        std::unordered_set<int> chosen;
++        const int want = std::min<int>(nDel, static_cast<int>(pool.size()));
++        while (static_cast<int>(chosen.size()) < want)
++            chosen.insert(pool[pick(rng)]);
++        b.heDelete.assign(chosen.begin(), chosen.end());
++        std::sort(b.heDelete.begin(), b.heDelete.end());
++        for (int i = 0; i < nIns; ++i) {
++            const int src = pool[pick(rng)];
++            std::vector<int> verts = hg.heVerts[src - 1];
++            const int nb = randomNeighbor(src);
++            if (nb > 0 && verts.size() >= 2) {
++                const std::vector<int>& nv = hg.heVerts[nb - 1];
++                const int r = std::max(
++                    1, static_cast<int>(std::lround(replaceFrac * verts.size())));
++                std::shuffle(verts.begin(), verts.end(), rng);
++                for (int k = 0; k < r && k < static_cast<int>(verts.size()); ++k)
++                    verts[k] = randomOf(nv);
++            }
++            HgBatch::HeIns ins;
++            ins.vertices = std::move(verts);
++            ins.weight = wDist(rng);
++            b.heInsert.push_back(std::move(ins));
++        }
++    } else {
++        long long retries = 0;
++        const long long maxRetries = 10LL * size + 1000;
++        for (int i = 0; i < size; ++i) {
++            const int id = pool[pick(rng)];
++            const std::vector<int>& verts = hg.heVerts[id - 1];
++            if (unif(rng) < delPct / 100.0) {
++                if (verts.size() < 2) {
++                    if (++retries > maxRetries) break;
++                    --i;
++                    continue;
++                }
++                b.vtxDelete.push_back({id, randomOf(verts)});
++            } else {
++                const int nb = randomNeighbor(id);
++                if (nb <= 0) {
++                    if (++retries > maxRetries) break;
++                    --i;
++                    continue;
++                }
++                b.vtxInsert.push_back({id, randomOf(hg.heVerts[nb - 1])});
++            }
++        }
++    }
++    return b;
++}
++
+ } // namespace escher_mosp
+diff --git a/hypergraph/src/HypergraphOracle.cpp b/hypergraph/src/HypergraphOracle.cpp
+new file mode 100644
+index 0000000..1afea32
+--- /dev/null
++++ b/hypergraph/src/HypergraphOracle.cpp
+@@ -0,0 +1,140 @@
++/**
++ * @file HypergraphOracle.cpp
++ * @brief Independent line-graph rebuild + Dijkstra (see HypergraphOracle.hpp).
++ */
++
++#include "HypergraphOracle.hpp"
++
++#include <algorithm>
++#include <functional>
++#include <queue>
++#include <utility>
++
++namespace escher_mosp {
++
++bool LineGraphCSR::adjacent(int a, int b) const {
++    if (a < 1 || a > numIds || b < 1 || b > numIds) return false;
++    const int* r = row(a);
++    return std::binary_search(r, r + degree(a), b);
++}
++
++LineGraphCSR rebuildLineGraph(const HostHypergraph& hg) {
++    const int m = hg.maxId();
++    const int n = hg.numVertices;
++
++    // Vertex -> alive hyperedges, from heVerts only.
++    std::vector<long long> vOff(static_cast<std::size_t>(n) + 1, 0);
++    for (int id = 1; id <= m; ++id) {
++        if (!hg.alive[id - 1]) continue;
++        for (int v : hg.heVerts[id - 1]) ++vOff[v + 1];
++    }
++    for (int v = 0; v < n; ++v) vOff[v + 1] += vOff[v];
++    std::vector<int> vHe(static_cast<std::size_t>(vOff[n]));
++    {
++        std::vector<long long> cur(vOff.begin(), vOff.end() - 1);
++        for (int id = 1; id <= m; ++id) {
++            if (!hg.alive[id - 1]) continue;
++            for (int v : hg.heVerts[id - 1]) vHe[cur[v]++] = id;
++        }
++    }
++
++    // Neighbour rows: union of the vertex lists, sorted and deduplicated.
++    // Two passes (count, then write) keep the rows in one allocation.
++    LineGraphCSR lg;
++    lg.numIds = m;
++    lg.offset.assign(static_cast<std::size_t>(m) + 1, 0);
++    auto gather = [&](int id, std::vector<int>& out) {
++        out.clear();
++        if (!hg.alive[id - 1]) return;
++        for (int v : hg.heVerts[id - 1])
++            for (long long k = vOff[v]; k < vOff[v + 1]; ++k)
++                if (vHe[k] != id) out.push_back(vHe[k]);
++        std::sort(out.begin(), out.end());
++        out.erase(std::unique(out.begin(), out.end()), out.end());
++    };
++#pragma omp parallel
++    {
++        std::vector<int> scratch;
++#pragma omp for schedule(dynamic, 1024)
++        for (int id = 1; id <= m; ++id) {
++            gather(id, scratch);
++            lg.offset[id] = static_cast<long long>(scratch.size());
++        }
++    }
++    for (int id = 1; id <= m; ++id) lg.offset[id] += lg.offset[id - 1];
++    lg.nbr.resize(static_cast<std::size_t>(lg.offset[m]));
++#pragma omp parallel
++    {
++        std::vector<int> scratch;
++#pragma omp for schedule(dynamic, 1024)
++        for (int id = 1; id <= m; ++id) {
++            gather(id, scratch);
++            std::copy(scratch.begin(), scratch.end(),
++                      lg.nbr.begin() + lg.offset[id - 1]);
++        }
++    }
++    return lg;
++}
++
++std::vector<long long> referenceDistances(const HostHypergraph& hg,
++                                          const LineGraphCSR& lg,
++                                          int sourceId) {
++    const int m = lg.numIds;
++    std::vector<long long> dist(m, HostHypergraph::INF);
++    if (sourceId < 1 || sourceId > m || !hg.alive[sourceId - 1]) return dist;
++    using QE = std::pair<long long, int>;
++    std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
++    dist[sourceId - 1] = 0;
++    pq.push({0, sourceId});
++    while (!pq.empty()) {
++        const auto [d, u] = pq.top();
++        pq.pop();
++        if (d != dist[u - 1]) continue;
++        const int* r = lg.row(u);
++        for (long long k = 0; k < lg.degree(u); ++k) {
++            const int v = r[k];
++            const long long nd = d + hg.heW[v - 1];
++            if (nd < dist[v - 1]) {
++                dist[v - 1] = nd;
++                pq.push({nd, v});
++            }
++        }
++    }
++    return dist;
++}
++
++SospCheck checkSosp(const HostHypergraph& hg, const LineGraphCSR& lg,
++                    const std::vector<long long>& reference,
++                    const std::vector<long long>& dist,
++                    const std::vector<int>& parent0) {
++    SospCheck c;
++    const int m = lg.numIds;
++    const long long INF = HostHypergraph::INF;
++    for (int id = 1; id <= m; ++id) {
++        const long long got =
++            id - 1 < static_cast<int>(dist.size()) ? dist[id - 1] : INF;
++        if (got != reference[id - 1]) {
++            if (c.distMismatches == 0) {
++                c.firstBadId = id;
++                c.firstGot = got;
++                c.firstWant = reference[id - 1];
++            }
++            ++c.distMismatches;
++        }
++    }
++    if (parent0.empty() || c.distMismatches != 0) return c;
++    for (int id = 1; id <= m; ++id) {
++        if (id == hg.sourceHe) continue;
++        const int p = parent0[id - 1] + 1;   // 1-based id or 0 (none)
++        if (!hg.alive[id - 1] || reference[id - 1] >= INF) {
++            if (p != 0) ++c.parentErrors;
++            continue;
++        }
++        if (p < 1 || p > m || !hg.alive[p - 1] || !lg.adjacent(id, p) ||
++            reference[p - 1] + hg.heW[id - 1] != reference[id - 1])
++            ++c.parentErrors;
++    }
++    return c;
++}
++
++} // namespace escher_mosp
