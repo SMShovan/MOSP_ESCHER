@@ -268,7 +268,8 @@ docs:
 # includes and templates on a MacBook before syncing to the cluster. Requires
 # nvcc to be installed (which it can be without a GPU) or use @c clang-check.
 
-ALL_SRCS := $(ESCHER_CU_SRCS) $(ESCHER_CPP_SRCS) $(GRAPH_CU_SRCS) $(GRAPH_CPP_SRCS) \
+ALL_SRCS := $(ESCHER_CU_SRCS) $(ESCHER_CPP_SRCS) $(GRAPH_CU_SRCS) \
+            $(GRAPH_CORE_CPP_SRCS) $(GRAPH_MOSP_CPP_SRCS) \
             $(MOSP_MAIN) $(MOSP_STRESS) $(MOSP_PSTRESS) \
             $(HYPERGRAPH_SRCS) $(HSOSP_DEV_SRCS) \
             hsosp/src/hsospBench.cu hsosp/src/hsospStress.cu \
