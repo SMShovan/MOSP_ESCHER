@@ -90,6 +90,28 @@ static void ensureScratchCapacity(CBSTContext &ctx, int K,
   ctx.scratchPayloadCap = newPayloadCap;
 }
 
+// Recomputes subtreeAvail (number of deleted slots per subtree) bottom-up,
+// one launch per tree level, so a level's parents read children that the
+// previous launch finished.
+static void recomputeSubtreeAvail(CBSTContext &ctx) {
+  const int blockSize = 256;
+  int lastLevelStart = 1;
+  while (lastLevelStart * 2 <= ctx.numRecords)
+    lastLevelStart <<= 1;
+  int levelStart = lastLevelStart - 1;
+  for (int levelEnd = ctx.numRecords - 1; levelStart >= 0;) {
+    int count = levelEnd - levelStart + 1;
+    int blocks = (count + blockSize - 1) / blockSize;
+    reduceAvailLevel<<<blocks, blockSize>>>(
+        levelStart, levelEnd, ctx.numRecords, ctx.d_avail, ctx.d_subtreeAvail);
+    checkCuda(cudaDeviceSynchronize());
+    if (levelStart == 0)
+      break;
+    levelEnd = levelStart - 1;
+    levelStart = (levelStart - 1) / 2;
+  }
+}
+
 void constructCBST(int *keys, int *startOffsets, int numRecords,
                    int *flatPayload, int flatPayloadSize, int payloadCapacity,
                    const char *datasetName, CBSTContext &ctx,
@@ -359,24 +381,7 @@ void deleteCBST(const std::vector<int> &deleteKeys, CBSTContext &ctx) {
   checkCuda(cudaFree(d_deleteKeys));
 
   // Bottom-up level-wise reduction to recompute subtreeAvail
-  int lastLevelStart = 1;
-  while (lastLevelStart * 2 <= ctx.numRecords)
-    lastLevelStart <<= 1;
-  int levelStart = lastLevelStart - 1;
-  if (levelStart >= ctx.numRecords)
-    levelStart = (lastLevelStart >> 1) - 1;
-
-  for (int levelEnd = ctx.numRecords - 1; levelStart >= 0;) {
-    int count = levelEnd - levelStart + 1;
-    int blocks = (count + blockSize - 1) / blockSize;
-    reduceAvailLevel<<<blocks, blockSize>>>(
-        levelStart, levelEnd, ctx.numRecords, ctx.d_avail, ctx.d_subtreeAvail);
-    checkCuda(cudaDeviceSynchronize());
-    if (levelStart == 0)
-      break;
-    levelEnd = levelStart - 1;
-    levelStart = (levelStart - 1) / 2;
-  }
+  recomputeSubtreeAvail(ctx);
 }
 
 InsertMapping insertCBST(const std::vector<int> &newKeys,
@@ -848,32 +853,13 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     // or all items matched), so the mapping is complete.
   }
 
-  // Recompute subtreeAvail bottom-up
-  int blockNodes = (ctx.numRecords + blockSize - 1) / blockSize;
-  reduceAvailLevel<<<blockNodes, blockSize>>>(
-      ctx.numRecords - 1, ctx.numRecords - 1, ctx.numRecords, ctx.d_avail,
-      ctx.d_subtreeAvail);
-  checkCuda(cudaDeviceSynchronize());
-  int lastLevelStart = 1;
-  while (lastLevelStart * 2 <= ctx.numRecords)
-    lastLevelStart <<= 1;
-  int levelStart = lastLevelStart - 1;
-  if (levelStart >= ctx.numRecords)
-    levelStart = (lastLevelStart >> 1) - 1;
-  for (int levelEnd = ctx.numRecords - 1; levelStart >= 0;
-       levelStart = (levelStart - 1) / 2) {
-    int start = levelStart;
-    int end = levelEnd;
-    int count = end - start + 1;
-    int blocks = (count + blockSize - 1) / blockSize;
-    reduceAvailLevel<<<blocks, blockSize>>>(start, end, ctx.numRecords,
-                                            ctx.d_avail, ctx.d_subtreeAvail);
-    checkCuda(cudaDeviceSynchronize());
-    if (levelStart == 0)
-      break;
-    levelEnd = levelStart - 1;
-    levelStart = (levelStart - 1) / 2;
-  }
+  // Recompute subtreeAvail bottom-up (reused slots are no longer
+  // available). The original loop advanced levelStart both in the for
+  // header and in the body, so each launch covered two tree levels and
+  // parents read children being written in the same launch: the counts
+  // went stale and the next insert located invalid slots (key 0,
+  // duplicate keys).
+  recomputeSubtreeAvail(ctx);
 
   return mapping;
 }

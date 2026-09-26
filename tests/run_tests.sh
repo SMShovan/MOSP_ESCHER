@@ -16,7 +16,7 @@ BIN="$ROOT/bin"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/escher_mosp_tests.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-XFAIL=" test_h2h_delta cbst_reuse cbst_terminator cbst_erase \
+XFAIL=" cbst_reuse cbst_terminator cbst_erase \
  cbst_surplus cbst_bestfit cbst_unfill-chain cbst_random test_hsosp_scale \
  hsospStress_escher parallelStressTest_seed6 "
 FAILURES=0

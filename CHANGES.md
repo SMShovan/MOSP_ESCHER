@@ -78,3 +78,14 @@ made there; these commits port those fixes, adapted to this copy's API
   pipeline aborts on the first batch at 70K hyperedges (colliding
   hyperedge id) and crashes in construct at 1M. Regression:
   `test_cbst_ops scale` (every key of n = 1..1,100 and 65,535..2^20).
+- **E2 subtreeAvail recomputation after insert** (`operations.cu`
+  `insertCBST`). The bottom-up loop advanced `levelStart` both in the `for`
+  header and in its body, so each launch reduced two tree levels and
+  parents read children written by the same launch. The counts went
+  stale; the next insert located invalid slots and returned key 0 and
+  duplicate keys, which `DynamicHypergraph` rejected (`test_h2h_delta`
+  aborted on sm_86 in 3 of 3 runs, and `scripts/run_experiments.sh` stopped
+  at that gate). Insert and erase now share one helper that reduces one
+  level per launch (ESCHER-GPU fixed the same loop). Regression:
+  `test_h2h_delta` (no longer XFAIL) and the `subtreeAvail` check after every
+  step of `test_cbst_ops`.
