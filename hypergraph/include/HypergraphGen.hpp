@@ -66,7 +66,9 @@ struct BatchParams {
 };
 
 /**
- * Generate a change batch against the CURRENT hypergraph state.
+ * Generate a change batch against the CURRENT hypergraph state. Without a
+ * live real hyperedge (only the virtual ones) a vertex batch is empty and
+ * a hyperedge batch has insertions only.
  *
  * @param hg      current host hypergraph (for alive ids / pools membership).
  * @param gen     generator parameters (pool model for inserted hyperedges).

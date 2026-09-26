@@ -342,6 +342,30 @@ int main() {
         checkAgainstOracle(hg, lg, dist, parent, -2, 0);
     }
 
+    // ---- batches for a hypergraph without real hyperedges ---------------
+    // (A vertex batch read pool[0] of an empty pool.)
+    {
+        HostHypergraph hg;
+        hg.buildFrom(4, {{0}, {3}}, {0, 0});
+        hg.sourceHe = 1;
+        hg.targetHe = 2;
+        GenParams gp;
+        gp.numVertices = 4;
+        gp.poolSize = 4;
+        BatchParams bp;
+        bp.size = 5;
+        bp.delPct = 50;
+        bp.kind = BatchKind::Vertex;
+        HgBatch b = generateBatch(hg, gp, bp, {}, {});
+        CHECK(b.totalOps() == 0, "empty pool: vertex batch has %zu ops",
+              b.totalOps());
+        bp.kind = BatchKind::Hyperedge;
+        b = generateBatch(hg, gp, bp, {}, {});
+        CHECK(b.heDelete.empty() && !b.heInsert.empty(),
+              "empty pool: hyperedge batch has %zu deletions, %zu "
+              "insertions", b.heDelete.size(), b.heInsert.size());
+    }
+
     std::printf("local_tests: %d configs, %d batches, "
                 "%d failures\n",
                 CONFIGS, totalBatches, failures);

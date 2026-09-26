@@ -191,7 +191,11 @@ HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
                 pool.push_back(id);
         }
     }
-    std::uniform_int_distribution<std::size_t> poolPick(0, pool.size() - 1);
+    // With no real hyperedge left the pool is empty: a hyperedge batch
+    // still gets its insertions, a vertex batch has nothing to change.
+    if (pool.empty() && bp.kind == BatchKind::Vertex) return batch;
+    std::uniform_int_distribution<std::size_t> poolPick(
+        0, pool.empty() ? 0 : pool.size() - 1);
 
     if (bp.kind == BatchKind::Hyperedge) {
         // ---- Deletions: distinct ids from the pool -----------------------
