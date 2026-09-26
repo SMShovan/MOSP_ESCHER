@@ -12,7 +12,9 @@ project's parallel SOSP-update framework as the update engine.
   ω → R>0; integer weights here). Only the virtual source and target
   hyperedges have weight 0. Zero or negative weights are rejected:
   two adjacent zero-weight hyperedges cut off from the source would keep a
-  stale finite distance.
+  stale finite distance. Weights above `2^28` are rejected too, so that no
+  path cost (fewer than `2^31` hyperedges) can overflow the 64-bit
+  distance sums or reach the value the device treats as unreachable.
 - The hypergraph is converted to the **h2h structure** (line graph): two
   hyperedges are adjacent iff they share at least one vertex.
 - Stepping into `h_j` costs `w_j`; a path's cost is the sum of the weights

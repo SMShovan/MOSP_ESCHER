@@ -17,10 +17,11 @@
  * unit-testable off-GPU (tests/local).
  *
  * Model (from the project meeting and the paper):
- *  - Hyperedge h_i carries one positive weight w_i >= 1 (the virtual
- *    source and target hyperedges: 0). DynamicHypergraph rejects other
- *    weights; with a zero-weight pair cut off from the source the update
- *    would keep a stale finite distance.
+ *  - Hyperedge h_i carries one positive weight 1 <= w_i <= MAX_WEIGHT
+ *    (the virtual source and target hyperedges: 0). DynamicHypergraph
+ *    rejects other weights; with a zero-weight pair cut off from the
+ *    source the update would keep a stale finite distance, and larger
+ *    weights could overflow the distance sums.
  *  - h2h edge (h_i, h_j) exists iff the two hyperedges share >= 1 vertex.
  *  - Stepping into h_j costs w_j, so ALL in-edges of node j in the line
  *    graph have weight w_j; the h2h adjacency is therefore kept as a single
@@ -134,6 +135,11 @@ struct LineGraphCSR {
 class HostHypergraph {
 public:
     static const long long INF;
+    /** Largest accepted hyperedge weight (2^28). A simple path enters fewer
+     *  than 2^31 hyperedges, so every path cost stays below 2^59: no 64-bit
+     *  distance sum can overflow, and every reachable distance stays below
+     *  the INF / 2 (about 2^60) the device treats as unreachable. */
+    static constexpr long long MAX_WEIGHT = 1LL << 28;
 
     int numVertices = 0;
 

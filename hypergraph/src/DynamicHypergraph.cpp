@@ -213,13 +213,15 @@ LineGraphCSR DynamicHypergraph::bulkLoad(std::vector<std::vector<int>>&& rows,
     for (std::size_t i = 0; i < weights.size(); ++i) {
         const int id = static_cast<int>(i) + 1;
         const bool isVirtual = (id == sourceHe || id == targetHe);
-        if (isVirtual ? weights[i] != 0 : weights[i] < 1) {
+        if (isVirtual ? weights[i] != 0
+                      : (weights[i] < 1 ||
+                         weights[i] > HostHypergraph::MAX_WEIGHT)) {
             throw escher::EscherError(
                 "DynamicHypergraph::bulkLoad: hyperedge " +
                 std::to_string(id) + " has weight " +
-                std::to_string(weights[i]) +
-                "; weights must be >= 1 (0 only for the virtual source and "
-                "target)");
+                std::to_string(weights[i]) + "; weights must be in [1, " +
+                std::to_string(HostHypergraph::MAX_WEIGHT) +
+                "] (0 only for the virtual source and target)");
         }
     }
     im.host.buildFrom(im.numVertices, std::move(rows), std::move(weights));
@@ -273,10 +275,11 @@ DynamicHypergraph::BatchResult DynamicHypergraph::beginBatch(
     BatchResult res;
     // Validate the inserted hyperedges before any structure is modified.
     for (const auto& ins : batch.heInsert) {
-        if (ins.weight < 1) {
+        if (ins.weight < 1 || ins.weight > HostHypergraph::MAX_WEIGHT) {
             throw escher::EscherError(
                 "DynamicHypergraph::applyBatch: inserted hyperedge weight " +
-                std::to_string(ins.weight) + " < 1; weights must be positive");
+                std::to_string(ins.weight) + " is not in [1, " +
+                std::to_string(HostHypergraph::MAX_WEIGHT) + "]");
         }
         if (ins.vertices.empty()) {
             throw escher::EscherError(

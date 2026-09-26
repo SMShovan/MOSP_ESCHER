@@ -262,7 +262,13 @@ test with other seeds, 0 failures.
   distances after one deletion). As in the paper (ω → R>0), weights must be
   >= 1; only the virtual source and target have weight 0. `bulkLoad` and
   `applyBatch` reject other weights (and empty inserted hyperedges) before
-  touching any structure. Regression: `test_hsosp_matches_dijkstra`.
+  touching any structure. Weights above 2^28 are rejected as well: with no
+  upper bound a weight near 2^63 wrapped the device distance sums, the
+  wrapped (negative) value passed the 32-bit packed-distance guard and
+  became a garbage distance, and the following recompute never finished.
+  With the cap every path cost stays below 2^59, under the device's
+  unreachable threshold (about 2^60). Regression:
+  `test_hsosp_matches_dijkstra`.
 - **S4 "targeted" change placement** (`hsospBench.cu`, `hsospStress.cu`,
   `HypergraphGen.hpp`). Device parents are 0-based node indices but
   `generateBatch` reads them as 1-based hyperedge ids, so the targeted
@@ -486,7 +492,7 @@ fallback), `hsospStress --configs 3 --check-escher`, `test_mosp_update` and
   relax more edges than the graph has adjacency entries (`--work-budget
   1`); on Geology this happens for about a third of the 100K and 200K
   hyperedge batches. The budget is a heuristic; its time is included.
-- **Weights.** Integer weights >= 1 (zero or negative weights are rejected);
+- **Weights.** Integer weights in [1, 2^28] (others are rejected);
   real datasets get U[1,100] weights, which the paper does not specify.
 - **CBST memory pool.** ESCHER temporaries come from the default
   stream-ordered memory pool, whose release threshold is raised to 1 GiB

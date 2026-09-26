@@ -7,6 +7,7 @@
  */
 
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -252,6 +253,50 @@ int main() {
             b.heInsert.push_back({{2, 3}, 0});
             dh.beginBatch(b);
         });
+        // Weights near LLONG_MAX wrapped the device distance sums past the
+        // 32-bit packed-distance guard (a garbage distance, and a
+        // recompute that never finished).
+        expectThrow("LLONG_MAX weight in bulkLoad", [] {
+            DynamicHypergraph::Caps caps;
+            caps.maxHyperedges = 16;
+            DynamicHypergraph dh(5, caps);
+            dh.bulkLoad({{0}, {0, 1}, {1, 2}, {3}},
+                        {0, 5, std::numeric_limits<long long>::max(), 0}, 1,
+                        4);
+        });
+        expectThrow("weight above MAX_WEIGHT in bulkLoad", [] {
+            DynamicHypergraph::Caps caps;
+            caps.maxHyperedges = 16;
+            DynamicHypergraph dh(5, caps);
+            dh.bulkLoad({{0}, {0, 1}, {1, 2}, {3}},
+                        {0, 5, HostHypergraph::MAX_WEIGHT + 1, 0}, 1, 4);
+        });
+        expectThrow("LLONG_MAX weight in an inserted hyperedge", [] {
+            DynamicHypergraph::Caps caps;
+            caps.maxHyperedges = 16;
+            DynamicHypergraph dh(6, caps);
+            dh.bulkLoad({{0}, {0, 1}, {1, 2}, {3}}, {0, 5, 4, 0}, 1, 4);
+            HgBatch b;
+            b.heInsert.push_back({{0, 5}, 1});
+            b.heInsert.push_back({{5}, std::numeric_limits<long long>::max()});
+            dh.beginBatch(b);
+        });
+        // The largest accepted weight must still load and solve exactly.
+        {
+            DynamicHypergraph::Caps caps;
+            caps.maxHyperedges = 16;
+            DynamicHypergraph dh(5, caps);
+            const long long W = HostHypergraph::MAX_WEIGHT;
+            LineGraphCSR lg0 = dh.bulkLoad({{0}, {0, 1}, {1, 2}, {2, 3}, {3}},
+                                           {0, W, W, W, 0}, 1, 5);
+            HostHypergraph& hg = dh.host();
+            hsosp::DeviceH2H dev;
+            hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.4);
+            hsosp::HsospState st;
+            st.allocate(caps.maxHyperedges);
+            hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
+            distsMatch(st, hg, "recompute with MAX_WEIGHT", 0);
+        }
     }
 
     std::printf("test_hsosp_matches_dijkstra: %s\n",
