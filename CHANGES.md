@@ -314,3 +314,17 @@ medians of three runs are in [results/README.md](results/README.md).
   DBLP static recompute: 332-334 ms → 81-83 ms (4.1x). This speeds up the
   baseline the dynamic time is compared with (the paper compares against
   "the same GPU kernels"), so the reported speedup becomes smaller.
+- **P2 device-side grouping and warp-per-row CSR apply**
+  (`applyDeltaToDevice`). The line-graph delta was grouped per row in a
+  host `unordered_map<int, pair<vector, vector>>`, uploaded with 7
+  `cudaMalloc` + copies and applied by one thread per row with an
+  O(deletions x degree) serial search; freeing the millions of small map
+  nodes also stalled the next host allocation by ~0.4 s (it showed up as
+  "SOSP" time of the first batch). The pairs are now uploaded once (they
+  stay on the device for the update), expanded into directed keys
+  `row << 33 | isInsert << 32 | col`, radix-sorted (CUB, only the used
+  bits), run-length encoded by row and applied one warp per row (ballot
+  search + swap-remove for deletions, coalesced append, one atomicAdd per
+  relocated row), with scratch kept across batches. DBLP 50K: CSR stage
+  2.0-2.2 s → 24-31 ms (including building and uploading the pairs); the
+  first batch's SOSP stage 386 → 10 ms (no allocator stall).

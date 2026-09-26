@@ -9,11 +9,13 @@
 
 #include "hsosp.cuh"
 
+#include <cub/cub.cuh>
+#include <thrust/iterator/transform_iterator.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace escher_mosp {
 namespace hsosp {
@@ -57,71 +59,107 @@ __global__ void fillIntKernel(int* arr, int n, int value) {
     if (tid < n) arr[tid] = value;
 }
 
-__global__ void scatterLLKernel(const int* idx, const long long* vals, int n,
-                                long long* arr) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < n) arr[idx[tid]] = vals[tid];
+// Directed row key of a delta pair entry: row << 33 | isInsert << 32 | col.
+// Sorting the keys groups every row's changes, deletions first.
+__global__ void expandDeltaKeysKernel(const int2* pairs, int nDel, int nTot,
+                                      unsigned long long* keys) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nTot) return;
+    const unsigned long long ins = (i >= nDel) ? 1ull : 0ull;
+    const unsigned a = static_cast<unsigned>(pairs[i].x);
+    const unsigned b = static_cast<unsigned>(pairs[i].y);
+    keys[2LL * i] = (static_cast<unsigned long long>(a) << 33) | (ins << 32) | b;
+    keys[2LL * i + 1] =
+        (static_cast<unsigned long long>(b) << 33) | (ins << 32) | a;
 }
 
+struct KeyRow {
+    __host__ __device__ int operator()(unsigned long long k) const {
+        return static_cast<int>(k >> 33);
+    }
+};
+
 /**
- * One thread per touched row: apply that row's deletions (swap-remove) then
- * insertions (append; relocate to the tail region on overflow). Race-free
- * because every touched row appears exactly once (grouped on the host).
+ * One warp per touched row (rows are unique after the sort, so the rows
+ * are race-free): deletions by ballot search + swap-remove, then a
+ * coalesced append of the insertions, relocating the row to the tail
+ * region (one atomicAdd) when it outgrows its capacity. (The original
+ * grouped the rows in a host unordered_map, uploaded 7 arrays and ran one
+ * thread per row with an O(deletions x degree) serial search.)
  */
-__global__ void applyRowChangesKernel(
-    int nRows, const int* rows, const long long* delOff, const int* delLen,
-    const int* delVals, const long long* insOff, const int* insLen,
-    const int* insVals, long long* rowStart, int* deg, int* cap, int* colInd,
-    unsigned long long* tailCursor, long long capEntries, int* overflowFlag) {
-
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= nRows) return;
-
-    const int r = rows[tid];
+__global__ void applyRowsWarp(int nRows, const int* rows, const int* rowOff,
+                              const int* rowLen,
+                              const unsigned long long* keys,
+                              long long* rowStart, int* deg, int* cap,
+                              int* colInd, unsigned long long* tailCursor,
+                              long long capEntries, int* overflowFlag) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= nRows) return;
+    const int r = rows[warp];
+    const int off = rowOff[warp];
+    const int len = rowLen[warp];
     long long base = rowStart[r];
     int d = deg[r];
 
-    // Deletions: swap with last.
-    const long long doff = delOff[tid];
-    const int dn = delLen[tid];
-    for (int k = 0; k < dn; ++k) {
-        const int v = delVals[doff + k];
-        for (int e = 0; e < d; ++e) {
-            if (colInd[base + e] == v) {
-                colInd[base + e] = colInd[base + d - 1];
-                --d;
-                break;
-            }
+    // Deletions sort before insertions (isInsert bit = 0).
+    int nd = 0;
+    for (int k = lane; k < len; k += 32)
+        nd += ((keys[off + k] >> 32) & 1ull) ? 0 : 1;
+    for (int o = 16; o > 0; o >>= 1) nd += __shfl_xor_sync(0xffffffffu, nd, o);
+    for (int k = 0; k < nd; ++k) {
+        const int v = static_cast<int>(keys[off + k] & 0xffffffffu);
+        int pos = -1;
+        for (int e0 = 0; e0 < d && pos < 0; e0 += 32) {
+            const int e = e0 + lane;
+            const unsigned m =
+                __ballot_sync(0xffffffffu, e < d && colInd[base + e] == v);
+            if (m) pos = e0 + __ffs(m) - 1;
         }
+        if (pos >= 0) {
+            if (lane == 0) colInd[base + pos] = colInd[base + d - 1];
+            --d;
+        }
+        __syncwarp();
     }
 
-    // Insertions: append, relocating the row if capacity is exceeded.
-    const int ni = insLen[tid];
+    const int ni = len - nd;
     if (ni > 0) {
         if (d + ni > cap[r]) {
             const int need = d + ni;
-            int newCap = (need + max(4, need / 4) + 31) & ~31;
-            const unsigned long long pos =
-                atomicAdd(tailCursor, static_cast<unsigned long long>(newCap));
+            const int newCap = (need + max(4, need / 4) + 31) & ~31;
+            unsigned long long pos = 0;
+            if (lane == 0)
+                pos = atomicAdd(tailCursor,
+                                static_cast<unsigned long long>(newCap));
+            pos = __shfl_sync(0xffffffffu, pos, 0);
             if (static_cast<long long>(pos) + newCap > capEntries) {
-                *overflowFlag = 1;
-                deg[r] = d;
+                if (lane == 0) {
+                    *overflowFlag = 1;
+                    deg[r] = d;
+                }
                 return;
             }
-            for (int e = 0; e < d; ++e) {
+            for (int e = lane; e < d; e += 32)
                 colInd[pos + e] = colInd[base + e];
+            if (lane == 0) {
+                rowStart[r] = static_cast<long long>(pos);
+                cap[r] = newCap;
             }
-            rowStart[r] = static_cast<long long>(pos);
-            cap[r] = newCap;
             base = static_cast<long long>(pos);
         }
-        const long long ioff = insOff[tid];
-        for (int k = 0; k < ni; ++k) {
-            colInd[base + d] = insVals[ioff + k];
-            ++d;
-        }
+        for (int k = lane; k < ni; k += 32)
+            colInd[base + d + k] =
+                static_cast<int>(keys[off + nd + k] & 0xffffffffu);
+        d += ni;
     }
-    deg[r] = d;
+    if (lane == 0) deg[r] = d;
+}
+
+__global__ void scatterWeightsKernel(const int* ids, const long long* w,
+                                     int n, long long* nodeW) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) nodeW[ids[i]] = w[i];
 }
 
 /**
@@ -487,18 +525,44 @@ void DeviceDelta::reserve(long long pairs, long long ids) {
     }
     if (ids > idCapacity) {
         if (d_ids) cudaFree(d_ids);
+        if (d_newW) cudaFree(d_newW);
         idCapacity = ids + ids / 2 + 1024;
         HSOSP_CUDA_CHECK(cudaMalloc(&d_ids, sizeof(int) * idCapacity));
+        HSOSP_CUDA_CHECK(cudaMalloc(&d_newW, sizeof(long long) * idCapacity));
     }
 }
 
+void DeviceDelta::reserveKeys(long long keys) {
+    if (keys <= keyCapacity) return;
+    if (d_keys) cudaFree(d_keys);
+    if (d_keysAlt) cudaFree(d_keysAlt);
+    if (d_rows) cudaFree(d_rows);
+    if (d_rowLen) cudaFree(d_rowLen);
+    if (d_rowOff) cudaFree(d_rowOff);
+    if (!d_numRows) HSOSP_CUDA_CHECK(cudaMalloc(&d_numRows, sizeof(int)));
+    keyCapacity = keys + keys / 2 + 4096;
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_keys, sizeof(unsigned long long) * keyCapacity));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_keysAlt, sizeof(unsigned long long) * keyCapacity));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_rows, sizeof(int) * keyCapacity));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_rowLen, sizeof(int) * keyCapacity));
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_rowOff, sizeof(int) * keyCapacity));
+}
+
+void DeviceDelta::reserveTemp(std::size_t bytes) {
+    if (bytes <= tempBytes) return;
+    if (d_temp) cudaFree(d_temp);
+    tempBytes = bytes + bytes / 2 + 4096;
+    HSOSP_CUDA_CHECK(cudaMalloc(&d_temp, tempBytes));
+}
+
 void DeviceDelta::free() {
-    if (d_pairs) cudaFree(d_pairs);
-    if (d_ids) cudaFree(d_ids);
-    d_pairs = nullptr;
-    d_ids = nullptr;
-    pairCapacity = idCapacity = 0;
-    numDel = numIns = numNew = numDead = 0;
+    for (void* p : {static_cast<void*>(d_pairs), static_cast<void*>(d_ids),
+                    static_cast<void*>(d_newW), static_cast<void*>(d_keys),
+                    static_cast<void*>(d_keysAlt), static_cast<void*>(d_rows),
+                    static_cast<void*>(d_rowLen), static_cast<void*>(d_rowOff),
+                    static_cast<void*>(d_numRows), d_temp})
+        if (p) cudaFree(p);
+    *this = DeviceDelta{};
 }
 
 // free() releases the graph arrays only: buildDeviceH2H (also used to
@@ -627,147 +691,66 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
     HSOSP_CUDA_CHECK(cudaMemset(dev.d_overflowFlag, 0, sizeof(int)));
 }
 
-bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
-                        const H2HDelta& delta) {
-    // Grow the node range for fresh ids introduced by the batch.
-    const int m = hg.maxId();
-    if (m > dev.maxNodes) {
-        throw std::runtime_error(
-            "applyDeltaToDevice: node capacity exceeded; raise maxHyperedges");
-    }
+namespace {
 
-    // Group per-row insert / delete lists (0-based node indices).
-    std::unordered_map<int, std::pair<std::vector<int>, std::vector<int>>>
-        rowOps;   // row -> (inserts, deletes)
-    rowOps.reserve(delta.insEdges.size() * 2 + delta.delEdges.size() * 2 + 8);
-    for (auto [a, b] : delta.delEdges) {
-        rowOps[a - 1].second.push_back(b - 1);
-        rowOps[b - 1].second.push_back(a - 1);
-    }
-    for (auto [a, b] : delta.insEdges) {
-        rowOps[a - 1].first.push_back(b - 1);
-        rowOps[b - 1].first.push_back(a - 1);
-    }
+/**
+ * Applies the pairs in dev.delta to the CSR on the device: directed keys
+ * (row << 33 | isInsert << 32 | col) are radix-sorted, run-length encoded
+ * by row and applied one warp per row; the weights of new nodes are
+ * scattered. Returns false on a tail overflow.
+ */
+bool applyDeltaPairs(DeviceH2H& dev) {
+    DeviceDelta& dd = dev.delta;
+    const int block = 256;
+    const long long nPairs = static_cast<long long>(dd.numDel) + dd.numIns;
+    if (nPairs > 0) {
+        const long long nKeys = 2 * nPairs;
+        if (nKeys > std::numeric_limits<int>::max())
+            throw std::runtime_error("applyDeltaToDevice: batch too large");
+        dd.reserveKeys(nKeys);
+        expandDeltaKeysKernel<<<gridFor(nPairs, block), block>>>(
+            dd.d_pairs, dd.numDel, static_cast<int>(nPairs), dd.d_keys);
+        HSOSP_CUDA_CHECK(cudaGetLastError());
 
-    const int nRows = static_cast<int>(rowOps.size());
-    dev.numNodes = m;
-    dev.numEntries += 2LL * (static_cast<long long>(delta.insEdges.size()) -
-                             static_cast<long long>(delta.delEdges.size()));
-
-    // Keep the delta on the device for hsospUpdate (0-based indices).
-    {
-        DeviceDelta& dd = dev.delta;
-        std::vector<int2> pairs;
-        pairs.reserve(delta.delEdges.size() + delta.insEdges.size());
-        for (auto [a, b] : delta.delEdges) pairs.push_back(make_int2(a - 1, b - 1));
-        for (auto [a, b] : delta.insEdges) pairs.push_back(make_int2(a - 1, b - 1));
-        std::vector<int> ids;
-        ids.reserve(delta.newHe.size() + delta.deadHe.size());
-        for (int id : delta.newHe) ids.push_back(id - 1);
-        for (int id : delta.deadHe) ids.push_back(id - 1);
-        dd.reserve(static_cast<long long>(pairs.size()),
-                   static_cast<long long>(ids.size()));
-        if (!pairs.empty())
-            HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_pairs, pairs.data(),
-                                        sizeof(int2) * pairs.size(),
-                                        cudaMemcpyHostToDevice));
-        if (!ids.empty())
-            HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_ids, ids.data(),
-                                        sizeof(int) * ids.size(),
-                                        cudaMemcpyHostToDevice));
-        dd.numDel = static_cast<int>(delta.delEdges.size());
-        dd.numIns = static_cast<int>(delta.insEdges.size());
-        dd.numNew = static_cast<int>(delta.newHe.size());
-        dd.numDead = static_cast<int>(delta.deadHe.size());
-    }
-
-    if (nRows > 0) {
-        std::vector<int> rows;
-        std::vector<long long> insOff, delOff;
-        std::vector<int> insLen, delLen, insVals, delVals;
-        rows.reserve(nRows);
-        insOff.reserve(nRows);
-        delOff.reserve(nRows);
-        insLen.reserve(nRows);
-        delLen.reserve(nRows);
-        for (auto& kv : rowOps) {
-            rows.push_back(kv.first);
-            insOff.push_back(static_cast<long long>(insVals.size()));
-            insLen.push_back(static_cast<int>(kv.second.first.size()));
-            for (int v : kv.second.first) insVals.push_back(v);
-            delOff.push_back(static_cast<long long>(delVals.size()));
-            delLen.push_back(static_cast<int>(kv.second.second.size()));
-            for (int v : kv.second.second) delVals.push_back(v);
-        }
-
-        auto upload = [](const void* src, std::size_t bytes) {
-            void* p = nullptr;
-            HSOSP_CUDA_CHECK(cudaMalloc(&p, bytes == 0 ? 4 : bytes));
-            if (bytes > 0) {
-                HSOSP_CUDA_CHECK(
-                    cudaMemcpy(p, src, bytes, cudaMemcpyHostToDevice));
-            }
-            return p;
-        };
-
-        int* d_rows = static_cast<int*>(
-            upload(rows.data(), rows.size() * sizeof(int)));
-        long long* d_insOff = static_cast<long long*>(
-            upload(insOff.data(), insOff.size() * sizeof(long long)));
-        int* d_insLen = static_cast<int*>(
-            upload(insLen.data(), insLen.size() * sizeof(int)));
-        int* d_insVals = static_cast<int*>(
-            upload(insVals.data(), insVals.size() * sizeof(int)));
-        long long* d_delOff = static_cast<long long*>(
-            upload(delOff.data(), delOff.size() * sizeof(long long)));
-        int* d_delLen = static_cast<int*>(
-            upload(delLen.data(), delLen.size() * sizeof(int)));
-        int* d_delVals = static_cast<int*>(
-            upload(delVals.data(), delVals.size() * sizeof(int)));
-
-        const int block = 256;
-        applyRowChangesKernel<<<gridFor(nRows, block), block>>>(
-            nRows, d_rows, d_delOff, d_delLen, d_delVals, d_insOff, d_insLen,
-            d_insVals, dev.d_rowStart, dev.d_deg, dev.d_cap, dev.d_colInd,
+        // Only the bits up to the row index take part in the sort.
+        int rowBits = 1;
+        while ((1LL << rowBits) < dev.maxNodes) ++rowBits;
+        const int endBit = 33 + rowBits;
+        const int n = static_cast<int>(nKeys);
+        cub::DoubleBuffer<unsigned long long> keys(dd.d_keys, dd.d_keysAlt);
+        auto rowsIn = thrust::make_transform_iterator(
+            static_cast<const unsigned long long*>(nullptr), KeyRow());
+        std::size_t sortBytes = 0, rleBytes = 0, scanBytes = 0;
+        HSOSP_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+            nullptr, sortBytes, keys, n, 0, endBit));
+        HSOSP_CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
+            nullptr, rleBytes, rowsIn, dd.d_rows, dd.d_rowLen, dd.d_numRows,
+            n));
+        HSOSP_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+            nullptr, scanBytes, dd.d_rowLen, dd.d_rowOff, n));
+        dd.reserveTemp(std::max({sortBytes, rleBytes, scanBytes}));
+        HSOSP_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+            dd.d_temp, dd.tempBytes, keys, n, 0, endBit));
+        const unsigned long long* sorted = keys.Current();
+        auto rows = thrust::make_transform_iterator(sorted, KeyRow());
+        HSOSP_CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
+            dd.d_temp, dd.tempBytes, rows, dd.d_rows, dd.d_rowLen,
+            dd.d_numRows, n));
+        int nRows = 0;
+        HSOSP_CUDA_CHECK(cudaMemcpy(&nRows, dd.d_numRows, sizeof(int),
+                                    cudaMemcpyDeviceToHost));
+        HSOSP_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+            dd.d_temp, dd.tempBytes, dd.d_rowLen, dd.d_rowOff, nRows));
+        applyRowsWarp<<<gridFor(32LL * nRows, block), block>>>(
+            nRows, dd.d_rows, dd.d_rowOff, dd.d_rowLen, sorted,
+            dev.d_rowStart, dev.d_deg, dev.d_cap, dev.d_colInd,
             dev.d_tailCursor, dev.capEntries, dev.d_overflowFlag);
         HSOSP_CUDA_CHECK(cudaGetLastError());
-        HSOSP_CUDA_CHECK(cudaDeviceSynchronize());
-
-        cudaFree(d_rows);
-        cudaFree(d_insOff);
-        cudaFree(d_insLen);
-        cudaFree(d_insVals);
-        cudaFree(d_delOff);
-        cudaFree(d_delLen);
-        cudaFree(d_delVals);
     }
-
-    // Node weights of inserted (or recreated) hyperedges.
-    if (!delta.newHe.empty()) {
-        std::vector<int> idx;
-        std::vector<long long> w;
-        idx.reserve(delta.newHe.size());
-        for (int id : delta.newHe) {
-            idx.push_back(id - 1);
-            w.push_back(hg.heW[id - 1]);
-        }
-        int* d_idx = nullptr;
-        long long* d_w = nullptr;
-        HSOSP_CUDA_CHECK(cudaMalloc(&d_idx, idx.size() * sizeof(int)));
-        HSOSP_CUDA_CHECK(cudaMalloc(&d_w, w.size() * sizeof(long long)));
-        HSOSP_CUDA_CHECK(cudaMemcpy(d_idx, idx.data(),
-                                    idx.size() * sizeof(int),
-                                    cudaMemcpyHostToDevice));
-        HSOSP_CUDA_CHECK(cudaMemcpy(d_w, w.data(),
-                                    w.size() * sizeof(long long),
-                                    cudaMemcpyHostToDevice));
-        const int block = 256;
-        scatterLLKernel<<<gridFor(idx.size(), block), block>>>(
-            d_idx, d_w, static_cast<int>(idx.size()), dev.d_nodeW);
+    if (dd.numNew > 0) {
+        scatterWeightsKernel<<<gridFor(dd.numNew, block), block>>>(
+            dd.d_ids, dd.d_newW, dd.numNew, dev.d_nodeW);
         HSOSP_CUDA_CHECK(cudaGetLastError());
-        HSOSP_CUDA_CHECK(cudaDeviceSynchronize());
-        cudaFree(d_idx);
-        cudaFree(d_w);
     }
 
     int overflow = 0;
@@ -779,6 +762,57 @@ bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
                                 cudaMemcpyDeviceToHost));
     dev.usedEntries = static_cast<long long>(tc);
     return overflow == 0;
+}
+
+} // namespace
+
+bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
+                        const H2HDelta& delta) {
+    // Grow the node range for fresh ids introduced by the batch.
+    const int m = hg.maxId();
+    if (m > dev.maxNodes) {
+        throw std::runtime_error(
+            "applyDeltaToDevice: node capacity exceeded; raise maxHyperedges");
+    }
+    dev.numNodes = m;
+    dev.numEntries += 2LL * (static_cast<long long>(delta.insEdges.size()) -
+                             static_cast<long long>(delta.delEdges.size()));
+
+    // Upload the delta once (0-based indices); it stays on the device for
+    // the CSR apply and for hsospUpdate.
+    DeviceDelta& dd = dev.delta;
+    std::vector<int2> pairs;
+    pairs.reserve(delta.delEdges.size() + delta.insEdges.size());
+    for (auto [a, b] : delta.delEdges) pairs.push_back(make_int2(a - 1, b - 1));
+    for (auto [a, b] : delta.insEdges) pairs.push_back(make_int2(a - 1, b - 1));
+    std::vector<int> ids;
+    std::vector<long long> newW;
+    ids.reserve(delta.newHe.size() + delta.deadHe.size());
+    newW.reserve(delta.newHe.size());
+    for (int id : delta.newHe) {
+        ids.push_back(id - 1);
+        newW.push_back(hg.heW[id - 1]);
+    }
+    for (int id : delta.deadHe) ids.push_back(id - 1);
+    dd.reserve(static_cast<long long>(pairs.size()),
+               static_cast<long long>(ids.size()));
+    if (!pairs.empty())
+        HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_pairs, pairs.data(),
+                                    sizeof(int2) * pairs.size(),
+                                    cudaMemcpyHostToDevice));
+    if (!ids.empty())
+        HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_ids, ids.data(),
+                                    sizeof(int) * ids.size(),
+                                    cudaMemcpyHostToDevice));
+    if (!newW.empty())
+        HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_newW, newW.data(),
+                                    sizeof(long long) * newW.size(),
+                                    cudaMemcpyHostToDevice));
+    dd.numDel = static_cast<int>(delta.delEdges.size());
+    dd.numIns = static_cast<int>(delta.insEdges.size());
+    dd.numNew = static_cast<int>(delta.newHe.size());
+    dd.numDead = static_cast<int>(delta.deadHe.size());
+    return applyDeltaPairs(dev);
 }
 
 std::vector<std::vector<int>> downloadRows(const DeviceH2H& dev, int m) {

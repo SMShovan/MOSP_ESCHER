@@ -43,6 +43,7 @@ namespace hsosp {
 struct DeviceDelta {
     int2* d_pairs = nullptr;
     int* d_ids = nullptr;
+    long long* d_newW = nullptr;     ///< weights of the new nodes
     long long pairCapacity = 0;
     long long idCapacity = 0;
     int numDel = 0;
@@ -50,7 +51,22 @@ struct DeviceDelta {
     int numNew = 0;
     int numDead = 0;
 
+    // Scratch of the device-side grouping (applyDeltaToDevice): directed
+    // row keys (double buffered for the radix sort), row runs and offsets,
+    // and the CUB temporary storage. Grown on demand, reused across batches.
+    unsigned long long* d_keys = nullptr;
+    unsigned long long* d_keysAlt = nullptr;
+    int* d_rows = nullptr;
+    int* d_rowLen = nullptr;
+    int* d_rowOff = nullptr;
+    int* d_numRows = nullptr;
+    void* d_temp = nullptr;
+    std::size_t tempBytes = 0;
+    long long keyCapacity = 0;
+
     void reserve(long long pairs, long long ids);
+    void reserveKeys(long long keys);
+    void reserveTemp(std::size_t bytes);
     void free();
 };
 
