@@ -46,6 +46,9 @@ bool LineGraphCSR::adjacent(int a, int b) const {
 }
 
 void HostHypergraph::freeListPush_(int id) {
+    // applyBatch never deletes the virtual hyperedges, so their ids can
+    // never be recycled for a weighted hyperedge.
+    assert(id != sourceHe && id != targetHe);
     if (static_cast<int>(freePos.size()) <= id) freePos.resize(id + 1, -1);
     freePos[id] = static_cast<int>(freeIds.size());
     freeIds.push_back(id);
@@ -166,10 +169,15 @@ void HostHypergraph::applyBatch(const HgBatch& b,
         }
     };
     std::vector<int> deletedAtAnyPoint;
+    // The virtual source {s} and target {t} are fixed: deleting the source
+    // left a dead node the update kept at distance 0 (and its id could be
+    // recycled as the source), and changing the target's vertices made it
+    // a free bridge or dropped t. Ops on them are skipped.
+    auto isVirtual = [&](int id) { return id == sourceHe || id == targetHe; };
 
     // ---------------- Phase 1: hyperedge deletions -----------------------
     for (int id : b.heDelete) {
-        if (id < 1 || id > maxId() || !alive[id - 1]) {
+        if (id < 1 || id > maxId() || !alive[id - 1] || isVirtual(id)) {
             ++inc.skippedOps;
             continue;
         }
@@ -189,7 +197,7 @@ void HostHypergraph::applyBatch(const HgBatch& b,
     // ---------------- Phase 2: incident vertex deletions ------------------
     for (const auto& c : b.vtxDelete) {
         if (c.heId < 1 || c.heId > maxId() || !alive[c.heId - 1] ||
-            c.vertex < 0 || c.vertex >= numVertices) {
+            isVirtual(c.heId) || c.vertex < 0 || c.vertex >= numVertices) {
             ++inc.skippedOps;
             continue;
         }
@@ -216,7 +224,7 @@ void HostHypergraph::applyBatch(const HgBatch& b,
     // ---------------- Phase 3: incident vertex insertions -----------------
     for (const auto& c : b.vtxInsert) {
         if (c.heId < 1 || c.heId > maxId() || !alive[c.heId - 1] ||
-            c.vertex < 0 || c.vertex >= numVertices) {
+            isVirtual(c.heId) || c.vertex < 0 || c.vertex >= numVertices) {
             ++inc.skippedOps;
             continue;
         }

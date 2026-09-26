@@ -301,6 +301,47 @@ int main() {
         checkAgainstOracle(hg, lg, dist, parent, -1, 0);
     }
 
+    // ---- ops on the virtual source / target are skipped ----------------
+    // (Deleting the source left a dead node at distance 0 and recycled its
+    // id for a weighted hyperedge that then acted as the source; vertex
+    // ops on the target made it a free bridge.)
+    {
+        // (Two vertices in each virtual row, so that a vertex deletion is
+        // not already refused for emptying the row.)
+        HostHypergraph hg;
+        hg.buildFrom(8, {{0, 5}, {0, 1}, {1, 2}, {2, 3}, {3, 7}},
+                     {0, 2, 3, 4, 0});
+        hg.sourceHe = 1;
+        hg.targetHe = 5;
+        HgBatch batch;
+        batch.heDelete = {1, 5};
+        batch.vtxInsert = {{5, 6}, {1, 6}, {4, 6}};
+        batch.vtxDelete = {{5, 7}, {1, 5}};
+        batch.heInsert.push_back({{2, 3}, 50});
+        IncidenceBatch inc;
+        EscherHorizOps ops;
+        const std::vector<int> ids = hg.reserveIds(1);
+        hg.applyBatch(batch, ids, inc, ops);
+        CHECK(inc.skippedOps == 6, "virtual: %d ops skipped, want 6",
+              inc.skippedOps);
+        CHECK(hg.alive[0] && hg.alive[4] &&
+                  hg.heVerts[0] == (std::vector<int>{0, 5}) &&
+                  hg.heVerts[4] == (std::vector<int>{3, 7}),
+              "virtual: source or target changed");
+        CHECK(ids[0] == 6 && hg.freeIds.empty(),
+              "virtual: inserted hyperedge got id %d", ids[0]);
+        CHECK(hg.heVerts[3] == (std::vector<int>{2, 3, 6}),
+              "virtual: vertex insert into a real hyperedge lost");
+        LineGraphCSR lg = hg.lineGraph();
+        std::vector<long long> dist;
+        std::vector<int> parent;
+        emulateSospRecompute(hg, lg, dist, parent, 64);
+        CHECK(dist[0] == 0 && dist[4] == 2 + 3 + 4,
+              "virtual: dist(source) %lld, dist(target) %lld", dist[0],
+              dist[4]);
+        checkAgainstOracle(hg, lg, dist, parent, -2, 0);
+    }
+
     std::printf("local_tests: %d configs, %d batches, "
                 "%d failures\n",
                 CONFIGS, totalBatches, failures);

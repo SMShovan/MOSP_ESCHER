@@ -269,6 +269,17 @@ test with other seeds, 0 failures.
   With the cap every path cost stays below 2^59, under the device's
   unreachable threshold (about 2^60). Regression:
   `test_hsosp_matches_dijkstra`.
+- **Ops on the virtual hyperedges** (`HostHypergraph::applyBatch`, docs).
+  Only the generators avoided the virtual source and target; the API
+  accepted deleting them and changing their vertices. A deleted source
+  stayed at distance 0 on the device (the oracle said INF), and the next
+  insertion recycled its id: a weighted hyperedge was then solved as the
+  source, and the oracle agreed because it reads the same `sourceHe`. A
+  vertex added to the zero-weight target made it a free bridge. These ops
+  are now skipped (counted in `skippedOps`) like ops on dead hyperedges,
+  so the virtual ids never reach the free list. Regression:
+  `test_hsosp_matches_dijkstra` (full pipeline, oracle and ESCHER contents)
+  and `tests/local`.
 - **S4 "targeted" change placement** (`hsospBench.cu`, `hsospStress.cu`,
   `HypergraphGen.hpp`). Device parents are 0-based node indices but
   `generateBatch` reads them as 1-based hyperedge ids, so the targeted

@@ -26,7 +26,10 @@ project's parallel SOSP-update framework as the update engine.
   `h_0`; `dist(t) = dist(h_{n+1})`.
 - Dynamics: hyperedge insertion/deletion (vertical ops) and incident-vertex
   insertion/deletion (horizontal ops). An h2h edge dies exactly when the
-  last common vertex of the two hyperedges disappears.
+  last common vertex of the two hyperedges disappears. The virtual source
+  and target hyperedges are fixed: a batch op that deletes one of them or
+  changes its vertices is skipped (counted in `skippedOps`), like an op on
+  a dead hyperedge.
 
 ## Architecture
 

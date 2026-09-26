@@ -88,7 +88,8 @@ struct IncidenceBatch {
     std::vector<long long> newW;
     /// Ids deleted by the batch and still dead at the end of it.
     std::vector<int> deadHe;
-    /// Number of batch ops skipped as no-ops (dead target, missing vertex...).
+    /// Number of batch ops skipped as no-ops (dead target, missing vertex,
+    /// an op on the virtual source or target hyperedge...).
     int skippedOps = 0;
 };
 
@@ -175,7 +176,9 @@ public:
     /** Apply a batch to the incidence model. @p finalIds are the ids to use
      *  for b.heInsert (one per entry; from reserveIds or from the ESCHER
      *  insert mapping). Fills @p inc (for the GPU line-graph delta) and
-     *  @p ops (ESCHER h2v / v2h operations). */
+     *  @p ops (ESCHER h2v / v2h operations). Invalid ops and every
+     *  deletion or vertex change of the virtual sourceHe / targetHe are
+     *  skipped (counted in inc.skippedOps). */
     void applyBatch(const HgBatch& b, const std::vector<int>& finalIds,
                     IncidenceBatch& inc, EscherHorizOps& ops);
 

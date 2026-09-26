@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -170,6 +171,52 @@ int main() {
             std::printf("FAIL: targeted batch: %d of %zu deletions are not "
                         "SOSP-tree parents\n",
                         notParent, batch.heDelete.size());
+            ++failures;
+        }
+    }
+
+    // ---- ops on the virtual source / target are skipped -----------------
+    // (Deleting the source left a dead node the update kept at distance 0,
+    // the oracle said INF; the next insertion recycled id 1 and was solved
+    // as the source at distance 0. Vertex ops on the target were accepted.)
+    {
+        DynamicHypergraph::Caps caps;
+        caps.maxHyperedges = 32;
+        DynamicHypergraph dh(7, caps);
+        LineGraphCSR lg0 = dh.bulkLoad({{0}, {0, 1}, {1, 2}, {2, 3}, {3}},
+                                       {0, 2, 3, 4, 0}, 1, 5);
+        HostHypergraph& hg = dh.host();
+        hsosp::DeviceH2H dev;
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.4);
+        hsosp::HsospState st;
+        st.allocate(caps.maxHyperedges);
+        hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
+
+        HgBatch b1;
+        b1.heDelete = {1};
+        b1.vtxInsert = {{5, 6}, {1, 6}, {4, 6}};
+        const hsosp::BatchTimes t1 = hsosp::applyBatch(dh, dev, b1, 1.4);
+        hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
+        distsMatch(st, hg, "virtual ops", 1);
+        HgBatch b2;
+        b2.heInsert.push_back({{2, 3}, 50});
+        b2.vtxDelete = {{4, 6}};
+        const hsosp::BatchTimes t2 = hsosp::applyBatch(dh, dev, b2, 1.4);
+        hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
+        distsMatch(st, hg, "virtual ops", 2);
+        if (t1.skippedOps != 3 || t2.skippedOps != 0 || !hg.alive[0] ||
+            hg.heW[0] != 0 || hg.heVerts[4] != std::vector<int>{3} ||
+            !hg.alive[5] || hg.heW[5] != 50) {
+            std::printf("FAIL: ops on the virtual hyperedges: skipped %d / "
+                        "%d (want 3 / 0), source alive %d weight %lld\n",
+                        t1.skippedOps, t2.skippedOps, int(hg.alive[0]),
+                        hg.heW[0]);
+            ++failures;
+        }
+        std::ostringstream log;
+        if (dh.checkEscher(rebuildLineGraph(hg), log) != 0) {
+            std::printf("FAIL: ops on the virtual hyperedges: ESCHER "
+                        "contents\n%s", log.str().c_str());
             ++failures;
         }
     }
