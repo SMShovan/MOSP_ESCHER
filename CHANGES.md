@@ -2,7 +2,47 @@
 
 Base: `baseline-2026-09` (the original `main`, 80cee62). Every commit builds
 and passes `make test`. Hardware for all measurements: RTX A5000 (sm_86,
-24 GB), 28-core / 56-thread host, CUDA 13.1.
+24 GB), 28-core / 56-thread host (shared), CUDA 12.9 and 13.1.
+
+## Summary
+
+| Item | Status |
+|---|---|
+| Build hygiene (sm_86 and -O3 defaults, header dependencies, `make test`) | done |
+| Oracles that fail on wrong results (proved by mutations) | done |
+| E1-E9 ESCHER core and adapters | done (E1-E7 ported from ESCHER-GPU; E8 and E9 are in this repository's adapters) |
+| ESCHER content checks, tests above 65,535 records | done |
+| M1, M2 MOSP half | done (fixed MOSP-CUDA engine ported, ESCHER adapter kept) |
+| S1-S5 H-SOSP | done |
+| P1 unification on the GPU | done, changed: the GPU derives the delta from its own incidence mirror, not from the ESCHER CBSTs (see README, differences from the paper) |
+| P2 device grouping + warp-per-row CSR apply | done |
+| P3 warp-cooperative pull kernels (also the static baseline) | done |
+| P4 ESCHER maintenance | done (P4a grouping without std::map, P4b copies / allocations / syncs) |
+| P5 host costs, -O3, sm_86 | done |
+| Sanitizers | memcheck, racecheck, initcheck, synccheck clean |
+| Datasets | DBLP and Geology measured; Orkut, AMiner, MAG exceed the int32 CBST payload; Threads not downloaded |
+
+Measured on coauth-DBLP with the paper's preprocessing and batch model
+(medians of three runs of three batches; details in
+[results/README.md](results/README.md)):
+
+| batch | dynamic time per batch, original + E1/E2 | final | speedup | load + 3 batches, original + E1/E2 | final |
+|---|---:|---:|---:|---:|---:|
+| hyperedge 25K | 6,835 ms | 107 ms | 64x | 31.7 s | 5.3 s |
+| hyperedge 50K | 13,425 ms | 169 ms | 80x | 51.4 s | 5.5 s |
+| hyperedge 100K | 26,405 ms | 275 ms | 96x | 90.5 s | 5.8 s |
+| hyperedge 200K | 53,427 ms | 470 ms | 114x | 171.4 s | 6.4 s |
+| vertex 25K | 2,031 ms | 61 ms | 34x | 17.3 s | 5.2 s |
+| vertex 50K | 3,744 ms | 92 ms | 41x | 22.4 s | 5.2 s |
+| vertex 100K | 7,345 ms | 144 ms | 51x | 33.2 s | 5.4 s |
+| vertex 200K | 14,448 ms | 250 ms | 58x | 54.5 s | 5.7 s |
+
+"original + E1/E2" is the original code with only the two fixes it needs
+to run at this size (without E1 it aborts or crashes above 65,535
+records). The static recompute baseline went from 338 to 78 ms (P3), so
+the paper's ratio recompute / dynamic moved from 0.01-0.16 to 0.17-1.28:
+the dynamic path is faster than the recompute only for 25K vertex
+batches, against 1.3-12.1x reported in the paper.
 
 ## Build and tests
 
@@ -18,6 +58,12 @@ and passes `make test`. Hardware for all measurements: RTX A5000 (sm_86,
   listed as XFAIL (a case that starts passing while listed is itself a
   failure) and removed from the list by the commit that fixes them. The
   MOSP stress tests take `[seed] [runs]` and run with fixed seeds.
+- **Sanitizer cleanliness**. `compute-sanitizer` initcheck flagged host
+  copies (in the checks) of bytes the device never wrote: CBST node
+  padding and the free slack of the incidence mirror. Node arrays and the
+  mirror's free tail are zeroed at allocation and the mirror check copies
+  only the used prefix. `thrust::maximum` (deprecated in CUDA 13) was
+  replaced by a local functor.
 
 ## Test oracles
 
@@ -236,23 +282,6 @@ test with other seeds, 0 failures.
   `parent_errors`; `verified` is 1 only when the oracle ran and agreed. The
   smoke suite runs in `make test`.
 
-## Benchmark driver
-
-- **Real hypergraphs** (`hsospBench --hg FILE`). The repository had no
-  loader for the paper's datasets (synthetic generators only). The new mode
-  reads one hyperedge per line with the paper's preprocessing (duplicate
-  vertices merged, hyperedges above `--maxcard`, default 25, dropped, vertex
-  ids renumbered; weights U[1,100]; source = a vertex of maximum degree,
-  target = a random vertex) and runs consecutive batches with the paper's
-  batch model (`generatePaperBatch`: deletions of random hyperedges;
-  insertions clone a hyperedge and replace about 30% of its vertices by
-  vertices of a neighbouring hyperedge; vertex batches remove a member or
-  adopt a neighbour's vertex), `--batch`, `--batches`, `--del`, `--kind`.
-  Every batch goes through the same routine as the synthetic suite (dynamic
-  pipeline, static recompute, checks) and gives one CSV row; `--verify`
-  selects the batches the independent oracle checks (all / first / none).
-  On coauth-DBLP this gives 2,466,792 hyperedges and 1,924,991 vertices
-  (the paper lists 2,466,661 / 1,924,991).
 - **S1 count-to-infinity and the every-batch fallback**
   (`hsosp/src/hsospDevice.cu`). The update re-evaluated seed nodes by pull
   with no invalidation: after a deletion, nodes that lost their tree path
@@ -295,6 +324,23 @@ test with other seeds, 0 failures.
   `static_iters` next to `iters`, and the columns are documented in
   `docs/HSOSP.md` (`--work-budget` sets the update budget).
 
+## Benchmark driver
+
+- **Real hypergraphs** (`hsospBench --hg FILE`). The repository had no
+  loader for the paper's datasets (synthetic generators only). The new mode
+  reads one hyperedge per line with the paper's preprocessing (duplicate
+  vertices merged, hyperedges above `--maxcard`, default 25, dropped, vertex
+  ids renumbered; weights U[1,100]; source = a vertex of maximum degree,
+  target = a random vertex) and runs consecutive batches with the paper's
+  batch model (`generatePaperBatch`: deletions of random hyperedges;
+  insertions clone a hyperedge and replace about 30% of its vertices by
+  vertices of a neighbouring hyperedge; vertex batches remove a member or
+  adopt a neighbour's vertex), `--batch`, `--batches`, `--del`, `--kind`.
+  Every batch goes through the same routine as the synthetic suite (dynamic
+  pipeline, static recompute, checks) and gives one CSV row; `--verify`
+  selects the batches the independent oracle checks (all / first / none).
+  On coauth-DBLP this gives 2,466,792 hyperedges and 1,924,991 vertices
+  (the paper lists 2,466,661 / 1,924,991).
 ## Performance
 
 Paper metric per batch = ESCHER maintenance + unification (line-graph delta)
@@ -402,3 +448,46 @@ medians of three runs are in [results/README.md](results/README.md).
   at -O3 (build hygiene commit).
   DBLP 50K: unification 88-93 → 49-51 ms, ESCHER maintenance 109-123 →
   93-94 ms; dynamic time per batch 213-230 → 157-160 ms (batches 2-3).
+## Sanitizers
+
+memcheck, racecheck, initcheck and synccheck report no errors on:
+`test_cbst_ops` (reuse, surplus, unfill-chain), `test_dynamicgraph_roundtrip`,
+`test_h2h_construction`, `test_h2h_delta` (includes the CSR rebuild and
+mirror re-upload paths), `test_hsosp_matches_dijkstra` (includes the
+fallback), `hsospStress --configs 3 --check-escher`, `test_mosp_update` and
+`parallelStressTest 1 5`.
+
+## Not done, caveats and risks
+
+- **The paper's speedups are not reproduced.** With both paths measured
+  the same way, the dynamic path (ESCHER maintenance + unification + CSR
+  apply + update) beats the GPU recompute only for 25K vertex batches on
+  DBLP. ESCHER maintenance (50-70 % of the remaining time) and the
+  unification (20-40 %) dominate; the update stage itself is 1.4-25x
+  faster than the recompute. Further reductions are possible (building
+  the CBST fill / unfill inputs on the device instead of downloading the
+  delta, overlapping the CBST maintenance with the update, a device-side
+  incidence update) but were not done.
+- **Unification does not read ESCHER.** The GPU derives the line-graph
+  delta from its own incidence mirror; the paper describes lookups in the
+  ESCHER v2h / h2v trees. The CBSTs are still maintained every batch and
+  checked by the tests, but the shortest-path results do not depend on
+  them (as in the original code).
+- **Datasets.** Only DBLP and Geology were measured. Orkut, AMiner and MAG
+  exceed the `int`-indexed CBST payload (2^31 values) and cannot be
+  loaded; Threads was not downloaded; the synthetic full suite was not
+  rerun.
+- **Measurement conditions.** One RTX A5000 per run (exclusive), but the
+  host was shared with other jobs; host-side stages vary by about 10-30 %
+  between runs, hence medians of three runs. The baseline was built with
+  CUDA 13.1, the final build with CUDA 12.9 (both sm_86); the final code
+  also passes `make test` when built with 13.1.
+- **Work budget.** The update falls back to the recompute when it would
+  relax more edges than the graph has adjacency entries (`--work-budget
+  1`); on Geology this happens for about a third of the 100K and 200K
+  hyperedge batches. The budget is a heuristic; its time is included.
+- **Weights.** Integer weights >= 1 (zero or negative weights are rejected);
+  real datasets get U[1,100] weights, which the paper does not specify.
+- **CBST memory pool.** ESCHER temporaries come from the default
+  stream-ordered memory pool, whose release threshold is raised to 1 GiB
+  for the whole process.

@@ -18,8 +18,75 @@ one-command cluster pipeline:
 
 ```bash
 CUDA_ARCH=sm_80 ./scripts/run_experiments.sh smoke   # sanity pass
-CUDA_ARCH=sm_80 ./scripts/run_experiments.sh full    # paper run: CSV + all figures
+CUDA_ARCH=sm_80 ./scripts/run_experiments.sh full    # synthetic suite: CSV + all figures
+# A real hypergraph (one hyperedge per line) with the paper's preprocessing
+# and batch model, every batch checked by the independent oracle:
+./bin/hsospBench --hg coauth.hg --kind hyperedge --batch 50000 --batches 3 \
+    --verify all --out results/dblp.csv
 ```
+
+## Correctness and performance changes
+
+[CHANGES.md](CHANGES.md) lists every fix and optimization made on top of
+the original code (base: tag `baseline-2026-09`), each with its regression
+test and before/after numbers; [results/README.md](results/README.md) has
+the before/after tables on coauth-DBLP and coauth-MAG-Geology. In short:
+
+- The ESCHER CBST core had the defects fixed earlier in ESCHER-GPU (a
+  32-bit rank overflow above 65,535 records, stale subtree counts, missing
+  row terminators, erased keys, metadata lost on rebuild, truncated
+  best-fit inserts, a wrong tail occupancy after unfill); at the paper's
+  scale the original crashed or corrupted the h2v / v2h / h2h contents.
+- The H-SOSP update counted to infinity after deletions, so every
+  realistic batch ran its 512-iteration cap and then a full recompute. It
+  is now exact and incremental (subtree invalidation, pull, push with a
+  packed atomicMin; a budget falls back to the recompute, timed).
+- The MOSP half was an unfixed copy of MOSP-CUDA with the same
+  count-to-infinity defect (wrong, too small distances); the fixed update
+  was ported.
+- Unification (the line-graph delta) runs on the GPU from the incidence
+  changes; the CSR apply, the pull kernels and the ESCHER operations were
+  rewritten for throughput. On DBLP the dynamic time per 50K hyperedge
+  batch went from 13.4 s to 0.17 s (27-114x across the measured
+  configurations).
+- Tests fail when results are wrong: an independent oracle (line graph
+  rebuilt from the vertex lists, Dijkstra, canonical tree), ESCHER content
+  read-back against a host model, tests above 65,535 records. `make test`
+  runs everything.
+
+### How this implementation differs from the paper
+
+- **Unification input.** The paper derives the line-graph changes on the
+  GPU "using the same v2h and h2v lookups" as ESCHER. Here the GPU keeps a
+  separate slack-row mirror of the incidence (`DeviceIncidence`) and
+  derives the net delta from it; the ESCHER h2v / v2h / h2h CBSTs are
+  maintained in every batch (and checked by the tests) but nothing on the
+  shortest-path path reads them, as in the original code.
+- **Update algorithm.** The pull-based update with an iteration cap
+  described in the paper does not converge after deletions (stale
+  distances rise by at least 1 per iteration). The update here first
+  invalidates the pre-batch subtrees of deleted tree edges and of new or
+  dead nodes, then pulls and pushes; it is exact without a cap. The budget
+  fallback to the recompute is kept and counted in the update time.
+- **Ties.** Parents are canonical (lowest id among the tight neighbours)
+  in the update, the recompute and the oracle.
+- **Weights.** Integer hyperedge weights >= 1 (zero or negative weights
+  are rejected; the paper's weights are positive reals). Real datasets get
+  U[1,100] weights.
+- **Baseline.** The static baseline is the GPU recompute with the same
+  kernels (as in the paper). Those kernels became about 4x faster (P3 in
+  CHANGES.md), which lowers the reported speedups.
+- **Scale.** The CBST payloads are `int`-indexed (at most 2^31 values per
+  tree), so Orkut, AMiner and MAG (about 2.1-2.9 x 10^9 h2h entries)
+  cannot be loaded, independently of GPU memory. Only DBLP and Geology
+  were measured here.
+- **Results.** On an RTX A5000 the dynamic time per batch (maintenance +
+  unification + CSR apply + update, the paper's metric) is below the
+  recompute only for DBLP vertex batches of 25K (1.28x); elsewhere it is
+  recompute/dynamic = 0.08-0.85, against 1.3-12.1x reported for DBLP
+  in the paper. The update stage alone is 1.4-25x faster than the
+  recompute; ESCHER maintenance and unification dominate. See
+  results/README.md.
 
 ## Layout
 
@@ -90,10 +157,12 @@ applied to the upstream ESCHER code.
 
 ## Requirements
 
-- CUDA Toolkit 12.5+ (Thrust is bundled)
+- CUDA Toolkit 12.5+ (Thrust and CUB are bundled); tested with 12.9 and
+  13.1
 - NVIDIA GPU with compute capability ≥ 7.0 (default `-arch=sm_86`; set
-  `CUDA_ARCH` for other GPUs, e.g. `sm_80` for A100, `sm_70` for V100)
-- C++17 host compiler (gcc 9+ or clang 10+)
+  `CUDA_ARCH` for other GPUs, e.g. `sm_80` for A100; CUDA 13 no longer
+  targets `sm_70`)
+- C++17 host compiler with OpenMP (gcc 9+)
 - `doxygen` (optional, for `make docs`)
 
 On macOS you can still preprocess every translation unit with
@@ -136,21 +205,20 @@ cd ~/escher-mosp
 
 ## Test strategy
 
-Three unit tests and the original MOSP stress/test-case harness:
+`make test` (or `./tests/run_all.sh`) builds everything and runs
+`tests/run_tests.sh`, which prints PASS / FAIL per case and exits non-zero
+on any failure:
 
-| Binary                                        | What it proves                                                                                  |
-|-----------------------------------------------|--------------------------------------------------------------------------------------------------|
-| `bin/test_cbst_smoke`                         | libescher_core constructs/insert/erase work for N ∈ {1,2,3,7,8,9,15,16,17,100,1000}              |
-| `bin/test_dynamicgraph_roundtrip`             | `loadFromCSR` → `dumpToCSR` is byte-identical for a hand-built 5-vertex / 2-objective graph      |
-| `bin/test_snapshot_matches_updateCSR`         | **ESCHER-backed** `updateGraphWithESCHER` produces byte-identical CSR to the legacy `updateGraphCSR` path |
-| `bin/main`                                    | Runs the full MOSP pipeline. `tests/testCase1..10/expected/` are generated and verified end-to-end |
-| `bin/stressTest`                              | 100 random configurations: sequentialSOSPUpdate (on ESCHER-backed graph) must match Dijkstra    |
-| `bin/parallelStressTest`                      | 100 random configurations: parallelSOSPUpdate must match Dijkstra                                |
-
-The equivalence test (`test_snapshot_matches_updateCSR`) is the single most
-important correctness check: if it passes, every downstream MOSP consumer
-sees exactly the same CSR whether the update went through the legacy in-memory
-path or through ESCHER.
+| Case | What it checks |
+|---|---|
+| `test_cbst_smoke`, `test_cbst_ops <scenario>` | every CBST operation mirrored on a host model; contents, reachability, tail metadata and subtree counts after each step (up to 2^20 records) |
+| `test_dynamicgraph_roundtrip` | `DynamicGraph` delete / insert rounds, ESCHER contents |
+| `test_snapshot_matches_updateCSR` | ESCHER-backed `updateGraphWithESCHER` == the legacy `updateGraphCSR` path |
+| `test_h2h_construction`, `test_h2h_delta` | device CSR and incidence mirror == the line graph rebuilt from the vertex lists, after every batch (overflow paths included) |
+| `test_hsosp_matches_dijkstra`, `test_hsosp_scale` | update, recompute and fallback == Dijkstra on the rebuilt line graph, canonical parents; ESCHER contents at 75K hyperedges |
+| `local_tests` | the host core without a GPU (tests/local) |
+| `hsospStress`, `hsospBench` smoke and real-file cases | randomized pipeline runs, every batch against the independent oracle |
+| `test_mosp_update`, `main`, `stressTest`, `parallelStressTest` | MOSP SOSP updates == Dijkstra (distances and trees), disconnecting deletions |
 
 ## Key decisions
 

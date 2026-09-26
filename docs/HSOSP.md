@@ -86,19 +86,57 @@ batch, deleted if only before.
 
 | Binary | Purpose |
 |---|---|
-| `bin/hsospBench`  | experiment matrix -> CSV (`--suite smoke|full`) |
+| `bin/hsospBench`  | experiment matrix -> CSV (`--suite smoke|full`), or a real hypergraph (`--hg`) |
 | `bin/hsospStress` | randomized full-pipeline check vs host Dijkstra |
 | `bin/test_h2h_construction` | line graph + device CSR + incidence mirror == oracle |
 | `bin/test_h2h_delta` | device CSR (GPU-derived delta) and incidence mirror == rebuild after every batch |
-| `bin/test_hsosp_matches_dijkstra` | update + recompute == Dijkstra (incl. disconnects) |
+| `bin/test_hsosp_matches_dijkstra` | update + recompute == Dijkstra (incl. disconnects), fallback, weight checks |
+| `bin/test_hsosp_scale` | 75K hyperedges (every CBST above 65,535 records), 7 batches: rows, distances, parents, ESCHER contents |
+| `tests/local/local_tests` | host core without a GPU: line graph, incidence batches, host copy of the delta rule, emulated update |
 
 ## Experiments
 
-Synthetic hypergraphs only (per project decision). The clustered-pool
-generator controls the average h2h degree through the vertex count
-(`n ~ m * E[c^2] / degTarget`); pools give locality and connectivity.
-Named configurations (full suite): HG-S (1M hyperedges), HG-M (5M),
-HG-L (10M), HG-XL (16M), HG-C (2M, cardinality up to 64).
+### Real hypergraphs (`--hg`)
+
+`hsospBench --hg FILE` runs a real hypergraph with the paper's
+preprocessing and batch model (Section VI):
+
+```bash
+./bin/hsospBench --hg coauth.hg --kind hyperedge --batch 50000 --batches 3 \
+    --del 50 --verify first --out results/dblp.csv
+```
+
+- `FILE`: one hyperedge per line, vertex ids separated by blanks (e.g.
+  coauth-DBLP or coauth-MAG-Geology from Benson et al.'s simplicial
+  datasets, one line per distinct simplex). Duplicate vertices are merged,
+  hyperedges with more than `--maxcard` vertices (default 25) are dropped
+  and vertex ids are renumbered.
+- Weights are drawn from U[1,100] (the paper does not say how it weights
+  the real datasets); the source is a vertex of maximum degree, the target
+  a random vertex (virtual hyperedges of weight 0).
+- A batch of `--batch` changes has `--del` % deletions (default 50). A
+  hyperedge insertion clones a random hyperedge and replaces about 30 % of
+  its vertices by vertices of a neighbouring hyperedge; a vertex batch
+  removes a member of a random hyperedge or adds a neighbour's vertex.
+  `--batches` consecutive batches run on the same state.
+- `--verify all|first|none` selects the batches checked by the independent
+  oracle (Dijkstra on the line graph rebuilt from the vertex lists, plus
+  the canonical shortest-path tree). Every batch is also compared with the
+  static recompute.
+- Each batch writes one CSV row (columns below); stderr has one summary
+  line per batch and an `[e2e]` line with the load time, the sums of the
+  dynamic and static times and the process wall time.
+
+coauth-DBLP gives 2,466,792 hyperedges, 1,924,991 vertices and 125.4M
+line-graph pairs (the paper lists 2,466,661 / 1,924,991); coauth-MAG-Geology
+gives 1,203,895 hyperedges and 1,256,385 vertices.
+
+### Synthetic suites (`--suite smoke|full`)
+
+The clustered-pool generator controls the average h2h degree through the
+vertex count (`n ~ m * E[c^2] / degTarget`); pools give locality and
+connectivity. Named configurations (full suite): HG-S (1M hyperedges),
+HG-M (5M), HG-L (10M), HG-XL (16M), HG-C (2M, cardinality up to 64).
 
 | Exp | Sweep | Figure(s) |
 |---|---|---|

@@ -1,5 +1,11 @@
 # Plan: Dynamic Single-Objective Shortest Path on Hypergraphs (H-SOSP) with ESCHER on GPU
 
+> The original design plan (July 2026), kept for reference. The code now
+> differs in places: there is no host copy of the line graph, the
+> line-graph delta is derived on the GPU, and the SOSP update is exact
+> (subtree invalidation + push). See [HSOSP.md](HSOSP.md) and
+> [CHANGES.md](../CHANGES.md).
+
 Prepared from: the meeting video + handwritten notes (Meeting/video1989311071.mp4), the escher-mosp
 codebase, the DynaMOSP paper (MOSP GPU), the ESCHER/Dynamic Hypergraph papers (conference + TKDE),
 and `Our plotting style.ipynb`.
