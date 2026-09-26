@@ -53,8 +53,10 @@ batches, against 1.3-12.1x reported in the paper.
   it affects (the original had no header dependencies); `NVCC` falls back to
   `/usr/local/cuda/bin/nvcc`; host OpenMP for the oracles. `make
   syntax-check` referred to an undefined `GRAPH_CPP_SRCS` and skipped the
-  two `graph/src/*.cpp` files; it now preprocesses every translation
-  unit.
+  two `graph/src/*.cpp` files, and it could not fail: under `set -e` a
+  failed `nvcc -E ... && echo ok` does not stop the loop, so it reported
+  success with rc 0 when a file failed. It now preprocesses every
+  translation unit, names the ones that fail and exits non-zero.
 - **`make test`** (`tests/run_tests.sh`) runs every unit test, the H-SOSP
   stress harness and the MOSP harnesses in a temporary directory, prints
   PASS/FAIL per case and exits non-zero on any failure. Known defects were

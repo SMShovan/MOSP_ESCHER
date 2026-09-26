@@ -284,9 +284,17 @@ ALL_SRCS := $(ESCHER_CU_SRCS) $(ESCHER_CPP_SRCS) $(GRAPH_CU_SRCS) \
             tests/unit/test_mosp_update.cu
 
 syntax-check:
-	@set -e; \
+	@failed=; \
 	for f in $(sort $(ALL_SRCS)); do \
 	  printf 'preprocess %s ... ' $$f; \
-	  $(NVCC) $(NVFLAGS) -E $$f > /dev/null && echo ok; \
-	done
+	  if $(NVCC) $(NVFLAGS) -E $$f > /dev/null; then \
+	    echo ok; \
+	  else \
+	    echo FAILED; failed="$$failed $$f"; \
+	  fi; \
+	done; \
+	if [ -n "$$failed" ]; then \
+	  echo "syntax-check: failed to preprocess:$$failed" >&2; \
+	  exit 1; \
+	fi
 	@echo "syntax-check: all translation units preprocessed cleanly"
