@@ -79,7 +79,9 @@ void unfillCBST(const std::vector<int>& keysToUnfill, const std::vector<int>& va
 // fillCBST and insertCBST compact on their own, and only when the new
 // segments would not fit behind the bump pointer (so a structure that never
 // fills up behaves exactly as without compaction); they throw only if the
-// live rows plus the new values do not fit the capacity.
+// compacted rows (live rows plus the kept first segments of deleted rows)
+// plus the new values do not fit the capacity. Compaction copies through a
+// temporary device buffer of the compacted size.
 int compactCBST(CBSTContext& ctx);
 
 // OO wrapper to manage CBST lifecycle and operations

@@ -312,7 +312,7 @@ int compactCBST(CBSTContext &ctx) {
     throw ::escher::EscherError(
         std::string("compactCBST [") +
         (ctx.datasetName ? ctx.datasetName : "?") +
-        "]: the live rows need " + std::to_string(total) +
+        "]: the compacted rows need " + std::to_string(total) +
         " payload slots, more than the capacity " +
         std::to_string(ctx.fixedSize) + ". Increase payloadCapacity.");
   }

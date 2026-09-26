@@ -239,9 +239,14 @@ pass: after every batch the three CBSTs hold exactly the host model's rows.
   keeps its reusable first segment) and moves the bump pointer back.
   `fillCBST` and `insertCBST` compact when the new segments do not fit
   behind the bump pointer (fill then re-fills the values that did not fit
-  into their rows' tails) and throw only when the live rows plus the new
-  values do not fit. Compaction runs only then, so a run that never fills
-  its payload is unchanged. On Geology the compaction took 9 ms (h2h, 130M
+  into their rows' tails) and throw only when the compacted payload plus
+  the new values does not fit. The compacted payload is the padded live
+  rows plus the first segment each deleted row keeps, so with many deleted
+  rows a fill can still throw while the live rows alone would fit.
+  Compaction copies through a temporary device buffer of the compacted
+  size (up to 8 GB at the cap of 2.0 x 10^9 slots). Compaction runs only
+  when a fill or insert runs out of space, so a run that never fills its
+  payload is unchanged. On Geology the compaction took 9 ms (h2h, 130M
   slots to 69M) and the 400-batch vertex run completes. Regression:
   `test_cbst_ops churn` (500 fill / unfill rounds in 2,000 slots, 300
   random rounds with erases and inserts in 1.5x the initial payload, an

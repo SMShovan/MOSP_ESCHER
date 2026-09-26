@@ -41,9 +41,11 @@ not just MOSP.
 - `compactCBST` — the payload is a bump allocator (fill appends overflow
   segments at `initialPayloadSize`; space freed by unfill is not reused in
   place). Compaction rewrites every row as one segment in key order and
-  moves the bump pointer back; `fillCBST` and `insertCBST` call it when
-  their new segments would not fit, and throw only if the live data
-  itself does not fit.
+  moves the bump pointer back (a deleted row keeps its first segment for
+  reuse); `fillCBST` and `insertCBST` call it when their new segments
+  would not fit, and throw only if the compacted rows plus the new values
+  do not fit. It copies through a temporary device buffer of the
+  compacted size.
 
 ### Kernels (`escher/kernel/`)
 
