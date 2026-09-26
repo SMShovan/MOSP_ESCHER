@@ -386,3 +386,19 @@ medians of three runs are in [results/README.md](results/README.md).
   device and only the total is read back. (The same changes were made in
   ESCHER-GPU.) DBLP 50K: ESCHER maintenance 333 → 113 ms on the first
   batch, 120-135 → 109-123 ms afterwards.
+- **P5 host batch bookkeeping** (`HostHypergraph::applyBatch`,
+  `DynamicHypergraph::finishBatch`, `hsospDelta.cu`). Three host costs
+  left after P1-P4: the incidence update tracked touched hyperedges and
+  vertices in hash containers and copied every touched row into its own
+  vector (about 80 ms per 50K DBLP batch, now flat per-id arrays reused
+  across batches); the sorted net delta (10M keys, 80 MB) was downloaded
+  into pageable memory (21 ms; now a persistent pinned buffer); and the
+  h2h groups were built by one thread (47 ms; now counted and written in
+  parallel over chunks split at row boundaries, into buffers reused
+  across batches). Earlier fixes in the same area: the free-id list is
+  removed from in O(1) (P1; the original scanned it for every insert, 16 s
+  per 200K batch), and the host allocator stall of the first batch
+  disappeared with the host line-graph copy (P1, P2). Host code is built
+  at -O3 (build hygiene commit).
+  DBLP 50K: unification 88-93 → 49-51 ms, ESCHER maintenance 109-123 →
+  93-94 ms; dynamic time per batch 213-230 → 157-160 ms (batches 2-3).

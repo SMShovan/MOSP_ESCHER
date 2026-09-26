@@ -16,8 +16,6 @@
 #include <limits>
 #include <queue>
 #include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
 
 namespace escher_mosp {
 
@@ -127,28 +125,45 @@ void HostHypergraph::applyBatch(const HgBatch& b,
     inc = IncidenceBatch{};
     ops = EscherHorizOps{};
 
-    // Touched hyperedges (pre-batch rows snapshotted on first touch) and
-    // touched vertices.
-    std::unordered_map<int, int> touchedSlot;
-    touchedSlot.reserve(b.totalOps() * 2 + 16);
-    std::vector<std::vector<int>> preRows;
-    auto touchHe = [&](int id) {
-        if (touchedSlot.emplace(id, static_cast<int>(inc.touched.size()))
-                .second) {
-            inc.touched.push_back(id);
-            preRows.push_back(id <= maxId() ? heVerts[id - 1]
-                                            : std::vector<int>{});
+    // Touched hyperedges (pre-batch rows recorded on first touch) and
+    // touched vertices, tracked in flat per-id arrays (hash sets and one
+    // vector per touched row cost about 60 ms per 50K DBLP batch).
+    if (heTouchSlot_.size() < heVerts.size() + b.heInsert.size() + 1)
+        heTouchSlot_.resize(heVerts.size() + b.heInsert.size() + 1, -1);
+    vertexTouched_.resize(numVertices, 0);
+    struct ScratchReset {   // also on an exception
+        HostHypergraph& hg;
+        const IncidenceBatch& inc;
+        ~ScratchReset() {
+            for (int id : inc.touched) hg.heTouchSlot_[id] = -1;
+            for (int v : inc.touchedVertices) hg.vertexTouched_[v] = 0;
         }
+    } scratchReset{*this, inc};
+    inc.preOff.assign(1, 0);
+    auto touchHe = [&](int id) {
+        if (id >= static_cast<int>(heTouchSlot_.size()))
+            heTouchSlot_.resize(id + 1, -1);
+        if (heTouchSlot_[id] >= 0) return;
+        heTouchSlot_[id] = static_cast<int>(inc.touched.size());
+        inc.touched.push_back(id);
+        if (id <= maxId())
+            inc.preVals.insert(inc.preVals.end(), heVerts[id - 1].begin(),
+                               heVerts[id - 1].end());
+        inc.preOff.push_back(static_cast<int>(inc.preVals.size()));
     };
-    std::unordered_set<int> touchedVertexSet;
+    const std::size_t opsHint = static_cast<std::size_t>(b.totalOps()) * 4;
+    inc.incKey.reserve(opsHint);
+    inc.incSign.reserve(opsHint);
     auto incidence = [&](int v, int h, int sign) {
         inc.incKey.push_back((static_cast<std::uint64_t>(
                                   static_cast<std::uint32_t>(v))
                               << 32) |
                              static_cast<std::uint32_t>(h));
         inc.incSign.push_back(sign);
-        if (touchedVertexSet.insert(v).second)
+        if (!vertexTouched_[v]) {
+            vertexTouched_[v] = 1;
             inc.touchedVertices.push_back(v);
+        }
     };
     std::vector<int> deletedAtAnyPoint;
 
@@ -258,15 +273,10 @@ void HostHypergraph::applyBatch(const HgBatch& b,
     for (int id : deletedAtAnyPoint)
         if (!alive[id - 1]) inc.deadHe.push_back(id);
 
-    // Pre / post rows of the touched hyperedges, post lengths of the
-    // touched vertices.
-    inc.preOff.assign(1, 0);
+    // Post rows of the touched hyperedges, post lengths of the touched
+    // vertices.
     inc.postOff.assign(1, 0);
-    for (std::size_t t = 0; t < inc.touched.size(); ++t) {
-        const int id = inc.touched[t];
-        inc.preVals.insert(inc.preVals.end(), preRows[t].begin(),
-                           preRows[t].end());
-        inc.preOff.push_back(static_cast<int>(inc.preVals.size()));
+    for (int id : inc.touched) {
         const std::vector<int>& post = heVerts[id - 1];
         inc.postVals.insert(inc.postVals.end(), post.begin(), post.end());
         inc.postOff.push_back(static_cast<int>(inc.postVals.size()));

@@ -551,6 +551,7 @@ void DeviceDelta::free() {
                     static_cast<void*>(d_rowLen), static_cast<void*>(d_rowOff),
                     static_cast<void*>(d_numRows), d_temp})
         if (p) cudaFree(p);
+    if (h_sortedKeys) cudaFreeHost(h_sortedKeys);
     *this = DeviceDelta{};
 }
 

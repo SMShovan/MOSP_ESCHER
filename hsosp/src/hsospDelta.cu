@@ -914,13 +914,22 @@ BatchTimes applyBatch(DynamicHypergraph& dh, DeviceH2H& dev,
 
     // 4. Remaining ESCHER maintenance from the sorted directed pairs.
     t0 = Clock::now();
-    std::vector<std::uint64_t> keys(
-        static_cast<std::size_t>(dev.delta.numSortedKeys));
-    if (!keys.empty())
-        HSOSP_CUDA_CHECK(cudaMemcpy(keys.data(), dev.delta.d_sortedKeys,
-                                    sizeof(u64) * keys.size(),
+    DeviceDelta& dd = dev.delta;
+    const long long nKeys = dd.numSortedKeys;
+    if (nKeys > dd.hostKeyCapacity) {
+        if (dd.h_sortedKeys) cudaFreeHost(dd.h_sortedKeys);
+        dd.h_sortedKeys = nullptr;
+        dd.hostKeyCapacity = nKeys + nKeys / 2 + 4096;
+        HSOSP_CUDA_CHECK(cudaMallocHost(&dd.h_sortedKeys,
+                                        sizeof(u64) * dd.hostKeyCapacity));
+    }
+    if (nKeys > 0)
+        HSOSP_CUDA_CHECK(cudaMemcpy(dd.h_sortedKeys, dd.d_sortedKeys,
+                                    sizeof(u64) * nKeys,
                                     cudaMemcpyDeviceToHost));
-    dh.finishBatch(br, keys);
+    static_assert(sizeof(u64) == sizeof(std::uint64_t), "key width");
+    dh.finishBatch(br, reinterpret_cast<const std::uint64_t*>(dd.h_sortedKeys),
+                   static_cast<std::size_t>(nKeys));
     HSOSP_CUDA_CHECK(cudaDeviceSynchronize());
     t.escherMs += msSince(t0);
     return t;

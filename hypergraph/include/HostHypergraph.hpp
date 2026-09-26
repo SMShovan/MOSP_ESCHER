@@ -187,6 +187,11 @@ public:
 private:
     void freeListRemove_(int id);
     void freeListPush_(int id);
+
+    // applyBatch scratch, all -1 / 0 between batches: slot of a touched
+    // hyperedge in IncidenceBatch::touched, touched-vertex flags.
+    std::vector<int> heTouchSlot_;
+    std::vector<std::uint8_t> vertexTouched_;
 };
 
 /**

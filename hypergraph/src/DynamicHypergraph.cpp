@@ -117,8 +117,11 @@ struct DynamicHypergraph::Impl {
     /// heId -> key of its row in the h2h CBST (0 = none).
     std::vector<int> h2hKeyOfHe;
     /// finishBatch scratch: heId -> index in the batch's new hyperedges
-    /// (-1 between batches).
+    /// (-1 between batches), the h2h fill / unfill groups and the rows of
+    /// the new hyperedges (kept to avoid reallocating them every batch).
     std::vector<int> newSlotOfHe;
+    GroupedOps h2hUnfill, h2hFill;
+    std::vector<int> newRowVals;
 };
 
 DynamicHypergraph::DynamicHypergraph(int numVertices, const Caps& caps)
@@ -338,8 +341,9 @@ DynamicHypergraph::BatchResult DynamicHypergraph::beginBatch(
     return res;
 }
 
-double DynamicHypergraph::finishBatch(
-    BatchResult& res, const std::vector<std::uint64_t>& directedKeys) {
+double DynamicHypergraph::finishBatch(BatchResult& res,
+                                      const std::uint64_t* directedKeys,
+                                      std::size_t numKeys) {
     Impl& im = *pImpl;
     const HostHypergraph& hg = im.host;
     auto t0 = Clock::now();
@@ -355,39 +359,106 @@ double DynamicHypergraph::finishBatch(
     // changes are one run with its deletions first and the fill / unfill
     // groups come out in row order without a further sort. Rows of dead
     // hyperedges are erased below (no unfill); rows of new hyperedges are
-    // inserted whole (no fill).
+    // inserted whole (no fill). The keys are split into chunks at row
+    // boundaries, grouped in parallel and concatenated.
     std::vector<int>& newSlot = im.newSlotOfHe;
     if (static_cast<int>(newSlot.size()) <= hg.maxId())
         newSlot.resize(hg.maxId() + 1, -1);
     for (std::size_t i = 0; i < newHe.size(); ++i)
         newSlot[newHe[i]] = static_cast<int>(i);
-    GroupedOps h2hUnfill, h2hFill;
-    std::vector<int> newRowStart(newHe.size(), 0), newRowLen(newHe.size(), 0);
-    std::vector<int> newRowVals;
-    long long insKeys = 0, delKeys = 0;
-    for (std::uint64_t k : directedKeys) {
-        const int row = static_cast<int>(k >> 33) + 1;
-        const bool ins = (k >> 32) & 1ull;
-        const int val = static_cast<int>(k & 0xffffffffu) + 1;
-        if (!ins) {
-            ++delKeys;
-            if (hg.alive[row - 1]) {
-                const int key = im.h2hKeyOfHe[row];
-                if (key > 0) h2hUnfill.add(key, val);
+    // Two passes over chunks split at row boundaries: count, then write
+    // every group straight into its final place (the buffers persist
+    // across batches).
+    enum { kUnfillRows, kUnfillVals, kFillRows, kFillVals, kNewVals, kIns,
+           kDel, kCounts };
+    const int nChunks =
+        static_cast<int>(std::min<std::size_t>(32, numKeys / 2048 + 1));
+    std::vector<std::size_t> bound(nChunks + 1, numKeys);
+    bound[0] = 0;
+    for (int c = 1; c < nChunks; ++c) {
+        std::size_t b = std::max(numKeys * c / nChunks, bound[c - 1]);
+        while (b > 0 && b < numKeys &&
+               (directedKeys[b] >> 33) == (directedKeys[b - 1] >> 33))
+            ++b;
+        bound[c] = b;
+    }
+    // Category of a key: 0 skip, 1 unfill, 2 fill, 3 new row.
+    auto category = [&](std::uint64_t k, int& row, int& key) {
+        row = static_cast<int>(k >> 33) + 1;
+        key = im.h2hKeyOfHe[row];
+        if (!((k >> 32) & 1ull))
+            return (hg.alive[row - 1] && key > 0) ? 1 : 0;
+        if (newSlot[row] >= 0) return 3;
+        return key > 0 ? 2 : 0;
+    };
+    std::vector<long long> counts(static_cast<std::size_t>(nChunks + 1) *
+                                      kCounts,
+                                  0);
+#pragma omp parallel for schedule(dynamic, 1) if (nChunks > 1)
+    for (int c = 0; c < nChunks; ++c) {
+        long long* n = &counts[static_cast<std::size_t>(c + 1) * kCounts];
+        int lastRow[4] = {0, 0, 0, 0};
+        for (std::size_t i = bound[c]; i < bound[c + 1]; ++i) {
+            int row, key;
+            const int cat = category(directedKeys[i], row, key);
+            ++n[(directedKeys[i] >> 32) & 1ull ? kIns : kDel];
+            if (cat == 1) {
+                n[kUnfillRows] += row != lastRow[1];
+                ++n[kUnfillVals];
+            } else if (cat == 2) {
+                n[kFillRows] += row != lastRow[2];
+                ++n[kFillVals];
+            } else if (cat == 3) {
+                ++n[kNewVals];
             }
-        } else {
-            ++insKeys;
-            const int slot = newSlot[row];
-            if (slot >= 0) {
-                if (newRowLen[slot]++ == 0)
-                    newRowStart[slot] = static_cast<int>(newRowVals.size());
-                newRowVals.push_back(val);
-            } else {
-                const int key = im.h2hKeyOfHe[row];
-                if (key > 0) h2hFill.add(key, val);
-            }
+            lastRow[cat] = row;
         }
     }
+    for (int c = 1; c <= nChunks; ++c)
+        for (int j = 0; j < kCounts; ++j)
+            counts[c * kCounts + j] += counts[(c - 1) * kCounts + j];
+    const long long* total = &counts[static_cast<std::size_t>(nChunks) *
+                                     kCounts];
+    GroupedOps& h2hUnfill = im.h2hUnfill;
+    GroupedOps& h2hFill = im.h2hFill;
+    h2hUnfill.keys.resize(total[kUnfillRows]);
+    h2hUnfill.prefix.resize(total[kUnfillRows]);
+    h2hUnfill.payload.resize(total[kUnfillVals]);
+    h2hFill.keys.resize(total[kFillRows]);
+    h2hFill.prefix.resize(total[kFillRows]);
+    h2hFill.payload.resize(total[kFillVals]);
+    std::vector<int>& newRowVals = im.newRowVals;
+    newRowVals.resize(total[kNewVals]);
+    std::vector<int> newRowStart(newHe.size(), 0), newRowLen(newHe.size(), 0);
+#pragma omp parallel for schedule(dynamic, 1) if (nChunks > 1)
+    for (int c = 0; c < nChunks; ++c) {
+        const long long* o = &counts[static_cast<std::size_t>(c) * kCounts];
+        long long ur = o[kUnfillRows] - 1, uv = o[kUnfillVals];
+        long long fr = o[kFillRows] - 1, fv = o[kFillVals];
+        long long nv = o[kNewVals];
+        int lastRow[4] = {0, 0, 0, 0};
+        for (std::size_t i = bound[c]; i < bound[c + 1]; ++i) {
+            int row, key;
+            const int cat = category(directedKeys[i], row, key);
+            const int val = static_cast<int>(directedKeys[i] & 0xffffffffu) + 1;
+            if (cat == 1) {
+                if (row != lastRow[1]) h2hUnfill.keys[++ur] = key;
+                h2hUnfill.payload[uv++] = val;
+                h2hUnfill.prefix[ur] = static_cast<int>(uv);
+            } else if (cat == 2) {
+                if (row != lastRow[2]) h2hFill.keys[++fr] = key;
+                h2hFill.payload[fv++] = val;
+                h2hFill.prefix[fr] = static_cast<int>(fv);
+            } else if (cat == 3) {
+                const int slot = newSlot[row];
+                if (row != lastRow[3]) newRowStart[slot] = static_cast<int>(nv);
+                ++newRowLen[slot];
+                newRowVals[nv++] = val;
+            }
+            lastRow[cat] = row;
+        }
+    }
+    const long long insKeys = total[kIns], delKeys = total[kDel];
     for (int id : newHe) newSlot[id] = -1;
     im.host.h2hPairCount += (insKeys - delKeys) / 2;
 

@@ -32,6 +32,7 @@
  * through the ESCHER structures and is timed as data structure maintenance.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
@@ -89,8 +90,8 @@ public:
      * indices), sorted, as the device CSR apply produces them. Returns the
      * elapsed milliseconds.
      */
-    double finishBatch(BatchResult& res,
-                       const std::vector<std::uint64_t>& directedKeys);
+    double finishBatch(BatchResult& res, const std::uint64_t* directedKeys,
+                       std::size_t numKeys);
 
     HostHypergraph& host();
     const HostHypergraph& host() const;

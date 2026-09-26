@@ -68,6 +68,9 @@ struct DeviceDelta {
     /// isInsert << 32 | col), 2 per pair (one of d_keys / d_keysAlt).
     const unsigned long long* d_sortedKeys = nullptr;
     long long numSortedKeys = 0;
+    /// Pinned host copy of the sorted keys (for the CBST maintenance).
+    unsigned long long* h_sortedKeys = nullptr;
+    long long hostKeyCapacity = 0;
 
     void reserve(long long pairs, long long ids);
     void reserveKeys(long long keys);
