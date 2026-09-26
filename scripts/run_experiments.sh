@@ -12,7 +12,8 @@
 #   HSOSP_REPS      repetitions per scenario        (default: 3)
 #   HSOSP_EXP       experiment subset, e.g. "E1,E3" (default: all)
 #   HSOSP_SEED      base RNG seed                   (default: 20260725)
-#   CUDA_ARCH       nvcc arch                       (default: sm_70; use sm_80 on A100)
+#   CUDA_ARCH       nvcc arch                       (default: the Makefile default, sm_86;
+#                                                    use sm_80 on A100)
 #
 # Every step is logged; the script aborts on the first failure so a broken
 # build or a correctness regression can never silently produce figures.
@@ -34,7 +35,7 @@ RESULTS="${HSOSP_RESULTS:-results/${SUITE}_${STAMP}}"
 REPS="${HSOSP_REPS:-3}"
 EXP="${HSOSP_EXP:-E1,E2,E3,E4,E5,E7}"
 SEED="${HSOSP_SEED:-20260725}"
-ARCH="${CUDA_ARCH:-sm_70}"
+ARCH="${CUDA_ARCH:-}"
 
 mkdir -p "$RESULTS"
 LOG="$RESULTS/run.log"
@@ -55,17 +56,12 @@ nvcc --version | tail -1
 nvidia-smi -L 2>/dev/null || echo "[env] nvidia-smi unavailable"
 
 # ---- 1. build --------------------------------------------------------------
-echo "=== build (CUDA_ARCH=$ARCH) ==="
-make -j "$(nproc)" all CUDA_ARCH="$ARCH"
+echo "=== build (CUDA_ARCH=${ARCH:-Makefile default}) ==="
+make -j "$(nproc)" all ${ARCH:+CUDA_ARCH="$ARCH"}
 
 # ---- 2. correctness gates --------------------------------------------------
-echo "=== unit tests ==="
-./bin/test_cbst_smoke
-./bin/test_dynamicgraph_roundtrip
-./bin/test_snapshot_matches_updateCSR
-./bin/test_h2h_construction
-./bin/test_h2h_delta
-./bin/test_hsosp_matches_dijkstra
+echo "=== test suite ==="
+./tests/run_tests.sh
 
 echo "=== randomized stress: full pipeline vs Dijkstra ==="
 STRESS_CONFIGS=100

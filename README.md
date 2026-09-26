@@ -91,7 +91,8 @@ applied to the upstream ESCHER code.
 ## Requirements
 
 - CUDA Toolkit 12.5+ (Thrust is bundled)
-- NVIDIA GPU with compute capability ≥ 7.0 (default `-arch=sm_70`)
+- NVIDIA GPU with compute capability ≥ 7.0 (default `-arch=sm_86`; set
+  `CUDA_ARCH` for other GPUs, e.g. `sm_80` for A100, `sm_70` for V100)
 - C++17 host compiler (gcc 9+ or clang 10+)
 - `doxygen` (optional, for `make docs`)
 
@@ -109,10 +110,16 @@ make parallelStressTest  # build just the CUDA parallel stress test
 make clean               # remove build/ and bin/
 make docs                # Doxygen HTML in docs/html/
 make syntax-check        # nvcc -E on every TU (no link; works on macOS)
+make test                # build everything and run tests/run_tests.sh
 
-# Override the CUDA architecture (for newer GPUs on the cluster):
+# Override the CUDA architecture (default sm_86), the compiler or the
+# optimization level (default -O3, host and device):
 make CUDA_ARCH=sm_80
+make NVCC=/usr/local/cuda/bin/nvcc OPT=-O2
 ```
+
+Objects depend on the headers they include and on the compiler flags in
+use, so changing a header or `CUDA_ARCH` rebuilds what is affected.
 
 ## Cluster workflow (mill.mst.edu)
 
@@ -160,8 +167,8 @@ path or through ESCHER.
    write still goes through ESCHER; the read path is a performance choice.
 4. **Motif counting dropped**. ESCHER's `HMotifCount*`, `type1/2/3`,
    `coarseTriangle`, and `motif_utils.cuh` are not part of the unified tree.
-5. **Default arch `sm_70`** (Volta/V100), overridable. Matches MOSP-CUDA's
-   original default and works with `--extended-lambda`.
+5. **Default arch `sm_86`** (Ampere RTX A5000 / A40, the development
+   machine), overridable with `CUDA_ARCH`.
 
 ## Where each public symbol lives
 

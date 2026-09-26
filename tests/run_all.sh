@@ -1,49 +1,13 @@
 #!/usr/bin/env bash
 #
-# End-to-end test runner for escher-mosp. Intended to be executed on the
-# cluster (mill.mst.edu) after transfer, once CUDA is available:
+# Build escher-mosp and run the whole test suite (same as `make test`).
+# Exits non-zero on the first build error or on any failed test case.
 #
-#   module load cuda-toolkit/12.5
-#   cd ~/escher-mosp
-#   ./tests/run_all.sh
-#
-# Exits non-zero on the first failure so CI can surface problems clearly.
+#   ./tests/run_all.sh                 # default CUDA_ARCH (sm_86)
+#   CUDA_ARCH=sm_80 ./tests/run_all.sh # e.g. A100
 
 set -euo pipefail
-
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/.." && pwd)"
-BIN="$ROOT/bin"
-
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-
-echo "=== building escher-mosp ==="
-make -j all
-
-echo
-echo "=== unit tests ==="
-"$BIN/test_cbst_smoke"
-"$BIN/test_dynamicgraph_roundtrip"
-"$BIN/test_snapshot_matches_updateCSR"
-"$BIN/test_h2h_construction"
-"$BIN/test_h2h_delta"
-"$BIN/test_hsosp_matches_dijkstra"
-
-echo
-echo "=== H-SOSP randomized stress ==="
-"$BIN/hsospStress" --configs 50
-
-echo
-echo "=== main pipeline ==="
-"$BIN/main"
-
-echo
-echo "=== sequential stress test ==="
-"$BIN/stressTest"
-
-echo
-echo "=== parallel stress test ==="
-"$BIN/parallelStressTest"
-
-echo
-echo "=== all tests passed ==="
+make -j "$(nproc)" all ${CUDA_ARCH:+CUDA_ARCH="$CUDA_ARCH"}
+./tests/run_tests.sh

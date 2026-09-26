@@ -1,0 +1,11 @@
+# Build products
+build/
+bin/
+docs/html/
+tests/local/local_tests
+# Files written by the MOSP harnesses when run from the repository root
+/tests/tmp/
+/tests/testCase*/
+/stressTest/
+/parallelStressTest/
+.DS_Store

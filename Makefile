@@ -13,20 +13,34 @@
 #   docs                Generate Doxygen HTML into docs/html.
 #   syntax-check        Preprocess every TU without linking (works on macOS
 #                       without a GPU, provided nvcc is installed).
+#   test                Build everything and run tests/run_tests.sh (unit
+#                       tests, randomized stress harnesses, MOSP pipeline);
+#                       exits non-zero on any failure.
 #
-# Overridable: CUDA_ARCH  (default sm_70, V100/Volta; MOSP kernels need
-#                          --extended-lambda which works on all sm_70+).
+# Overridable on the command line:
+#   CUDA_ARCH  target GPU architecture (default sm_86, RTX A5000 / A40;
+#              use sm_80 for A100, sm_90 for H100)
+#   NVCC       nvcc to use (default: nvcc on PATH, else /usr/local/cuda)
+#   OPT        optimization level for host and device code (default -O3)
+#
+# Every object depends on the headers it includes (-MMD -MP dependency
+# files) and on the compiler and flags in use (build/.flags), so changing a
+# header, CUDA_ARCH or OPT rebuilds exactly what is affected.
 #
 # =============================================================================
 
-NVCC      := nvcc
-CUDA_ARCH ?= sm_70
+NVCC      ?= $(shell command -v nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc)
+CUDA_ARCH ?= sm_86
+OPT       ?= -O3
 
 INCLUDES  := -Iescher/include -Iescher/kernel -Igraph/include -Imosp/headers \
              -Ihypergraph/include -Ihsosp/include
 
-NVFLAGS   := -std=c++17 -O2 --extended-lambda -arch=$(CUDA_ARCH) $(INCLUDES)
-CXXFLAGS  := -std=c++17 -O2 -Wall $(INCLUDES)
+# -lineinfo keeps source correlation for compute-sanitizer / Nsight without
+# changing code generation.
+NVFLAGS   := -std=c++17 $(OPT) -lineinfo --extended-lambda -arch=$(CUDA_ARCH) \
+             $(INCLUDES)
+DEPFLAGS  := -MMD -MP
 
 BUILDDIR  := build
 BINDIR    := bin
@@ -108,7 +122,7 @@ UNIT_TESTS := \
 # Phony targets
 # -----------------------------------------------------------------------------
 
-.PHONY: all clean run tests docs syntax-check stressTest parallelStressTest
+.PHONY: all clean run tests test docs syntax-check stressTest parallelStressTest
 
 all: $(BINDIR)/main $(BINDIR)/stressTest $(BINDIR)/parallelStressTest \
      $(BINDIR)/hsospBench $(BINDIR)/hsospStress tests
@@ -118,6 +132,9 @@ parallelStressTest: $(BINDIR)/parallelStressTest
 hsospBench:         $(BINDIR)/hsospBench
 hsospStress:        $(BINDIR)/hsospStress
 tests:              $(UNIT_TESTS)
+
+test: all
+	./tests/run_tests.sh
 
 run: $(BINDIR)/main
 	./$(BINDIR)/main
@@ -139,13 +156,23 @@ $(LIBESCHER): $(ESCHER_OBJS)
 # Pattern rules
 # -----------------------------------------------------------------------------
 
-$(BUILDDIR)/%.cu.o: %.cu
-	@mkdir -p $(dir $@)
-	$(NVCC) $(NVFLAGS) -c -o $@ $<
+# build/.flags records the compiler and flags; it is rewritten (and every
+# object rebuilt) only when they change.
+FLAGS_STAMP := $(BUILDDIR)/.flags
+FLAGS_NOW   := $(NVCC) $(NVFLAGS)
+$(shell mkdir -p $(BUILDDIR); \
+        [ "$$(cat $(FLAGS_STAMP) 2>/dev/null)" = '$(FLAGS_NOW)' ] || \
+        echo '$(FLAGS_NOW)' > $(FLAGS_STAMP))
 
-$(BUILDDIR)/%.cpp.o: %.cpp
+$(BUILDDIR)/%.cu.o: %.cu $(FLAGS_STAMP)
 	@mkdir -p $(dir $@)
-	$(NVCC) $(NVFLAGS) -c -o $@ $<
+	$(NVCC) $(NVFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+$(BUILDDIR)/%.cpp.o: %.cpp $(FLAGS_STAMP)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+-include $(shell find $(BUILDDIR) -name '*.d' 2>/dev/null)
 
 # -----------------------------------------------------------------------------
 # Executables
