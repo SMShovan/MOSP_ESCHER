@@ -31,8 +31,16 @@ average about 8 during the runs), CUDA 12.9 (final build) and 13.1
   only zero allocations for the sanitizer, replace a deprecated functor
   and change documentation).
 
-Both run the same batches: the batch generator is seeded and takes the
-same decisions on the same hypergraph state.
+Every vertex batch and the first two hyperedge batches of each
+configuration are identical in the two builds (the batch generator is
+seeded). The third hyperedge batch differs slightly: the generator draws
+from a pool ordered by hyperedge id, and the ids of inserted hyperedges
+that reuse a deleted ESCHER slot come from the best-fit mapping, which E6
+changes. The second batch is the first that can reuse slots (a batch
+inserts before it erases), so from then on the builds number some
+inserted hyperedges differently and the third batch picks different
+hyperedges. The line graph after that batch differs by at most 0.03 %
+(DBLP) and 0.14 % (Geology) of its pairs.
 
 ## Method
 
