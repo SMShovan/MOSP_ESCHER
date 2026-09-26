@@ -57,25 +57,25 @@ __global__ void computeAssigned(int *prefixMax, int *assigned, int M);
 __global__ void extractKeysFromPositions(int *d_keys, int *positions,
                                          int *outKeys, int numRecords, int D);
 
-// Apply reuse with best-fit index mapping (uses deletedKeys for BST
-// correctness)
-__global__ void applyReuse(CBSTNode *nodes, int *flatValues, int *avail,
-                           int *positions, int *newKeys, int *newPayload,
-                           int *newPrefixSizes, int *relocationPlan,
-                           int *matchedItemIndices, int *matchedSlotIndices,
-                           int *deletedKeys, int matchCount);
+// Pair matched items with their best-fit slots
+__global__ void pairMatches(const int *itemOrder, const int *assigned,
+                            const int *slotOrder, int matchCount,
+                            int *matchedItemIndices, int *matchedSlotIndices);
 
-// Degree-binned applyReuse
+// Degree-binned apply reuse (thread / warp / block per matched item); keys
+// come from deletedKeys to preserve the BST order
+__global__ void applyReuse(CBSTNode *nodes, int *flatValues, int *avail,
+                           int *positions, int *newPayload, int *newPrefixSizes,
+                           int *matchedItemIndices, int *matchedSlotIndices,
+                           int *deletedKeys, int *binIndices, int binCount);
 __global__ void applyReuse_warp(CBSTNode *nodes, int *flatValues, int *avail,
                                 int *positions, int *newPayload,
-                                int *newPrefixSizes, int *relocationPlan,
-                                int *matchedItemIndices,
+                                int *newPrefixSizes, int *matchedItemIndices,
                                 int *matchedSlotIndices, int *deletedKeys,
                                 int *binIndices, int binCount);
 __global__ void applyReuse_block(CBSTNode *nodes, int *flatValues, int *avail,
                                  int *positions, int *newPayload,
-                                 int *newPrefixSizes, int *relocationPlan,
-                                 int *matchedItemIndices,
+                                 int *newPrefixSizes, int *matchedItemIndices,
                                  int *matchedSlotIndices, int *deletedKeys,
                                  int *binIndices, int binCount);
 

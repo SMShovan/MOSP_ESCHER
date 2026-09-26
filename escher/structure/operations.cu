@@ -407,94 +407,82 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
       cudaMemcpy(&D, ctx.d_subtreeAvail, sizeof(int), cudaMemcpyDeviceToHost));
 
   int reuseK = std::min(K, D);
+  std::vector<char> matched(K, 0);
 
   // ── GPU Best-Fit Matching Pipeline ──────────────────────────────────
-  int matchCount = 0;
-  std::vector<int> h_matchedItemIdx; // host copy for surplus computation
-  std::vector<int> h_deletedKeys;    // host copy of original keys for mapping
-  int *d_allPositions = nullptr;
-  int *d_matchedItemIdx = nullptr;
-  int *d_matchedSlotIdx = nullptr;
-  int *d_deletedKeys = nullptr;
-
   if (D > 0 && reuseK > 0) {
     // Locate ALL D deleted slots via order-statistic tree
+    int *d_allPositions = nullptr, *d_deletedKeys = nullptr,
+        *d_slotCaps = nullptr, *d_slotOrder = nullptr;
     checkCuda(cudaMalloc(&d_allPositions, D * sizeof(int)));
+    checkCuda(cudaMalloc(&d_deletedKeys, D * sizeof(int)));
+    checkCuda(cudaMalloc(&d_slotCaps, D * sizeof(int)));
+    checkCuda(cudaMalloc(&d_slotOrder, D * sizeof(int)));
     int numBlocksD = (D + blockSize - 1) / blockSize;
     locateReusableSlots<<<numBlocksD, blockSize>>>(
         ctx.d_subtreeAvail, ctx.d_avail, ctx.numRecords, d_allPositions, D);
-    checkCuda(cudaDeviceSynchronize());
 
     // Recover original keys of deleted slots via CBST layout formula
-    checkCuda(cudaMalloc(&d_deletedKeys, D * sizeof(int)));
     extractKeysFromPositions<<<numBlocksD, blockSize>>>(
         ctx.d_keys, d_allPositions, d_deletedKeys, ctx.numRecords, D);
-    checkCuda(cudaDeviceSynchronize());
-
-    // D2H: transfer deleted keys for mapping construction
-    h_deletedKeys.resize(D);
-    checkCuda(cudaMemcpy(h_deletedKeys.data(), d_deletedKeys, D * sizeof(int),
-                         cudaMemcpyDeviceToHost));
 
     // Step 1: Extract slot capacities (GPU parallel)
-    int *d_slotCaps;
-    checkCuda(cudaMalloc(&d_slotCaps, D * sizeof(int)));
     extractSlotCapacities<<<numBlocksD, blockSize>>>(
         ctx.d_nodes, d_allPositions, d_slotCaps, D);
-    checkCuda(cudaDeviceSynchronize());
 
     // Step 2: Compute item sizes for eligible items (GPU parallel)
-    int *d_itemSizes;
+    int *d_itemSizes = nullptr, *d_itemOrder = nullptr, *d_lo = nullptr,
+        *d_prefixMax = nullptr, *d_assigned = nullptr;
     checkCuda(cudaMalloc(&d_itemSizes, reuseK * sizeof(int)));
+    checkCuda(cudaMalloc(&d_itemOrder, reuseK * sizeof(int)));
+    checkCuda(cudaMalloc(&d_lo, reuseK * sizeof(int)));
+    checkCuda(cudaMalloc(&d_prefixMax, reuseK * sizeof(int)));
+    checkCuda(cudaMalloc(&d_assigned, reuseK * sizeof(int)));
     int numBlocksR = (reuseK + blockSize - 1) / blockSize;
     computeItemSizes<<<numBlocksR, blockSize>>>(ctx.d_insertPrefixSizes,
                                                 d_itemSizes, reuseK);
-    checkCuda(cudaDeviceSynchronize());
+    checkCuda(cudaGetLastError());
 
-    // Step 3: Sort slot capacities in-place (no need to track original indices)
+    // Step 3: Sort slot capacities, remembering which slot each one is.
+    // (The original sorted the capacities alone, lost the slot identity,
+    // and then gave the k-th matched item the k-th slot in BST order,
+    // truncating items larger than that slot.)
     thrust::device_ptr<int> caps_ptr = thrust::device_pointer_cast(d_slotCaps);
-    thrust::sort(caps_ptr, caps_ptr + D);
+    thrust::device_ptr<int> slotOrder_ptr =
+        thrust::device_pointer_cast(d_slotOrder);
+    thrust::sequence(slotOrder_ptr, slotOrder_ptr + D);
+    thrust::sort_by_key(caps_ptr, caps_ptr + D, slotOrder_ptr);
 
     // Step 4: Sort item sizes with original-index tracking
-    int *d_itemSortIdx;
-    checkCuda(cudaMalloc(&d_itemSortIdx, reuseK * sizeof(int)));
-    thrust::device_ptr<int> sortIdx_ptr =
-        thrust::device_pointer_cast(d_itemSortIdx);
-    thrust::sequence(sortIdx_ptr, sortIdx_ptr + reuseK);
-    thrust::device_ptr<int> sizes_ptr =
-        thrust::device_pointer_cast(d_itemSizes);
-    thrust::sort_by_key(sizes_ptr, sizes_ptr + reuseK, sortIdx_ptr);
+    thrust::device_ptr<int> itemOrder_ptr =
+        thrust::device_pointer_cast(d_itemOrder);
+    thrust::sequence(itemOrder_ptr, itemOrder_ptr + reuseK);
+    thrust::device_ptr<int> sizes_ptr = thrust::device_pointer_cast(d_itemSizes);
+    thrust::sort_by_key(sizes_ptr, sizes_ptr + reuseK, itemOrder_ptr);
 
     // Step 5: Binary search — lo[i] = first slot with capacity >=
     // sorted_size[i]
-    int *d_lo;
-    checkCuda(cudaMalloc(&d_lo, reuseK * sizeof(int)));
     lowerBoundKernel<<<numBlocksR, blockSize>>>(d_slotCaps, D, d_itemSizes,
                                                 reuseK, d_lo);
-    checkCuda(cudaDeviceSynchronize());
 
     // Step 6: b[i] = lo[i] - i  (in-place, d_lo becomes d_b)
     computeBInPlace<<<numBlocksR, blockSize>>>(d_lo, reuseK);
-    checkCuda(cudaDeviceSynchronize());
+    checkCuda(cudaGetLastError());
 
     // Step 7: prefix_max = inclusive_scan(b, max)
-    int *d_prefixMax;
-    checkCuda(cudaMalloc(&d_prefixMax, reuseK * sizeof(int)));
     thrust::device_ptr<int> b_ptr = thrust::device_pointer_cast(d_lo);
     thrust::device_ptr<int> pmax_ptr = thrust::device_pointer_cast(d_prefixMax);
     thrust::inclusive_scan(b_ptr, b_ptr + reuseK, pmax_ptr,
                            thrust::maximum<int>());
 
-    // Step 8: assigned[i] = i + prefix_max[i]
-    int *d_assigned;
-    checkCuda(cudaMalloc(&d_assigned, reuseK * sizeof(int)));
+    // Step 8: assigned[i] = i + prefix_max[i] (rank of the slot for sorted
+    // item i; strictly increasing, and >= lo[i] so the slot fits the item)
     computeAssigned<<<numBlocksR, blockSize>>>(d_prefixMax, d_assigned, reuseK);
-    checkCuda(cudaDeviceSynchronize());
 
     // Step 9: Count matched items (assigned[i] < D)
     thrust::device_ptr<int> assigned_ptr =
         thrust::device_pointer_cast(d_assigned);
-    matchCount = static_cast<int>(
+    int matchCount = static_cast<int>(
         thrust::count_if(assigned_ptr, assigned_ptr + reuseK, LessThan{D}));
 
 #ifdef ESCHER_DEBUG_INSERT
@@ -504,187 +492,81 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
 #endif
 
     if (matchCount > 0) {
-      // Step 10: Extract matched original item indices (GPU parallel)
+      // Step 10: matched (item, slot) pairs: sorted item i -> slot of rank
+      // assigned[i]
+      int *d_matchedItemIdx = nullptr, *d_matchedSlotIdx = nullptr;
       checkCuda(cudaMalloc(&d_matchedItemIdx, matchCount * sizeof(int)));
-      thrust::device_ptr<int> matchOut_ptr =
-          thrust::device_pointer_cast(d_matchedItemIdx);
-      thrust::copy_if(sortIdx_ptr, sortIdx_ptr + reuseK, assigned_ptr,
-                      matchOut_ptr, LessThan{D});
-
-      // Step 11: Sort matched indices to restore key order (BST constraint)
-      thrust::sort(matchOut_ptr, matchOut_ptr + matchCount);
-
-      // Step 12: Matched slot indices = [0, 1, ..., matchCount-1] (BST order)
       checkCuda(cudaMalloc(&d_matchedSlotIdx, matchCount * sizeof(int)));
-      thrust::device_ptr<int> slotOut_ptr =
-          thrust::device_pointer_cast(d_matchedSlotIdx);
-      thrust::sequence(slotOut_ptr, slotOut_ptr + matchCount);
+      pairMatches<<<(matchCount + blockSize - 1) / blockSize, blockSize>>>(
+          d_itemOrder, d_assigned, d_slotOrder, matchCount, d_matchedItemIdx,
+          d_matchedSlotIdx);
 
-      // D2H: transfer matched item indices for surplus computation + mapping
-      h_matchedItemIdx.resize(matchCount);
-      checkCuda(cudaMemcpy(h_matchedItemIdx.data(), d_matchedItemIdx,
+      // D2H: matched pairs and slot keys for the mapping and the binning
+      std::vector<int> h_items(matchCount), h_slots(matchCount), h_keys(D);
+      checkCuda(cudaMemcpy(h_items.data(), d_matchedItemIdx,
                            matchCount * sizeof(int), cudaMemcpyDeviceToHost));
-
-      // Build mapping for matched items:
-      // matchedItemIndices[k] → slot k → deletedKeys[k]
+      checkCuda(cudaMemcpy(h_slots.data(), d_matchedSlotIdx,
+                           matchCount * sizeof(int), cudaMemcpyDeviceToHost));
+      checkCuda(cudaMemcpy(h_keys.data(), d_deletedKeys, D * sizeof(int),
+                           cudaMemcpyDeviceToHost));
+      std::vector<int> bins[3];
       for (int k = 0; k < matchCount; ++k) {
-        mapping.itemToKey[h_matchedItemIdx[k]] = h_deletedKeys[k];
+        int itemIdx = h_items[k];
+        mapping.itemToKey[itemIdx] = h_keys[h_slots[k]];
+        matched[itemIdx] = 1;
+        int len = newPrefixSizes[itemIdx] -
+                  (itemIdx == 0 ? 0 : newPrefixSizes[itemIdx - 1]);
+        bins[len < 32 ? 0 : (len < 1024 ? 1 : 2)].push_back(k);
       }
+
+      // ── Degree-binned applyReuse dispatch (thread / warp / block) ──────
+      for (int b = 0; b < 3; ++b) {
+        int n = static_cast<int>(bins[b].size());
+        if (n == 0)
+          continue;
+        int *d_binIdx = nullptr;
+        checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
+        checkCuda(cudaMemcpy(d_binIdx, bins[b].data(), n * sizeof(int),
+                             cudaMemcpyHostToDevice));
+        if (b == 0)
+          applyReuse<<<(n + blockSize - 1) / blockSize, blockSize>>>(
+              ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
+              ctx.d_insertPayload, ctx.d_insertPrefixSizes, d_matchedItemIdx,
+              d_matchedSlotIdx, d_deletedKeys, d_binIdx, n);
+        else if (b == 1)
+          applyReuse_warp<<<(n * 32 + blockSize - 1) / blockSize, blockSize>>>(
+              ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
+              ctx.d_insertPayload, ctx.d_insertPrefixSizes, d_matchedItemIdx,
+              d_matchedSlotIdx, d_deletedKeys, d_binIdx, n);
+        else
+          applyReuse_block<<<n, blockSize>>>(
+              ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
+              ctx.d_insertPayload, ctx.d_insertPrefixSizes, d_matchedItemIdx,
+              d_matchedSlotIdx, d_deletedKeys, d_binIdx, n);
+        checkCuda(cudaDeviceSynchronize());
+        checkCuda(cudaFree(d_binIdx));
+      }
+      checkCuda(cudaFree(d_matchedItemIdx));
+      checkCuda(cudaFree(d_matchedSlotIdx));
     }
 
-    // Free intermediate GPU buffers
-    checkCuda(cudaFree(d_slotCaps));
     checkCuda(cudaFree(d_itemSizes));
-    checkCuda(cudaFree(d_itemSortIdx));
+    checkCuda(cudaFree(d_itemOrder));
     checkCuda(cudaFree(d_lo));
     checkCuda(cudaFree(d_prefixMax));
     checkCuda(cudaFree(d_assigned));
-
-    // ── Degree-binned applyReuse dispatch ─────────────────────────────
-    if (matchCount > 0) {
-      checkCuda(
-          cudaMemset(ctx.d_relocationPlan, 0, matchCount * 3 * sizeof(int)));
-
-      // Compute per-item payload sizes for binning
-      std::vector<int> h_prefixSizes(K);
-      checkCuda(cudaMemcpy(h_prefixSizes.data(), ctx.d_insertPrefixSizes,
-                           K * sizeof(int), cudaMemcpyDeviceToHost));
-
-      std::vector<int> reuseSmall, reuseMed, reuseLarge;
-      for (int k = 0; k < matchCount; ++k) {
-        int itemIdx = h_matchedItemIdx[k];
-        int len = (itemIdx == 0)
-                      ? h_prefixSizes[0]
-                      : h_prefixSizes[itemIdx] - h_prefixSizes[itemIdx - 1];
-        if (len < 32)
-          reuseSmall.push_back(k);
-        else if (len < 1024)
-          reuseMed.push_back(k);
-        else
-          reuseLarge.push_back(k);
-      }
-
-      // Small bin: thread-per-item (original applyReuse)
-      if (!reuseSmall.empty()) {
-        // For the small bin, we use the original applyReuse which processes
-        // all matchCount items. We need to create a subset. However, the
-        // original kernel expects contiguous matchedItemIndices. Instead,
-        // since the small bin indices map directly into the matched arrays,
-        // we can launch the original kernel for all items when all are small,
-        // or use a binned approach.
-        // For simplicity and consistency, we always use the binned approach:
-        // the thread-level kernel IS the original applyReuse, so we just
-        // launch it for all matchCount. We only use warp/block for upgrades.
-      }
-
-      // If all items are small (common case), just launch the original kernel
-      if (reuseMed.empty() && reuseLarge.empty()) {
-        int numBlocksM = (matchCount + blockSize - 1) / blockSize;
-        applyReuse<<<numBlocksM, blockSize>>>(
-            ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
-            ctx.d_insertKeys, ctx.d_insertPayload, ctx.d_insertPrefixSizes,
-            ctx.d_relocationPlan, d_matchedItemIdx, d_matchedSlotIdx,
-            d_deletedKeys, matchCount);
-        checkCuda(cudaDeviceSynchronize());
-      } else {
-        // Mixed bins: launch separate kernels
-        // Small bin
-        if (!reuseSmall.empty()) {
-          int n = static_cast<int>(reuseSmall.size());
-          // For small bin, we need a subset. Build temp arrays.
-          // Actually, the original applyReuse uses tid as index into matched
-          // arrays. We need to create device arrays of just small-bin matched
-          // indices.
-          int *d_smallMatchItem, *d_smallMatchSlot;
-          checkCuda(cudaMalloc(&d_smallMatchItem, n * sizeof(int)));
-          checkCuda(cudaMalloc(&d_smallMatchSlot, n * sizeof(int)));
-          // Extract small-bin items from matched arrays
-          std::vector<int> h_smallItems(n), h_smallSlots(n);
-          std::vector<int> h_allMatchItems(matchCount),
-              h_allMatchSlots(matchCount);
-          checkCuda(cudaMemcpy(h_allMatchItems.data(), d_matchedItemIdx,
-                               matchCount * sizeof(int),
-                               cudaMemcpyDeviceToHost));
-          checkCuda(cudaMemcpy(h_allMatchSlots.data(), d_matchedSlotIdx,
-                               matchCount * sizeof(int),
-                               cudaMemcpyDeviceToHost));
-          for (int i = 0; i < n; ++i) {
-            h_smallItems[i] = h_allMatchItems[reuseSmall[i]];
-            h_smallSlots[i] = h_allMatchSlots[reuseSmall[i]];
-          }
-          checkCuda(cudaMemcpy(d_smallMatchItem, h_smallItems.data(),
-                               n * sizeof(int), cudaMemcpyHostToDevice));
-          checkCuda(cudaMemcpy(d_smallMatchSlot, h_smallSlots.data(),
-                               n * sizeof(int), cudaMemcpyHostToDevice));
-          int blocks = (n + blockSize - 1) / blockSize;
-          applyReuse<<<blocks, blockSize>>>(
-              ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
-              ctx.d_insertKeys, ctx.d_insertPayload, ctx.d_insertPrefixSizes,
-              ctx.d_relocationPlan, d_smallMatchItem, d_smallMatchSlot,
-              d_deletedKeys, n);
-          checkCuda(cudaDeviceSynchronize());
-          checkCuda(cudaFree(d_smallMatchItem));
-          checkCuda(cudaFree(d_smallMatchSlot));
-        }
-        // Medium bin: warp-per-item
-        if (!reuseMed.empty()) {
-          int n = static_cast<int>(reuseMed.size());
-          int *d_binIdx;
-          checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-          checkCuda(cudaMemcpy(d_binIdx, reuseMed.data(), n * sizeof(int),
-                               cudaMemcpyHostToDevice));
-          int totalThreads = n * 32;
-          int blocks = (totalThreads + blockSize - 1) / blockSize;
-          applyReuse_warp<<<blocks, blockSize>>>(
-              ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
-              ctx.d_insertPayload, ctx.d_insertPrefixSizes,
-              ctx.d_relocationPlan, d_matchedItemIdx, d_matchedSlotIdx,
-              d_deletedKeys, d_binIdx, n);
-          checkCuda(cudaDeviceSynchronize());
-          checkCuda(cudaFree(d_binIdx));
-        }
-        // Large bin: block-per-item
-        if (!reuseLarge.empty()) {
-          int n = static_cast<int>(reuseLarge.size());
-          int *d_binIdx;
-          checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-          checkCuda(cudaMemcpy(d_binIdx, reuseLarge.data(), n * sizeof(int),
-                               cudaMemcpyHostToDevice));
-          applyReuse_block<<<n, blockSize>>>(
-              ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
-              ctx.d_insertPayload, ctx.d_insertPrefixSizes,
-              ctx.d_relocationPlan, d_matchedItemIdx, d_matchedSlotIdx,
-              d_deletedKeys, d_binIdx, n);
-          checkCuda(cudaDeviceSynchronize());
-          checkCuda(cudaFree(d_binIdx));
-        }
-      }
-
-      checkCuda(cudaFree(d_matchedItemIdx));
-      checkCuda(cudaFree(d_matchedSlotIdx));
-      d_matchedItemIdx = nullptr;
-      d_matchedSlotIdx = nullptr;
-    }
-  }
-
-  if (d_allPositions)
     checkCuda(cudaFree(d_allPositions));
-  if (d_deletedKeys)
     checkCuda(cudaFree(d_deletedKeys));
+    checkCuda(cudaFree(d_slotCaps));
+    checkCuda(cudaFree(d_slotOrder));
+  }
 
   // ── Build surplus list ──────────────────────────────────────────────
   // Unmatched items from the first reuseK plus all items beyond reuseK.
   std::vector<int> surplusIndices;
-  {
-    int matchPtr = 0;
-    for (int i = 0; i < K; ++i) {
-      if (matchPtr < matchCount && h_matchedItemIdx[matchPtr] == i) {
-        matchPtr++;
-      } else {
-        surplusIndices.push_back(i);
-      }
-    }
-  }
+  for (int i = 0; i < K; ++i)
+    if (!matched[i])
+      surplusIndices.push_back(i);
   int surplus = static_cast<int>(surplusIndices.size());
 
   // ── Surplus inserts: append at tail, then reconstruct ───────────────

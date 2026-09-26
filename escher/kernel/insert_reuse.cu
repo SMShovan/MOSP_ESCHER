@@ -108,51 +108,68 @@ __global__ void extractKeysFromPositions(int *d_keys, int *positions,
   outKeys[tid] = d_keys[cbstRankOfPosition(pos, numRecords)];
 }
 
-// ── Phase 2: Apply reuse ────────────────────────────────────────────────
-
-// Thread-level applyReuse (small payloads, len < 32): one thread per matched
-// item. Also used as the "small bin" kernel in degree-binned dispatch.
-__global__ void applyReuse(CBSTNode *nodes, int *flatValues, int *avail,
-                           int *positions, int *newKeys, int *newPayload,
-                           int *newPrefixSizes, int *relocationPlan,
-                           int *matchedItemIndices, int *matchedSlotIndices,
-                           int *deletedKeys, int matchCount) {
+// Pairs each matched item with its slot. Items are sorted by size and slots
+// by capacity; assigned[i] (the slot rank of sorted item i) is strictly
+// increasing and >= the first slot that fits, so the matched items are
+// exactly sorted items 0..matchCount-1 and every one fits its slot.
+__global__ void pairMatches(const int *itemOrder, const int *assigned,
+                            const int *slotOrder, int matchCount,
+                            int *matchedItemIndices, int *matchedSlotIndices) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid >= matchCount)
     return;
-  int itemIdx = matchedItemIndices[tid];
-  int slotIdx = matchedSlotIndices[tid];
+  matchedItemIndices[tid] = itemOrder[tid];
+  matchedSlotIndices[tid] = slotOrder[assigned[tid]];
+}
+
+// ── Phase 2: Apply reuse ────────────────────────────────────────────────
+// Best-fit matching guarantees len <= capacity, so a matched item always
+// fits its slot (the original assigned items to slots in BST order and
+// truncated rows that did not fit).
+
+// Value of slot position i (0 <= i <= capacity) after reusing it for a row
+// of len values: the row, its INT_MIN terminator, then zeros (the rest of the
+// deleted row's data is cleared so the free part of the segment is empty).
+static __device__ int reusedSlotValue(const int *newPayload, int start,
+                                      int len, int i) {
+  return i < len ? newPayload[start + i] : (i == len ? INT_MIN : 0);
+}
+
+// Metadata of a reused slot.
+static __device__ void finishReuse(CBSTNode *node, int *avail, int pos,
+                                   int base, int len, int capacity, int key) {
+  node->occupancy = len;
+  // Restore the slot's own key so the BST order is preserved
+  node->index = key;
+  node->tailBase = base;
+  node->tailCapacity = capacity;
+  avail[pos] = 0;
+}
+
+// Thread-level applyReuse (small payloads, len < 32): one thread per matched
+// item. binIndices[t] -> index into matchedItemIndices/matchedSlotIndices.
+__global__ void applyReuse(CBSTNode *nodes, int *flatValues, int *avail,
+                           int *positions, int *newPayload, int *newPrefixSizes,
+                           int *matchedItemIndices, int *matchedSlotIndices,
+                           int *deletedKeys, int *binIndices, int binCount) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= binCount)
+    return;
+  int matchIdx = binIndices[tid];
+  int itemIdx = matchedItemIndices[matchIdx];
+  int slotIdx = matchedSlotIndices[matchIdx];
   int pos = positions[slotIdx];
   if (pos < 0)
     return;
   CBSTNode *node = &nodes[pos];
   int start = (itemIdx == 0) ? 0 : newPrefixSizes[itemIdx - 1];
-  int end = newPrefixSizes[itemIdx];
-  int len = end - start;
+  int len = newPrefixSizes[itemIdx] - start;
   int base = node->value;
   int capacity = node->length - 1;
-  if (len <= capacity) {
-    for (int i = 0; i < len; ++i) {
-      flatValues[base + i] = newPayload[start + i];
-    }
-    flatValues[base + len] = INT_MIN;
-    // Update metadata
-    node->occupancy = len;
-  } else {
-    for (int i = 0; i < capacity; ++i) {
-      flatValues[base + i] = newPayload[start + i];
-    }
-    int idx3 = tid * 3;
-    relocationPlan[idx3] = base + capacity;
-    relocationPlan[idx3 + 1] = capacity;
-    relocationPlan[idx3 + 2] = len - capacity;
-    node->occupancy = capacity;
+  for (int i = 0; i <= capacity; ++i) {
+    flatValues[base + i] = reusedSlotValue(newPayload, start, len, i);
   }
-  // Write the SLOT's original key (not the item's key) to preserve BST order
-  node->index = deletedKeys[slotIdx];
-  node->tailBase = base;
-  node->tailCapacity = capacity;
-  avail[pos] = 0;
+  finishReuse(node, avail, pos, base, len, capacity, deletedKeys[slotIdx]);
 }
 
 // ── Warp-level applyReuse (medium payloads, 32 <= len < 1024) ───────────
@@ -160,8 +177,7 @@ __global__ void applyReuse(CBSTNode *nodes, int *flatValues, int *avail,
 // binIndices[warpIdx] → index into matchedItemIndices/matchedSlotIndices.
 __global__ void applyReuse_warp(CBSTNode *nodes, int *flatValues, int *avail,
                                 int *positions, int *newPayload,
-                                int *newPrefixSizes, int *relocationPlan,
-                                int *matchedItemIndices,
+                                int *newPrefixSizes, int *matchedItemIndices,
                                 int *matchedSlotIndices, int *deletedKeys,
                                 int *binIndices, int binCount) {
   int globalTid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -179,35 +195,18 @@ __global__ void applyReuse_warp(CBSTNode *nodes, int *flatValues, int *avail,
 
   CBSTNode *node = &nodes[pos];
   int start = (itemIdx == 0) ? 0 : newPrefixSizes[itemIdx - 1];
-  int end = newPrefixSizes[itemIdx];
-  int len = end - start;
+  int len = newPrefixSizes[itemIdx] - start;
   int base = node->value;
   int capacity = node->length - 1;
 
-  int copyLen = (len <= capacity) ? len : capacity;
-
   // Warp-strided cooperative copy
-  for (int i = lane; i < copyLen; i += 32) {
-    flatValues[base + i] = newPayload[start + i];
+  for (int i = lane; i <= capacity; i += 32) {
+    flatValues[base + i] = reusedSlotValue(newPayload, start, len, i);
   }
 
-  // Lane 0 handles sentinel, metadata, overflow plan
-  if (lane == 0) {
-    if (len <= capacity) {
-      flatValues[base + len] = INT_MIN;
-      node->occupancy = len;
-    } else {
-      int idx3 = matchIdx * 3;
-      relocationPlan[idx3] = base + capacity;
-      relocationPlan[idx3 + 1] = capacity;
-      relocationPlan[idx3 + 2] = len - capacity;
-      node->occupancy = capacity;
-    }
-    node->index = deletedKeys[slotIdx];
-    node->tailBase = base;
-    node->tailCapacity = capacity;
-    avail[pos] = 0;
-  }
+  // Lane 0 handles the metadata
+  if (lane == 0)
+    finishReuse(node, avail, pos, base, len, capacity, deletedKeys[slotIdx]);
 }
 
 // ── Block-level applyReuse (large payloads, len >= 1024) ────────────────
@@ -215,8 +214,7 @@ __global__ void applyReuse_warp(CBSTNode *nodes, int *flatValues, int *avail,
 // binIndices[blockIdx.x] → index into matchedItemIndices/matchedSlotIndices.
 __global__ void applyReuse_block(CBSTNode *nodes, int *flatValues, int *avail,
                                  int *positions, int *newPayload,
-                                 int *newPrefixSizes, int *relocationPlan,
-                                 int *matchedItemIndices,
+                                 int *newPrefixSizes, int *matchedItemIndices,
                                  int *matchedSlotIndices, int *deletedKeys,
                                  int *binIndices, int binCount) {
   int idx = blockIdx.x;
@@ -232,33 +230,16 @@ __global__ void applyReuse_block(CBSTNode *nodes, int *flatValues, int *avail,
 
   CBSTNode *node = &nodes[pos];
   int start = (itemIdx == 0) ? 0 : newPrefixSizes[itemIdx - 1];
-  int end = newPrefixSizes[itemIdx];
-  int len = end - start;
+  int len = newPrefixSizes[itemIdx] - start;
   int base = node->value;
   int capacity = node->length - 1;
 
-  int copyLen = (len <= capacity) ? len : capacity;
-
   // Block-strided cooperative copy
-  for (int i = threadIdx.x; i < copyLen; i += blockDim.x) {
-    flatValues[base + i] = newPayload[start + i];
+  for (int i = threadIdx.x; i <= capacity; i += blockDim.x) {
+    flatValues[base + i] = reusedSlotValue(newPayload, start, len, i);
   }
 
-  // Thread 0 handles sentinel, metadata, overflow plan
-  if (threadIdx.x == 0) {
-    if (len <= capacity) {
-      flatValues[base + len] = INT_MIN;
-      node->occupancy = len;
-    } else {
-      int idx3 = matchIdx * 3;
-      relocationPlan[idx3] = base + capacity;
-      relocationPlan[idx3 + 1] = capacity;
-      relocationPlan[idx3 + 2] = len - capacity;
-      node->occupancy = capacity;
-    }
-    node->index = deletedKeys[slotIdx];
-    node->tailBase = base;
-    node->tailCapacity = capacity;
-    avail[pos] = 0;
-  }
+  // Thread 0 handles the metadata
+  if (threadIdx.x == 0)
+    finishReuse(node, avail, pos, base, len, capacity, deletedKeys[slotIdx]);
 }

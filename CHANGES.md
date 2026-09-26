@@ -120,3 +120,13 @@ made there; these commits port those fixes, adapted to this copy's API
   rebuild now keeps the full record of every live node (brought into key
   order through its in-order rank) and gives surplus rows their real
   occupancy and tail. Regression: `test_cbst_ops surplus`.
+- **E6 best-fit result discarded** (`operations.cu` `insertCBST`,
+  `kernel/insert_reuse.cu`). The capacities of the deleted slots were sorted
+  without their slot ids; the matched items were then re-sorted by index
+  and the k-th one written into the k-th deleted slot in BST order. Items
+  larger than that slot were truncated (the relocation plan the kernels
+  wrote was never consumed): a 10-value item stored in a 3-value slot kept
+  3 values. The slot ids now travel through the sort and each matched item
+  goes to the slot the prefix-max matching chose, which always fits; the
+  rest of a reused slot is cleared. Regression: `test_cbst_ops bestfit`
+  (and `reuse`, which also needed E4).
