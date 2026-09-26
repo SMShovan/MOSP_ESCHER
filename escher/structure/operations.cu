@@ -26,16 +26,10 @@ struct LessThan {
 #include "../kernel/kernels.cuh"
 #include "../kernel/device_utils.cuh"
 
-// Utility: dump node index and value to plain arrays; deleted nodes
-// (avail = 1) are reported with index -1 so the rebuild drops them.
-__global__ void dumpNodeIndexValue(CBSTNode *nodes, const int *avail, int n,
-                                   int *outIndex, int *outValue) {
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid < n) {
-    outIndex[tid] = avail[tid] ? -1 : nodes[tid].index;
-    outValue[tid] = nodes[tid].value;
-  }
-}
+// Functor for thrust::copy_if on a 0/1 stencil
+struct IsSet {
+  __host__ __device__ bool operator()(int x) const { return x != 0; }
+};
 
 // Local CUDA error checker for this TU. Delegates to the public
 // escher::checkCudaImpl helper so failures surface as EscherError
@@ -701,8 +695,9 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
       int q = (num + a - 1) / a;
       return q * a;
     };
-    std::vector<int> appendedOffsets;
-    appendedOffsets.reserve(surplus);
+    // Tail metadata of each surplus row: one segment holding len values,
+    // zero padding up to the alignment, then the INT_MIN terminator.
+    std::vector<CBSTNode> surplusRecords(surplus);
     int cursor = ctx.initialPayloadSize;
     for (int s = 0; s < surplus; ++s) {
       int globalIdx = surplusIndices[s];
@@ -721,7 +716,13 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
             std::to_string(ctx.fixedSize) +
             "). Increase payloadCapacity.");
       }
-      appendedOffsets.push_back(base);
+      CBSTNode &r = surplusRecords[s];
+      r = CBSTNode{};
+      r.value = base;
+      r.length = aligned + 1;
+      r.occupancy = len;
+      r.tailBase = base;
+      r.tailCapacity = aligned;
       if (len > 0) {
         checkCuda(cudaMemcpy(ctx.d_flatPayload + base,
                              newPayload.data() + start, len * sizeof(int),
@@ -738,116 +739,77 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     }
     ctx.initialPayloadSize = cursor;
 
-    // Reconstruct CBST from valid (non-deleted) nodes + surplus
+    // Reconstruct the CBST from the surviving (non-deleted) nodes plus the
+    // surplus rows. Surviving nodes keep their full records (offset,
+    // length, occupancy and tail segment); the original rebuilt them from
+    // (key, offset) pairs with storeItemsIntoNodes, which reset occupancy
+    // to 0 and the tail to the first segment, so the next fill overwrote
+    // the row from its base and overflow chains were lost. Live nodes are
+    // brought into key order through their in-order rank, then compacted.
     int oldN = ctx.numRecords;
-
-    int *d_idx, *d_val;
-    checkCuda(cudaMalloc(&d_idx, oldN * sizeof(int)));
-    checkCuda(cudaMalloc(&d_val, oldN * sizeof(int)));
-    int blocksDump = (oldN + blockSize - 1) / blockSize;
-    dumpNodeIndexValue<<<blocksDump, blockSize>>>(ctx.d_nodes, ctx.d_avail,
-                                                  oldN, d_idx, d_val);
-    checkCuda(cudaDeviceSynchronize());
-
-    // Sort (key, startOffset) pairs on the DEVICE. The upstream code copied
-    // both arrays to the host and ran std::sort over up to numRecords pairs
-    // on every surplus insert, which dominates batch time for multi-million
-    // record trees. Deleted nodes carry index -1 and sort to the front.
-    {
-      thrust::device_ptr<int> idx_ptr = thrust::device_pointer_cast(d_idx);
-      thrust::device_ptr<int> val_ptr = thrust::device_pointer_cast(d_val);
-      thrust::sort_by_key(idx_ptr, idx_ptr + oldN, val_ptr);
-    }
-
-    std::vector<int> h_idx(oldN), h_val(oldN);
-    checkCuda(cudaMemcpy(h_idx.data(), d_idx, oldN * sizeof(int),
-                         cudaMemcpyDeviceToHost));
-    checkCuda(cudaMemcpy(h_val.data(), d_val, oldN * sizeof(int),
-                         cudaMemcpyDeviceToHost));
-    checkCuda(cudaFree(d_idx));
-    checkCuda(cudaFree(d_val));
-
-    // Skip the leading non-positive (deleted) entries; the rest is sorted.
-    int firstValid = 0;
-    while (firstValid < oldN && h_idx[firstValid] <= 0)
-      ++firstValid;
-    std::vector<std::pair<int, int>> pairs;
-    pairs.reserve(oldN - firstValid);
-    for (int i = firstValid; i < oldN; ++i) {
-      pairs.emplace_back(h_idx[i], h_val[i]);
-    }
-
-    int validOldCount = static_cast<int>(pairs.size());
-    int newN = validOldCount + surplus;
+    CBSTNode *d_ranked = nullptr, *d_records = nullptr;
+    int *d_rankedLive = nullptr;
+    checkCuda(cudaMalloc(&d_ranked, oldN * sizeof(CBSTNode)));
+    checkCuda(cudaMalloc(&d_records,
+                         static_cast<size_t>(oldN + surplus) * sizeof(CBSTNode)));
+    checkCuda(cudaMalloc(&d_rankedLive, oldN * sizeof(int)));
+    int blocksOld = (oldN + blockSize - 1) / blockSize;
+    rankOrderNodes<<<blocksOld, blockSize>>>(ctx.d_nodes, ctx.d_avail, oldN,
+                                             d_ranked, d_rankedLive);
+    checkCuda(cudaGetLastError());
+    thrust::device_ptr<CBSTNode> ranked_ptr(d_ranked), records_ptr(d_records);
+    thrust::device_ptr<int> live_ptr(d_rankedLive);
+    int validOldCount = static_cast<int>(
+        thrust::copy_if(ranked_ptr, ranked_ptr + oldN, live_ptr, records_ptr,
+                        IsSet()) -
+        records_ptr);
 
     // ── Option A: Preserve original keys (no compaction) ────────────
     // Surviving nodes keep their original keys.  Surplus items get keys
     // beyond the current maximum so no external references are invalidated.
-    std::vector<int> h_newKeys(newN);
-    std::vector<int> h_newStarts(newN);
-    for (int i = 0; i < validOldCount; ++i) {
-      h_newKeys[i] = pairs[i].first; // original key preserved
-      h_newStarts[i] = pairs[i].second;
+    int nextKey = 1;
+    if (validOldCount > 0) {
+      int lastKey = 0;
+      checkCuda(cudaMemcpy(&lastKey, &d_records[validOldCount - 1].index,
+                           sizeof(int), cudaMemcpyDeviceToHost));
+      nextKey = lastKey + 1;
     }
-    int nextKey = (validOldCount > 0) ? h_newKeys[validOldCount - 1] + 1 : 1;
     for (int i = 0; i < surplus; ++i) {
-      h_newKeys[validOldCount + i] = nextKey;
-      h_newStarts[validOldCount + i] = appendedOffsets[i];
-      // Build mapping for surplus items
+      surplusRecords[i].index = nextKey;
+      surplusRecords[i].size = ctx.initialPayloadSize;
       mapping.itemToKey[surplusIndices[i]] = nextKey;
       nextKey++;
     }
+    checkCuda(cudaMemcpy(d_records + validOldCount, surplusRecords.data(),
+                         surplus * sizeof(CBSTNode), cudaMemcpyHostToDevice));
+    int newN = validOldCount + surplus;
 
     // Free old device arrays
-    if (ctx.d_keys)
-      checkCuda(cudaFree(ctx.d_keys));
-    if (ctx.d_startOffsets)
-      checkCuda(cudaFree(ctx.d_startOffsets));
-    if (ctx.d_nodes)
-      checkCuda(cudaFree(ctx.d_nodes));
-    if (ctx.d_avail)
-      checkCuda(cudaFree(ctx.d_avail));
-    if (ctx.d_subtreeAvail)
-      checkCuda(cudaFree(ctx.d_subtreeAvail));
-    if (ctx.d_insertKeys)
-      checkCuda(cudaFree(ctx.d_insertKeys));
-    if (ctx.d_insertPayload)
-      checkCuda(cudaFree(ctx.d_insertPayload));
-    if (ctx.d_insertPrefixSizes)
-      checkCuda(cudaFree(ctx.d_insertPrefixSizes));
-    if (ctx.d_relocationPlan)
-      checkCuda(cudaFree(ctx.d_relocationPlan));
+    checkCuda(cudaFree(ctx.d_keys));
+    checkCuda(cudaFree(ctx.d_startOffsets));
+    checkCuda(cudaFree(ctx.d_nodes));
+    checkCuda(cudaFree(ctx.d_avail));
+    checkCuda(cudaFree(ctx.d_subtreeAvail));
 
     ctx.numRecords = newN;
     checkCuda(cudaMalloc(&ctx.d_nodes, newN * sizeof(CBSTNode)));
     checkCuda(cudaMalloc(&ctx.d_keys, newN * sizeof(int)));
     checkCuda(cudaMalloc(&ctx.d_startOffsets, newN * sizeof(int)));
-    checkCuda(cudaMemcpy(ctx.d_keys, h_newKeys.data(), newN * sizeof(int),
-                         cudaMemcpyHostToDevice));
-    checkCuda(cudaMemcpy(ctx.d_startOffsets, h_newStarts.data(),
-                         newN * sizeof(int), cudaMemcpyHostToDevice));
-
     checkCuda(cudaMalloc(&ctx.d_avail, newN * sizeof(int)));
     checkCuda(cudaMalloc(&ctx.d_subtreeAvail, newN * sizeof(int)));
     checkCuda(cudaMemset(ctx.d_avail, 0, newN * sizeof(int)));
     checkCuda(cudaMemset(ctx.d_subtreeAvail, 0, newN * sizeof(int)));
 
-    checkCuda(cudaMalloc(&ctx.d_insertKeys, newN * sizeof(int)));
-    checkCuda(cudaMalloc(&ctx.d_insertPayload,
-                         static_cast<size_t>(newN) * 3 * sizeof(int)));
-    checkCuda(cudaMalloc(&ctx.d_insertPrefixSizes, newN * sizeof(int)));
-    checkCuda(cudaMalloc(&ctx.d_relocationPlan,
-                         3LL * newN * sizeof(int)));
-    ctx.scratchKeysCap = newN;
-    ctx.scratchPayloadCap = static_cast<long long>(newN) * 3;
-
     int blocksBuild = (newN + blockSize - 1) / blockSize;
+    recordKeysAndStarts<<<blocksBuild, blockSize>>>(d_records, newN,
+                                                    ctx.d_keys,
+                                                    ctx.d_startOffsets);
     buildEmptyBinaryTree<<<blocksBuild, blockSize>>>(ctx.d_nodes, newN);
+    placeNodeRecords<<<blocksBuild, blockSize>>>(ctx.d_nodes, d_records, newN);
     checkCuda(cudaDeviceSynchronize());
-    storeItemsIntoNodes<<<blocksBuild, blockSize>>>(ctx.d_nodes, ctx.d_keys,
-                                                    ctx.d_startOffsets, newN,
-                                                    ctx.initialPayloadSize);
-    checkCuda(cudaDeviceSynchronize());
+    checkCuda(cudaFree(d_ranked));
+    checkCuda(cudaFree(d_records));
+    checkCuda(cudaFree(d_rankedLive));
   } else {
     // No surplus: mapping for matched items was already populated above.
     // Any items that were NOT matched and NOT surplus don't exist (K == 0

@@ -7,6 +7,12 @@ __global__ void buildEmptyBinaryTree(CBSTNode *nodes, int n);
 __global__ void storeItemsIntoNodes(CBSTNode *nodes, int *indices, int *values,
                                     int n, int totalSize);
 __global__ void printEachNode(CBSTNode *nodes, int n);
+__global__ void rankOrderNodes(const CBSTNode *nodes, const int *avail, int n,
+                               CBSTNode *ranked, int *rankedLive);
+__global__ void recordKeysAndStarts(const CBSTNode *records, int n, int *keys,
+                                    int *starts);
+__global__ void placeNodeRecords(CBSTNode *nodes, const CBSTNode *sortedRecords,
+                                 int n);
 
 // Payload ops
 __global__ void insertNode(CBSTNode *nodes, int *flatValues, int *insertIndices,

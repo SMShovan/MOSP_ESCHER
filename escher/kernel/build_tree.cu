@@ -61,3 +61,46 @@ __global__ void printEachNode(CBSTNode *nodes, int n) {
     }
   }
 }
+
+// Brings the live nodes into key order for a rebuild: the node at heap
+// position t has in-order rank cbstRankOfPosition(t, n), and keys are sorted
+// by rank. rankedLive[r] = 1 for a live (not deleted) node.
+__global__ void rankOrderNodes(const CBSTNode *nodes, const int *avail, int n,
+                               CBSTNode *ranked, int *rankedLive) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= n)
+    return;
+  int rank = cbstRankOfPosition(tid, n);
+  ranked[rank] = nodes[tid];
+  rankedLive[rank] = avail[tid] == 0;
+}
+
+// Sorted key and row offset arrays of a record list.
+__global__ void recordKeysAndStarts(const CBSTNode *records, int n, int *keys,
+                                    int *starts) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= n)
+    return;
+  keys[tid] = records[tid].index;
+  starts[tid] = records[tid].value;
+}
+
+// Rebuild after surplus inserts: places full node records (sorted by key) at
+// their heap positions, so surviving rows keep their offset, length and
+// tail metadata (occupancy, tailBase, tailCapacity). Child / parent pointers
+// come from buildEmptyBinaryTree.
+__global__ void placeNodeRecords(CBSTNode *nodes, const CBSTNode *sortedRecords,
+                                 int n) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= n)
+    return;
+  const CBSTNode &r = sortedRecords[cbstRankOfPosition(tid, n)];
+  CBSTNode &node = nodes[tid];
+  node.index = r.index;
+  node.value = r.value;
+  node.length = r.length;
+  node.size = r.size;
+  node.occupancy = r.occupancy;
+  node.tailBase = r.tailBase;
+  node.tailCapacity = r.tailCapacity;
+}
