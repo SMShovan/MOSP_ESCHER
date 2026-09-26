@@ -30,6 +30,8 @@
 
 using namespace std;
 
+// Every step's result is checked: main exits with 1 when a step fails or a
+// generated test case does not match Dijkstra (it ignored all of them).
 int main() {
 
   int numberOfNodes = 100;
@@ -43,54 +45,70 @@ int main() {
   double deletionPercentage = 50;
 
   // 1a. Generate graph in MTX format (for Dijkstra on MTX input)
-  generateGraph(numberOfNodes, numberOfEdges, true, "data/graph.mtx",
-                numberOfObjectives, objectiveStartRange, objectiveEndRange);
+  if (!generateGraph(numberOfNodes, numberOfEdges, true, "data/graph.mtx",
+                    numberOfObjectives, objectiveStartRange, objectiveEndRange)) {
+    return 1;
+  }
 
   // 1b. Generate graph in CSR format
-  generateGraphCSR(numberOfNodes, numberOfEdges, true,
-                   "data/originalGraph/graphCsr", numberOfObjectives,
-                   objectiveStartRange, objectiveEndRange);
+  if (!generateGraphCSR(numberOfNodes, numberOfEdges, true,
+                       "data/originalGraph/graphCsr", numberOfObjectives,
+                       objectiveStartRange, objectiveEndRange)) {
+    return 1;
+  }
 
   // 2. Generate edge changes
-  generateChangedEdges(objectiveStartRange, objectiveEndRange,
-                       numberOfObjectives, numberOfNodes,
-                       numberOfChangedEdges, insertionPercentage,
-                       deletionPercentage, true, true, true, false,
-                       "data/originalGraph/graphCsr");
+  if (!generateChangedEdges(objectiveStartRange, objectiveEndRange,
+                           numberOfObjectives, numberOfNodes,
+                           numberOfChangedEdges, insertionPercentage,
+                           deletionPercentage, true, true, true, false,
+                           "data/originalGraph/graphCsr")) {
+    return 1;
+  }
 
   // 3. Update graph with changes — routed through the ESCHER CBST adapter.
   //    Every edge insert/delete below flows through CBSTOperations::insert,
   //    ::erase, ::fill and unfillCBST; the resulting CSR files are
   //    byte-identical to the legacy updateGraphCSR output for directed mode
   //    (verified by tests/unit/test_snapshot_matches_updateCSR).
-  escher_mosp::updateGraphWithESCHER(
-      "data/originalGraph/graphCsr", "data/updatedGraph/updatedGraphCsr",
-      "output/changedEdges/insert.txt", "output/changedEdges/delete.txt",
-      /*payloadCapacity=*/65536, /*directed=*/true);
+  if (!escher_mosp::updateGraphWithESCHER(
+          "data/originalGraph/graphCsr", "data/updatedGraph/updatedGraphCsr",
+          "output/changedEdges/insert.txt", "output/changedEdges/delete.txt",
+          /*payloadCapacity=*/65536, /*directed=*/true)) {
+    return 1;
+  }
 
   // 4a. Dijkstra on original MTX graph (objective 0)
-  runDijkstra("data/graph.mtx", 0, source,
-              "output/distancesTrees/distances.txt",
-              "output/distancesTrees/SSSPTree.txt");
+  if (!runDijkstra("data/graph.mtx", 0, source,
+                  "output/distancesTrees/distances.txt",
+                  "output/distancesTrees/SSSPTree.txt")) {
+    return 1;
+  }
 
   // 4b. Dijkstra on original CSR graph (objective 0)
-  runDijkstraCSR("data/originalGraph/graphCsr", 0, source,
-                 "output/distancesTrees/distancesCsr.txt",
-                 "output/distancesTrees/SSSPTreeCsr.txt");
+  if (!runDijkstraCSR("data/originalGraph/graphCsr", 0, source,
+                     "output/distancesTrees/distancesCsr.txt",
+                     "output/distancesTrees/SSSPTreeCsr.txt")) {
+    return 1;
+  }
 
   // 4c. Dijkstra on updated CSR graph (objective 0)
-  runDijkstraCSR("data/updatedGraph/updatedGraphCsr", 0, source,
-                 "output/updatedDistancesTrees/updatedDistancesCsr.txt",
-                 "output/updatedDistancesTrees/updatedSSSPTreeCsr.txt");
+  if (!runDijkstraCSR("data/updatedGraph/updatedGraphCsr", 0, source,
+                     "output/updatedDistancesTrees/updatedDistancesCsr.txt",
+                     "output/updatedDistancesTrees/updatedSSSPTreeCsr.txt")) {
+    return 1;
+  }
 
   // 5. Sequential SOSP Update (host baseline, objective 0)
-  sequentialSOSPUpdate(
-      "data/originalGraph/graphCsr",
-      "output/distancesTrees/distancesCsr.txt",
-      "output/distancesTrees/SSSPTreeCsr.txt",
-      "output/changedEdges/insert.txt", "output/changedEdges/delete.txt",
-      0, source, "output/sospUpdateDistancesTrees/distancesCsr.txt",
-      "output/sospUpdateDistancesTrees/SSSPTreeCsr.txt");
+  if (!sequentialSOSPUpdate(
+          "data/originalGraph/graphCsr",
+          "output/distancesTrees/distancesCsr.txt",
+          "output/distancesTrees/SSSPTreeCsr.txt",
+          "output/changedEdges/insert.txt", "output/changedEdges/delete.txt",
+          0, source, "output/sospUpdateDistancesTrees/distancesCsr.txt",
+          "output/sospUpdateDistancesTrees/SSSPTreeCsr.txt")) {
+    return 1;
+  }
 
   // 6. Parallel SOSP Update (CUDA) — one per objective
   vector<string> treeOutputPaths;
@@ -100,28 +118,36 @@ int main() {
     // Run Dijkstra for this objective on the original graph
     string dijkstraDistPath = objDir + "/distancesOriginal.txt";
     string dijkstraTreePath = objDir + "/SSSPTreeOriginal.txt";
-    runDijkstraCSR("data/originalGraph/graphCsr", obj, source, dijkstraDistPath,
-                   dijkstraTreePath);
+    if (!runDijkstraCSR("data/originalGraph/graphCsr", obj, source, dijkstraDistPath,
+                       dijkstraTreePath)) {
+      return 1;
+    }
 
     // Run CUDA parallel SOSP Update for this objective
     string parallelDistPath = objDir + "/distancesParallelUpdate.txt";
     string parallelTreePath = objDir + "/SSSPTreeParallelUpdate.txt";
-    parallelSOSPUpdate("data/originalGraph/graphCsr", dijkstraDistPath,
-                       dijkstraTreePath, "output/changedEdges/insert.txt",
-                       "output/changedEdges/delete.txt", obj, source,
-                       parallelDistPath, parallelTreePath);
+    if (!parallelSOSPUpdate("data/originalGraph/graphCsr", dijkstraDistPath,
+                           dijkstraTreePath, "output/changedEdges/insert.txt",
+                           "output/changedEdges/delete.txt", obj, source,
+                           parallelDistPath, parallelTreePath)) {
+      return 1;
+    }
 
     treeOutputPaths.push_back(parallelTreePath);
   }
 
   // 7. Combined graph MOSP
-  parallelCombinedGraph("data/originalGraph/graphCsr", treeOutputPaths,
-                        numberOfObjectives, source, "output/combinedGraph",
-                        "output/combinedGraph/distancesCsr.txt",
-                        "output/combinedGraph/SSSPTreeCsr.txt");
+  if (!parallelCombinedGraph("data/originalGraph/graphCsr", treeOutputPaths,
+                            numberOfObjectives, source, "output/combinedGraph",
+                            "output/combinedGraph/distancesCsr.txt",
+                            "output/combinedGraph/SSSPTreeCsr.txt")) {
+    return 1;
+  }
 
   // 8. Generate and verify 10 test cases
-  generateTestCases("tests");
+  if (!generateTestCases("tests")) {
+    return 1;
+  }
 
   cout << "\n=== MOSPCUDA pipeline complete ===\n";
 

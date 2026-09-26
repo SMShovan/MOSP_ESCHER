@@ -83,6 +83,7 @@ MOSP_MAIN    := $(MOSP_BASE) \
                 mosp/src/main.cu \
                 mosp/src/sequentialSOSPUpdate.cu \
                 mosp/src/parallelSOSPUpdate.cu \
+                mosp/src/sospUpdateGpu.cu \
                 mosp/src/parallelCombinedGraph.cu
 MOSP_STRESS  := $(MOSP_BASE) \
                 mosp/src/stressTest.cu \
@@ -90,6 +91,7 @@ MOSP_STRESS  := $(MOSP_BASE) \
 MOSP_PSTRESS := $(MOSP_BASE) \
                 mosp/src/parallelStressTest.cu \
                 mosp/src/parallelSOSPUpdate.cu \
+                mosp/src/sospUpdateGpu.cu \
                 mosp/src/sequentialSOSPUpdate.cu
 
 MOSP_MAIN_OBJS    := $(MOSP_MAIN:%=$(BUILDDIR)/%.o)
@@ -120,7 +122,8 @@ UNIT_TESTS := \
     $(BINDIR)/test_h2h_construction \
     $(BINDIR)/test_h2h_delta \
     $(BINDIR)/test_hsosp_matches_dijkstra \
-    $(BINDIR)/test_hsosp_scale
+    $(BINDIR)/test_hsosp_scale \
+    $(BINDIR)/test_mosp_update
 
 # -----------------------------------------------------------------------------
 # Phony targets
@@ -239,11 +242,16 @@ $(BINDIR)/test_hsosp_scale: $(BUILDDIR)/tests/unit/test_hsosp_scale.cu.o $(HSOSP
 MOSP_BASE_OBJS := $(MOSP_BASE:%=$(BUILDDIR)/%.o) \
                   $(BUILDDIR)/mosp/src/sequentialSOSPUpdate.cu.o \
                   $(BUILDDIR)/mosp/src/parallelSOSPUpdate.cu.o \
+                  $(BUILDDIR)/mosp/src/sospUpdateGpu.cu.o \
                   $(BUILDDIR)/mosp/src/parallelCombinedGraph.cu.o
 
 $(BINDIR)/test_snapshot_matches_updateCSR: $(BUILDDIR)/tests/unit/test_snapshot_matches_updateCSR.cu.o $(GRAPH_OBJS) $(MOSP_BASE_OBJS) $(LIBESCHER)
 	@mkdir -p $(BINDIR)
 	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_snapshot_matches_updateCSR.cu.o $(GRAPH_OBJS) $(MOSP_BASE_OBJS) $(LIBESCHER)
+
+$(BINDIR)/test_mosp_update: $(BUILDDIR)/tests/unit/test_mosp_update.cu.o $(GRAPH_OBJS) $(MOSP_BASE_OBJS) $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_mosp_update.cu.o $(GRAPH_OBJS) $(MOSP_BASE_OBJS) $(LIBESCHER)
 
 # -----------------------------------------------------------------------------
 # Doxygen
@@ -271,7 +279,8 @@ ALL_SRCS := $(ESCHER_CU_SRCS) $(ESCHER_CPP_SRCS) $(GRAPH_CU_SRCS) $(GRAPH_CPP_SR
             tests/unit/test_h2h_construction.cu \
             tests/unit/test_h2h_delta.cu \
             tests/unit/test_hsosp_matches_dijkstra.cu \
-            tests/unit/test_hsosp_scale.cu
+            tests/unit/test_hsosp_scale.cu \
+            tests/unit/test_mosp_update.cu
 
 syntax-check:
 	@set -e; \

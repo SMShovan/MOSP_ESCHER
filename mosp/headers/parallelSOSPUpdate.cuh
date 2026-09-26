@@ -12,10 +12,11 @@
  * Produces identical results to sequentialSOSPUpdate() (and thus matches
  * Dijkstra recalculation on the updated graph).
  *
- * Phases 0 and 1 (preparation + initial edge processing) are sequential
- * on the host. Phase 2 (iterative propagation) and the post-processing
- * BFS are parallelized with CUDA kernels using atomic operations for
- * flag deduplication and worklist compaction.
+ * Phase 0 (reading the inputs and applying the batch) runs on the host.
+ * Step 1 (roots from the change list, subtree invalidation by pointer
+ * jumping, first pull pass) and Step 2 (monotone propagation) run on the
+ * GPU; see parallelSOSPUpdate.cu. Vertices cut off from the source end
+ * with distance INF and parent -1.
  *
  * @param originalCsrPrefix  Prefix for original CSR files.
  * @param distancesInputPath Path to original distances file from Dijkstra.

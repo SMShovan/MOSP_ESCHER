@@ -26,37 +26,38 @@
  *     the updated graph structure.
  *
  * --- Phase 1: Process Changed Edges ---
- *   Insertions are processed BEFORE deletions for each vertex.
- *
- *   For each inserted edge (u, v) with weight w:
- *     If dist[u] + w < dist[v], update dist[v] and parent[v], mark v affected.
- *
- *   For each deleted edge (u, v):
- *     If parent[v] == u (tree edge deleted), search all in-neighbors of v
- *     in the UPDATED graph for the best alternative parent. Mark v affected.
- *     Non-tree-edge deletions are safely ignored.
+ *   The head v of every deleted or weight-increased tree edge (u,v)
+ *   (parent[v] == u) is a root. The SOSP subtree of every root is
+ *   invalidated (distance INF, parent -1): these vertices lost their
+ *   shortest paths. The invalidated vertices and the heads of all inserted
+ *   edges then take the best (distance, id) pair over their in-neighbours
+ *   in the UPDATED graph; the ones whose distance decreased are affected.
+ *   (The thesis' Step 1 instead picks the best current in-neighbour of a
+ *   root, which may be one of its own descendants; the resulting stale
+ *   cycle "counts to infinity" and the original code stopped it with an
+ *   iteration cap that could leave reachable vertices with wrong
+ *   distances.)
  *
  * --- Phase 2: Propagate the Update ---
  *   Iteratively propagate changes until no more vertices are affected:
  *     1. Collect all out-neighbors of affected vertices as candidates.
- *     2. For each candidate, recompute the best distance from ALL in-neighbors.
- *     3. Always update the parent to the current best (fixes parent consistency).
- *     4. If the distance changed, mark the candidate as newly affected.
+ *     2. For each candidate, recompute the best (distance, parent id) pair
+ *        over ALL in-neighbors and keep it if it is better (monotone).
+ *     3. If the distance decreased, mark the candidate as newly affected.
+ *   Distances only decrease, so the loop terminates without an iteration
+ *   cap, and vertices that became unreachable keep INF (no reachability
+ *   post-pass is needed).
  *
  * ============================================================================
- * CORRECTNESS FIXES OVER THE ORIGINAL PAPER
+ * NOTES
  * ============================================================================
  *
  * 1. SOURCE VERTEX PROTECTION: The source vertex (distance = 0) is never
  *    updated, even if it appears as a candidate during propagation.
  *
- * 2. PARENT CONSISTENCY: The paper only updates parent when distance changes.
- *    We always update parent to the current best in-neighbor, even when the
- *    distance stays the same. This prevents stale parent pointers when the
- *    old parent's distance increased but an equally-good alternative exists.
- *
- * 3. SAFETY ITERATION LIMIT: A maximum iteration count (numberOfNodes)
- *    prevents infinite loops in edge cases involving disconnected components.
+ * 2. TIE-BREAK: among in-neighbours with equal distance the lowest vertex
+ *    id becomes the parent, so the result equals the (canonical) Dijkstra
+ *    tree of the updated graph.
  *
  * ============================================================================
  */
@@ -69,7 +70,6 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <queue>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -274,7 +274,9 @@ void findBestParent(
         }
 
         long long candidateDistance = distances[candidateParent] + candidateWeight;
-        if (candidateDistance < bestDistance) {
+        // Ties go to the lowest parent id (canonical SOSP tree).
+        if (candidateDistance < bestDistance ||
+            (candidateDistance == bestDistance && candidateParent < bestParent)) {
             bestDistance = candidateDistance;
             bestParent = candidateParent;
         }
@@ -454,102 +456,103 @@ bool sequentialSOSPUpdate(
     // ========================================================================
     // PHASE 1: PROCESS CHANGED EDGES
     // ========================================================================
-    // Identify initially affected vertices from the batch of changes.
-    // Process insertions BEFORE deletions so that a newly inserted better path
-    // can protect a vertex from needing an alternative parent search.
+    // 1a. Roots: the head v of every deleted or weight-increased edge (u,v)
+    //     that is the tree edge of v (parent[v] == u).
+    // 1b. Invalidate the SOSP subtree of every root (distance INF, parent
+    //     -1): each of these vertices lost its shortest path. Choosing a new
+    //     parent for a root among its current in-neighbours, as the thesis'
+    //     Step 1 does, can pick one of its own descendants and start a stale
+    //     cycle that only "counts to infinity" by the cycle weight per round.
+    // 1c. The invalidated vertices and the heads of all inserted edges are
+    //     re-evaluated over their in-neighbours (monotone: a vertex only
+    //     takes a strictly better (distance, parent id) pair).
+
+    vector<bool> isInvalid(numberOfNodes, false);
+    vector<int> roots;
+    auto markRoot = [&](int u, int v) {
+        if (parent[v] == u && !isInvalid[v]) {
+            isInvalid[v] = true;
+            roots.push_back(v);
+        }
+    };
+    for (const auto &edge : deletedEdges) {
+        markRoot(edge.from, edge.to);
+    }
+    for (const auto &wi : weightIncreases) {
+        markRoot(wi.from, wi.to);
+    }
+
+    {
+        // Children lists of the SOSP tree, then a traversal from the roots.
+        vector<int> childStart(numberOfNodes + 1, 0), children;
+        for (int v = 0; v < numberOfNodes; ++v) {
+            if (v != source && parent[v] >= 0) {
+                ++childStart[parent[v] + 1];
+            }
+        }
+        for (int v = 0; v < numberOfNodes; ++v) {
+            childStart[v + 1] += childStart[v];
+        }
+        children.resize(childStart[numberOfNodes]);
+        vector<int> cursor(childStart.begin(), childStart.end() - 1);
+        for (int v = 0; v < numberOfNodes; ++v) {
+            if (v != source && parent[v] >= 0) {
+                children[cursor[parent[v]]++] = v;
+            }
+        }
+        vector<int> invalidated = roots;
+        for (size_t i = 0; i < invalidated.size(); ++i) {
+            int x = invalidated[i];
+            for (int c = childStart[x]; c < childStart[x + 1]; ++c) {
+                if (!isInvalid[children[c]]) {
+                    isInvalid[children[c]] = true;
+                    invalidated.push_back(children[c]);
+                }
+            }
+        }
+        for (int v : invalidated) {
+            distances[v] = INF_VALUE;
+            parent[v] = -1;
+        }
+        roots.swap(invalidated);
+    }
 
     vector<bool> isAffected(numberOfNodes, false);
     vector<int> affectedVertices;
 
-    // --- 1a. Process insertions ---
-    // We use the actual weight from the UPDATED adjacency list (not the raw
-    // insertion record) because duplicate insertions for the same edge are
-    // resolved in Phase 0e by keeping the last write. Using the adjacency
-    // weight ensures consistency with the final graph topology.
-    for (const auto &edge : insertedEdges) {
-        int u = edge.from;
-        int v = edge.to;
-
-        // Skip if source vertex of insertion is unreachable
-        if (distances[u] >= INF_VALUE / 2) {
-            continue;
-        }
-
-        // Look up the actual edge weight from the updated adjacency list
-        long long actualWeight = -1;
-        for (const auto &neighbor : outAdjacency[u]) {
-            if (neighbor.vertex == v) {
-                actualWeight = neighbor.weight;
-                break;
-            }
-        }
-        if (actualWeight < 0) {
-            continue; // edge was deleted and not re-inserted
-        }
-
-        long long newDistance = distances[u] + actualWeight;
-        if (newDistance < distances[v]) {
-            distances[v] = newDistance;
-            parent[v] = u;
-            if (!isAffected[v]) {
-                isAffected[v] = true;
-                affectedVertices.push_back(v);
-            }
-        }
-    }
-
-    // --- 1b. Process deletions ---
-    for (const auto &edge : deletedEdges) {
-        int u = edge.from;
-        int v = edge.to;
-
-        // Only act if the deleted edge was a tree edge (parent[v] == u).
-        // Non-tree-edge deletions do not affect shortest distances.
-        if (parent[v] != u) {
-            continue;
-        }
-
-        // The tree edge to v was removed. Find the best alternative parent
-        // among v's in-neighbors in the UPDATED graph (deleted edge already
-        // removed, inserted edges already added to the adjacency lists).
-        int bestAlternativeParent = -1;
-        long long bestAlternativeDistance = INF_VALUE;
-        findBestParent(v, inAdjacency, distances, INF_VALUE,
-                        bestAlternativeParent, bestAlternativeDistance);
-
-        parent[v] = bestAlternativeParent;
-        distances[v] = bestAlternativeDistance;
-
-        if (!isAffected[v]) {
-            isAffected[v] = true;
-            affectedVertices.push_back(v);
-        }
-    }
-
-    // --- 1c. Process weight increases on existing edges ---
-    // When an insertion overwrites an existing edge with a HIGHER weight,
-    // the old shortest path through that edge may no longer be valid.
-    // If the affected edge was a tree edge (parent[v] == u), re-evaluate
-    // vertex v's distance from ALL in-neighbors, just like a deletion.
-    for (const auto &wi : weightIncreases) {
-        int u = wi.from;
-        int v = wi.to;
-
-        if (parent[v] != u) {
-            continue;
-        }
-
+    // Re-evaluate one vertex; returns true if its distance decreased.
+    auto relax = [&](int v) {
         int bestNewParent = -1;
         long long bestNewDistance = INF_VALUE;
-        findBestParent(v, inAdjacency, distances, INF_VALUE,
-                        bestNewParent, bestNewDistance);
-
-        parent[v] = bestNewParent;
+        findBestParent(v, inAdjacency, distances, INF_VALUE, bestNewParent,
+                       bestNewDistance);
+        bool better = bestNewDistance < distances[v] ||
+                      (bestNewDistance == distances[v] && bestNewParent >= 0 &&
+                       bestNewParent < parent[v]);
+        if (!better) {
+            return false;
+        }
+        bool decreased = bestNewDistance < distances[v];
         distances[v] = bestNewDistance;
-
+        parent[v] = bestNewParent;
+        return decreased;
+    };
+    auto markAffected = [&](int v) {
         if (!isAffected[v]) {
             isAffected[v] = true;
             affectedVertices.push_back(v);
+        }
+    };
+
+    for (int v : roots) {
+        if (relax(v)) {
+            markAffected(v);
+        }
+    }
+    for (const auto &edge : insertedEdges) {
+        int v = edge.to;
+        if (v != source && relax(v)) {
+            markAffected(v);
         }
     }
 
@@ -559,14 +562,22 @@ bool sequentialSOSPUpdate(
     // Iteratively propagate changes through the graph until convergence.
     // Each iteration:
     //   (a) Collect out-neighbors of all currently affected vertices as candidates.
-    //   (b) For each candidate, recompute the best distance from all in-neighbors.
-    //   (c) If the distance or parent changed, mark the candidate as affected.
+    //   (b) For each candidate, recompute the best distance from all in-neighbors
+    //       and keep it if it is better (monotone update).
+    //   (c) If the distance decreased, mark the candidate as affected.
+    // Distances only decrease, so the loop terminates, and a vertex that is
+    // no longer reachable from the source keeps the INF it got in Phase 1.
 
     int iterationCount = 0;
-    const int maxIterations = numberOfNodes; // Safety limit
 
-    while (!affectedVertices.empty() && iterationCount < maxIterations) {
+    while (!affectedVertices.empty()) {
         ++iterationCount;
+        if (iterationCount > numberOfNodes) {
+            // Every sweep settles at least one more hop of every shortest
+            // path, so this cannot happen.
+            cout << "Error: SOSP update did not converge.\n";
+            return false;
+        }
 
         // --- 2a. Identify candidate vertices (out-neighbors of affected) ---
         vector<bool> isCandidate(numberOfNodes, false);
@@ -594,61 +605,8 @@ bool sequentialSOSPUpdate(
 
         // --- 2b. Update distances of candidate vertices ---
         for (int candidateVertex : candidateVertices) {
-            int bestNewParent = -1;
-            long long bestNewDistance = INF_VALUE;
-            findBestParent(candidateVertex, inAdjacency, distances, INF_VALUE,
-                           bestNewParent, bestNewDistance);
-
-            // ALWAYS update the parent to the current best (parent consistency fix).
-            // Only propagate further if the DISTANCE actually changed.
-            bool distanceChanged = (bestNewDistance != distances[candidateVertex]);
-
-            parent[candidateVertex] = bestNewParent;
-            distances[candidateVertex] = bestNewDistance;
-
-            if (distanceChanged) {
-                if (!isAffected[candidateVertex]) {
-                    isAffected[candidateVertex] = true;
-                    affectedVertices.push_back(candidateVertex);
-                }
-            }
-        }
-    }
-
-    if (iterationCount >= maxIterations && !affectedVertices.empty()) {
-        cout << "Warning: SOSP update reached maximum iteration limit ("
-             << maxIterations << "). Running reachability check.\n";
-    }
-
-    // ========================================================================
-    // POST-PROCESSING: REACHABILITY CHECK
-    // ========================================================================
-    // If edge deletions disconnected part of the graph from the source, the
-    // iterative propagation may not converge (distances keep increasing in
-    // a cycle). A BFS from the source on the updated graph identifies all
-    // reachable vertices. Unreachable vertices get dist = INF, parent = -1.
-
-    {
-        vector<bool> reachable(numberOfNodes, false);
-        queue<int> bfsQueue;
-        reachable[source] = true;
-        bfsQueue.push(source);
-
-        while (!bfsQueue.empty()) {
-            int current = bfsQueue.front();
-            bfsQueue.pop();
-            for (const auto &neighbor : outAdjacency[current]) {
-                if (!reachable[neighbor.vertex]) {
-                    reachable[neighbor.vertex] = true;
-                    bfsQueue.push(neighbor.vertex);
-                }
-            }
-        }
-
-        for (int v = 0; v < numberOfNodes; ++v) {
-            if (!reachable[v]) {
-                distances[v] = INF_VALUE;
-                parent[v] = -1;
+            if (relax(candidateVertex)) {
+                markAffected(candidateVertex);
             }
         }
     }

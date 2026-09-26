@@ -85,7 +85,7 @@ struct TestCaseParams {
  * All random generation uses fixed seeds for reproducibility.
  *
  * @param baseDir Root directory for test output (e.g. "tests").
- * @return True if all 10 test cases generated successfully; false otherwise.
+ * @return True if all 10 test cases ran and matched Dijkstra; false otherwise.
  */
 bool generateTestCases(const string &baseDir) {
     const TestCaseParams cases[10] = {
@@ -225,5 +225,5 @@ bool generateTestCases(const string &baseDir) {
     }
 
     cout << "\n=== Test Summary: " << passCount << "/10 passed ===\n";
-    return true;
+    return passCount == 10;
 }

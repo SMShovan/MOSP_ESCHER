@@ -164,3 +164,44 @@ pass: after every batch the three CBSTs hold exactly the host model's rows.
   `std::invalid_argument`, and the capacity is never below the layout.
   Regression: `test_h2h_construction`; `test_h2h_delta` builds every third
   configuration with headroom 1 so the overflow-rebuild path runs.
+
+## Correctness: MOSP half (`mosp/`)
+
+`mosp/` was a copy of the unfixed MOSP-CUDA (`ac29545`). The fixed SOSP
+update engine of MOSP-CUDA was ported (its `sospUpdateGpu`, the invalidation
+in `sequentialSOSPUpdate` and the lowest-id tie rule), keeping this
+repository's ESCHER adapter (`updateGraphWithESCHER`) at the call sites and
+leaving out MOSP-CUDA's instrumentation and in-memory drivers.
+
+- **M1 count-to-infinity in the SOSP update** (`parallelSOSPUpdate.cu`,
+  `sequentialSOSPUpdate.cu`). After a deletion, vertices that lost their
+  tree path kept stale finite distances that grew around cycles; the loop
+  was capped at n iterations and followed by a reachability BFS that only
+  reset unreachable vertices, so reachable vertices on a stale cycle kept
+  distances that were too small (the 4-vertex example in
+  `test_mosp_update`: d(1) = 7, d(2) = 6 instead of 100, 101; about 1 in 800
+  random stress configurations). Now: the subtree of every deleted or
+  weight-increased tree edge is invalidated (pointer jumping on the GPU, a
+  children walk on the host), invalidated vertices and heads of inserted
+  edges pull their best (distance, id), and a monotone push (near-far
+  worklist with a packed 64-bit atomicMin on the GPU) propagates the
+  decreases. There is no iteration cap and no reachability pass. Parent
+  ties go to the lowest vertex id everywhere (Dijkstra included), so the
+  updated trees equal the Dijkstra trees exactly and the stress tests now
+  compare the tree files too.
+- **M2 a batch that deletes every edge** (`Dijkstra.cu`). The updated CSR
+  then has an empty values file, `readCSR` infers 0 objectives and
+  `runDijkstraCSR` rejected every objective index, so the stress harness
+  reported a pipeline failure. The objective index is only range-checked
+  when the graph has weights.
+- `main` ignored the result of every step and `generateTestCases` returned
+  true even when a case did not match Dijkstra; both now report failure
+  (and `generateGraph` creates its output directory, which `main` needs on
+  a fresh checkout). The stress tests print the run parameters of a
+  pipeline error.
+
+Regression: `test_mosp_update` (disconnection, delete-all, tie cases for
+both updates; the first two fail on the original code), `parallelStressTest`
+seed 6 (failed on the original), and the stress tests' tree comparison.
+Additional check (not in `make test`): 5 x 400 configurations of each stress
+test with other seeds, 0 failures.

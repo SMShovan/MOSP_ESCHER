@@ -16,7 +16,7 @@ BIN="$ROOT/bin"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/escher_mosp_tests.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-XFAIL=" parallelStressTest_seed6 "
+XFAIL=" "
 FAILURES=0
 
 # run_case <name> <command...>: the command must exit with status 0.
@@ -66,8 +66,9 @@ run_case hsospStress_escher "$BIN/hsospStress" --configs 20 --seed 11 \
     --check-escher
 
 echo "=== MOSP pipeline and stress tests ==="
-# Fixed seeds keep the suite reproducible; seed 6 of parallelStressTest hits
-# the MOSP count-to-infinity defect (run 195).
+# Fixed seeds keep the suite reproducible; seed 6 of parallelStressTest hit
+# the original MOSP count-to-infinity defect (run 195).
+run_case test_mosp_update        "$BIN/test_mosp_update"
 run_case main                    "$BIN/main"
 run_case stressTest              "$BIN/stressTest" 1 200
 run_case parallelStressTest      "$BIN/parallelStressTest" 1 200
