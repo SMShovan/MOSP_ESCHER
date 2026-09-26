@@ -474,6 +474,30 @@ bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
     return overflow == 0;
 }
 
+std::vector<std::vector<int>> downloadRows(const DeviceH2H& dev, int m) {
+    std::vector<long long> rowStart(m);
+    std::vector<int> deg(m);
+    std::vector<int> colInd(static_cast<std::size_t>(dev.capEntries));
+    if (m > 0) {
+        HSOSP_CUDA_CHECK(cudaMemcpy(rowStart.data(), dev.d_rowStart,
+                                    sizeof(long long) * m,
+                                    cudaMemcpyDeviceToHost));
+        HSOSP_CUDA_CHECK(cudaMemcpy(deg.data(), dev.d_deg, sizeof(int) * m,
+                                    cudaMemcpyDeviceToHost));
+        HSOSP_CUDA_CHECK(cudaMemcpy(colInd.data(), dev.d_colInd,
+                                    sizeof(int) * dev.capEntries,
+                                    cudaMemcpyDeviceToHost));
+    }
+    std::vector<std::vector<int>> rows(m);
+    for (int i = 0; i < m; ++i) {
+        rows[i].reserve(deg[i]);
+        for (int e = 0; e < deg[i]; ++e)
+            rows[i].push_back(colInd[rowStart[i] + e] + 1);
+        std::sort(rows[i].begin(), rows[i].end());
+    }
+    return rows;
+}
+
 // ---------------------------------------------------------------------------
 // HsospState
 // ---------------------------------------------------------------------------

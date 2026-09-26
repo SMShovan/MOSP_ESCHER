@@ -32,10 +32,12 @@
  * through the ESCHER structures and is timed as data structure maintenance.
  */
 
+#include <iosfwd>
 #include <memory>
 #include <vector>
 
 #include "HostHypergraph.hpp"
+#include "HypergraphOracle.hpp"
 
 namespace escher_mosp {
 
@@ -74,6 +76,16 @@ public:
 
     /** Approximate device memory held by the three CBSTs. */
     long long escherDeviceBytes() const;
+
+    /**
+     * Test oracle: reads the three CBSTs back and compares every row with
+     * the host incidence model (h2v, v2h) and with @p lg, the line graph
+     * rebuilt from it (h2h, under the key the h2h insert assigned). Also
+     * checks the CBST tail metadata and availability bookkeeping (see
+     * integrity.hpp). Returns the number of violations; details go to
+     * @p log.
+     */
+    long long checkEscher(const LineGraphCSR& lg, std::ostream& log) const;
 
 private:
     struct Impl;

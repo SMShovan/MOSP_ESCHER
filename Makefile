@@ -37,9 +37,10 @@ INCLUDES  := -Iescher/include -Iescher/kernel -Igraph/include -Imosp/headers \
              -Ihypergraph/include -Ihsosp/include
 
 # -lineinfo keeps source correlation for compute-sanitizer / Nsight without
-# changing code generation.
+# changing code generation. Host code uses OpenMP (test oracles, bulk
+# construction).
 NVFLAGS   := -std=c++17 $(OPT) -lineinfo --extended-lambda -arch=$(CUDA_ARCH) \
-             $(INCLUDES)
+             -Xcompiler -fopenmp $(INCLUDES)
 DEPFLAGS  := -MMD -MP
 
 BUILDDIR  := build
@@ -102,6 +103,7 @@ MOSP_PSTRESS_OBJS := $(MOSP_PSTRESS:%=$(BUILDDIR)/%.o)
 HYPERGRAPH_SRCS := \
     hypergraph/src/HostHypergraph.cpp \
     hypergraph/src/HypergraphGen.cpp \
+    hypergraph/src/HypergraphOracle.cpp \
     hypergraph/src/DynamicHypergraph.cpp
 HSOSP_DEV_SRCS  := hsosp/src/hsospDevice.cu
 
@@ -112,11 +114,13 @@ HSOSP_CORE_OBJS := $(HYPERGRAPH_OBJS) $(HSOSP_DEV_OBJS)
 # Unit tests
 UNIT_TESTS := \
     $(BINDIR)/test_cbst_smoke \
+    $(BINDIR)/test_cbst_ops \
     $(BINDIR)/test_dynamicgraph_roundtrip \
     $(BINDIR)/test_snapshot_matches_updateCSR \
     $(BINDIR)/test_h2h_construction \
     $(BINDIR)/test_h2h_delta \
-    $(BINDIR)/test_hsosp_matches_dijkstra
+    $(BINDIR)/test_hsosp_matches_dijkstra \
+    $(BINDIR)/test_hsosp_scale
 
 # -----------------------------------------------------------------------------
 # Phony targets
@@ -194,6 +198,10 @@ $(BINDIR)/test_cbst_smoke: $(BUILDDIR)/tests/unit/test_cbst_smoke.cu.o $(LIBESCH
 	@mkdir -p $(BINDIR)
 	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_cbst_smoke.cu.o $(LIBESCHER)
 
+$(BINDIR)/test_cbst_ops: $(BUILDDIR)/tests/unit/test_cbst_ops.cu.o $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_cbst_ops.cu.o $(LIBESCHER)
+
 $(BINDIR)/test_dynamicgraph_roundtrip: $(BUILDDIR)/tests/unit/test_dynamicgraph_roundtrip.cu.o $(GRAPH_CORE_OBJS) $(LIBESCHER)
 	@mkdir -p $(BINDIR)
 	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_dynamicgraph_roundtrip.cu.o $(GRAPH_CORE_OBJS) $(LIBESCHER)
@@ -218,6 +226,10 @@ $(BINDIR)/test_h2h_delta: $(BUILDDIR)/tests/unit/test_h2h_delta.cu.o $(HSOSP_COR
 $(BINDIR)/test_hsosp_matches_dijkstra: $(BUILDDIR)/tests/unit/test_hsosp_matches_dijkstra.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
 	@mkdir -p $(BINDIR)
 	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_hsosp_matches_dijkstra.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+
+$(BINDIR)/test_hsosp_scale: $(BUILDDIR)/tests/unit/test_hsosp_scale.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
+	@mkdir -p $(BINDIR)
+	$(NVCC) $(NVFLAGS) -o $@ $(BUILDDIR)/tests/unit/test_hsosp_scale.cu.o $(HSOSP_CORE_OBJS) $(LIBESCHER)
 
 # The equivalence test links in the MOSP base (needed for generateGraphCSR,
 # generateChangedEdges, updateGraphCSR, readCSR). generateTestCases.cu in the
@@ -253,11 +265,13 @@ ALL_SRCS := $(ESCHER_CU_SRCS) $(ESCHER_CPP_SRCS) $(GRAPH_CU_SRCS) $(GRAPH_CPP_SR
             $(HYPERGRAPH_SRCS) $(HSOSP_DEV_SRCS) \
             hsosp/src/hsospBench.cu hsosp/src/hsospStress.cu \
             tests/unit/test_cbst_smoke.cu \
+            tests/unit/test_cbst_ops.cu \
             tests/unit/test_dynamicgraph_roundtrip.cu \
             tests/unit/test_snapshot_matches_updateCSR.cu \
             tests/unit/test_h2h_construction.cu \
             tests/unit/test_h2h_delta.cu \
-            tests/unit/test_hsosp_matches_dijkstra.cu
+            tests/unit/test_hsosp_matches_dijkstra.cu \
+            tests/unit/test_hsosp_scale.cu
 
 syntax-check:
 	@set -e; \

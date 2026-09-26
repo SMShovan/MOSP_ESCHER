@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <ostream>
 #include <stdexcept>
 
 #include "escher_errors.hpp"
 #include "flatten.hpp"
+#include "integrity.hpp"
 #include "structure.hpp"
 
 namespace escher_mosp {
@@ -123,6 +125,56 @@ long long DynamicHypergraph::escherDeviceBytes() const {
     };
     return cbstBytes(pImpl->h2v.get()) + cbstBytes(pImpl->v2h.get()) +
            cbstBytes(pImpl->h2h.get());
+}
+
+long long DynamicHypergraph::checkEscher(const LineGraphCSR& lg,
+                                       std::ostream& log) const {
+    const Impl& im = *pImpl;
+    const HostHypergraph& hg = im.host;
+    const int m = hg.maxId();
+    long long errors = 0;
+
+    // h2v: key = hyperedge id, values = incident vertices + 1.
+    std::vector<std::vector<int>> h2vRows(m);
+    for (int id = 1; id <= m; ++id) {
+        if (!hg.alive[id - 1]) continue;
+        for (int v : hg.heVerts[id - 1]) h2vRows[id - 1].push_back(v + 1);
+    }
+    errors += checkTreeRows(im.h2v->context(), h2vRows, true, "h2v", log);
+    errors += checkSubtreeAvail(im.h2v->context(), "h2v", log);
+
+    // v2h: key = vertex + 1, values = incident alive hyperedge ids.
+    std::vector<std::vector<int>> v2hRows(im.numVertices);
+    for (int id = 1; id <= m; ++id) {
+        if (!hg.alive[id - 1]) continue;
+        for (int v : hg.heVerts[id - 1]) v2hRows[v].push_back(id);
+    }
+    errors += checkTreeRows(im.v2h->context(), v2hRows, true, "v2h", log);
+
+    // h2h: key = h2hKeyOfHe[id], values = line-graph neighbours of id.
+    std::vector<std::vector<int>> h2hRows;
+    for (int id = 1; id <= m; ++id) {
+        const int key = im.h2hKeyOfHe[id];
+        if (!hg.alive[id - 1]) {
+            if (key != 0) {
+                log << "[check] h2h: dead hyperedge " << id
+                    << " still owns key " << key << "  <-- FAILED\n";
+                ++errors;
+            }
+            continue;
+        }
+        if (key < 1) {
+            log << "[check] h2h: alive hyperedge " << id
+                << " has no h2h key  <-- FAILED\n";
+            ++errors;
+            continue;
+        }
+        if (key > static_cast<int>(h2hRows.size())) h2hRows.resize(key);
+        h2hRows[key - 1].assign(lg.row(id), lg.row(id) + lg.degree(id));
+    }
+    errors += checkTreeRows(im.h2h->context(), h2hRows, true, "h2h", log);
+    errors += checkSubtreeAvail(im.h2h->context(), "h2h", log);
+    return errors;
 }
 
 void DynamicHypergraph::bulkLoad(std::vector<std::vector<int>>&& rows,

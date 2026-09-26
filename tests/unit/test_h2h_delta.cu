@@ -1,42 +1,23 @@
 /**
  * @file test_h2h_delta.cu
  * @brief After every batch, the incrementally maintained h2h (host shadow
- *        AND resident device CSR) must equal a from-scratch rebuild.
+ *        AND resident device CSR) must equal the line graph rebuilt from the
+ *        incidence lists (independent oracle; rows compared as multisets).
  */
 
 #include <algorithm>
 #include <cstdio>
 #include <random>
-#include <set>
 #include <vector>
 
 #include "DynamicHypergraph.hpp"
 #include "HypergraphGen.hpp"
 #include "hsosp.cuh"
+#include "test_util.cuh"
 
 using namespace escher_mosp;
 
 static int failures = 0;
-
-static std::vector<std::set<int>> deviceRowsAsSets(
-    const hsosp::DeviceH2H& dev, int m) {
-    std::vector<long long> rowStart(m);
-    std::vector<int> deg(m);
-    cudaMemcpy(rowStart.data(), dev.d_rowStart, sizeof(long long) * m,
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(deg.data(), dev.d_deg, sizeof(int) * m,
-               cudaMemcpyDeviceToHost);
-    std::vector<int> colInd(static_cast<std::size_t>(dev.capEntries));
-    cudaMemcpy(colInd.data(), dev.d_colInd, sizeof(int) * dev.capEntries,
-               cudaMemcpyDeviceToHost);
-    std::vector<std::set<int>> rows(m);
-    for (int i = 0; i < m; ++i) {
-        for (int e = 0; e < deg[i]; ++e) {
-            rows[i].insert(colInd[rowStart[i] + e] + 1);
-        }
-    }
-    return rows;
-}
 
 int main() {
     std::mt19937_64 meta(31337);
@@ -76,27 +57,18 @@ int main() {
                 hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.3);
             }
 
-            auto bf = hg.bruteForceH2H();
-            auto cur = hg.h2h;
-            for (auto& r : cur) std::sort(r.begin(), r.end());
-            if (bf != cur) {
+            LineGraphCSR lg = rebuildLineGraph(hg);
+            if (testutil::shadowRowMismatches(hg, lg) != 0) {
                 std::printf("FAIL cfg %d batch %d: shadow != rebuild\n", cfg,
                             bi);
                 ++failures;
                 break;
             }
-            auto devRows = deviceRowsAsSets(dev, hg.maxId());
-            for (int id = 1; id <= hg.maxId(); ++id) {
-                std::set<int> want(hg.h2h[id - 1].begin(),
-                                   hg.h2h[id - 1].end());
-                if (devRows[id - 1] != want) {
-                    std::printf(
-                        "FAIL cfg %d batch %d: device row %d != shadow "
-                        "(%zu vs %zu entries)\n",
-                        cfg, bi, id, devRows[id - 1].size(), want.size());
-                    ++failures;
-                    break;
-                }
+            if (testutil::deviceRowMismatches(dev, lg, "delta") != 0) {
+                std::printf("FAIL cfg %d batch %d: device CSR != rebuild\n",
+                            cfg, bi);
+                ++failures;
+                break;
             }
         }
     }

@@ -1,7 +1,9 @@
 /**
  * @file test_hsosp_matches_dijkstra.cu
- * @brief GPU recompute and dynamic update must both match host Dijkstra,
- *        including a forced-disconnection case that exercises the fallback.
+ * @brief GPU recompute and dynamic update must both match the independent
+ *        oracle (Dijkstra on the line graph rebuilt from the incidence
+ *        lists), distances and shortest-path parents, including a
+ *        forced-disconnection case.
  */
 
 #include <cstdio>
@@ -11,6 +13,7 @@
 #include "DynamicHypergraph.hpp"
 #include "HypergraphGen.hpp"
 #include "hsosp.cuh"
+#include "test_util.cuh"
 
 using namespace escher_mosp;
 
@@ -18,17 +21,15 @@ static int failures = 0;
 
 static bool distsMatch(const hsosp::HsospState& st,
                        const HostHypergraph& hg, const char* what, int cfg) {
-    std::vector<long long> got;
-    st.downloadDistances(got, hg.maxId());
-    std::vector<long long> truth = hg.dijkstra(hg.sourceHe);
-    for (int i = 0; i < hg.maxId(); ++i) {
-        if (got[i] != truth[i]) {
-            std::printf("FAIL cfg %d: %s mismatch at he %d (got %lld want "
-                        "%lld)\n",
-                        cfg, what, i + 1, got[i], truth[i]);
-            ++failures;
-            return false;
-        }
+    LineGraphCSR lg = rebuildLineGraph(hg);
+    SospCheck c = testutil::checkState(st, hg, lg);
+    if (!c.ok()) {
+        std::printf("FAIL cfg %d: %s: %lld distance mismatches (first he %d: "
+                    "got %lld want %lld), %lld parent errors\n",
+                    cfg, what, c.distMismatches, c.firstBadId, c.firstGot,
+                    c.firstWant, c.parentErrors);
+        ++failures;
+        return false;
     }
     return true;
 }

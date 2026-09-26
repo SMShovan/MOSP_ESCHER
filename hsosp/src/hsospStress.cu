@@ -1,23 +1,30 @@
 /**
  * @file hsospStress.cu
  * @brief Randomized correctness harness for the full H-SOSP pipeline
- *        (ESCHER routing + device CSR + SOSP update) against host Dijkstra.
+ *        (ESCHER routing + device CSR + SOSP update) against an independent
+ *        oracle: Dijkstra on the line graph rebuilt from the incidence lists
+ *        (HypergraphOracle.hpp).
  *
  * Mirrors the role of stressTest / parallelStressTest in the MOSP project:
- * many random configurations, exact comparison, non-zero exit and a
+ * many random configurations, exact comparison of distances, a check of
+ * the shortest-path parents, of the device CSR rows and (with
+ * --check-escher) of the ESCHER CBST contents; non-zero exit and a
  * reproduction seed on the first failure.
  *
- * Usage: hsospStress [--configs N] [--seed S]
+ * Usage: hsospStress [--configs N] [--seed S] [--check-escher]
  */
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "DynamicHypergraph.hpp"
 #include "HypergraphGen.hpp"
+#include "HypergraphOracle.hpp"
 #include "hsosp.cuh"
 
 using namespace escher_mosp;
@@ -25,11 +32,20 @@ using namespace escher_mosp;
 int main(int argc, char** argv) {
     int configs = 100;
     unsigned long long seed = 987654321ull;
+    bool checkEscher = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--configs") && i + 1 < argc)
             configs = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc)
             seed = std::stoull(argv[++i]);
+        else if (!std::strcmp(argv[i], "--check-escher"))
+            checkEscher = true;
+        else {
+            std::fprintf(stderr,
+                         "usage: hsospStress [--configs N] [--seed S] "
+                         "[--check-escher]\n");
+            return 2;
+        }
     }
 
     std::mt19937_64 meta(seed);
@@ -67,12 +83,16 @@ int main(int argc, char** argv) {
         ucfg.maxIterations = 256;
         hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
 
-        // Initial solve must already match Dijkstra.
+        // Initial solve must already match the oracle.
         {
+            LineGraphCSR lg = rebuildLineGraph(hg);
             std::vector<long long> got;
+            std::vector<int> par;
             st.downloadDistances(got, hg.maxId());
-            std::vector<long long> truth = hg.dijkstra(hg.sourceHe);
-            if (got != truth) {
+            st.downloadParents(par, hg.maxId());
+            SospCheck c = checkSosp(
+                hg, lg, referenceDistances(hg, lg, hg.sourceHe), got, par);
+            if (!c.ok()) {
                 std::printf("FAIL cfg %d (seed %llu): initial solve\n", cfg,
                             (unsigned long long)gp.seed);
                 ++failures;
@@ -112,39 +132,54 @@ int main(int argc, char** argv) {
                 dev, st, br.delta.seeds, br.delta.deadHe, hg.sourceHe, ucfg);
             if (us.fallbackRecompute) ++fallbacks;
 
-            // Shadow adjacency must equal a brute-force rebuild.
+            // Oracle: line graph rebuilt from the incidence lists.
+            LineGraphCSR lg = rebuildLineGraph(hg);
+            const char* what = nullptr;
+            long long bad = 0;
             {
-                auto bf = hg.bruteForceH2H();
-                for (auto& r : bf) std::sort(r.begin(), r.end());
-                auto cur = hg.h2h;
-                for (auto& r : cur) std::sort(r.begin(), r.end());
-                if (bf != cur) {
-                    std::printf(
-                        "FAIL cfg %d batch %d (seed %llu): h2h shadow\n",
-                        cfg, bi, (unsigned long long)bp.seed);
-                    ++failures;
-                    break;
-                }
+                auto rows = [&](int id) {
+                    std::vector<int> r = hg.h2h[id - 1];
+                    std::sort(r.begin(), r.end());
+                    return r;
+                };
+                for (int id = 1; id <= hg.maxId() && !bad; ++id)
+                    if (rows(id) != std::vector<int>(lg.row(id),
+                                                     lg.row(id) +
+                                                         lg.degree(id)))
+                        bad = 1, what = "h2h shadow";
             }
-
-            std::vector<long long> got;
-            st.downloadDistances(got, hg.maxId());
-            std::vector<long long> truth = hg.dijkstra(hg.sourceHe);
-            if (got != truth) {
+            if (!bad) {
+                auto devRows = hsosp::downloadRows(dev, hg.maxId());
+                for (int id = 1; id <= hg.maxId() && !bad; ++id)
+                    if (devRows[id - 1] !=
+                        std::vector<int>(lg.row(id),
+                                         lg.row(id) + lg.degree(id)))
+                        bad = 1, what = "device CSR";
+            }
+            SospCheck c;
+            if (!bad) {
+                std::vector<long long> got;
+                std::vector<int> par;
+                st.downloadDistances(got, hg.maxId());
+                st.downloadParents(par, hg.maxId());
+                c = checkSosp(hg, lg, referenceDistances(hg, lg, hg.sourceHe),
+                              got, par);
+                if (!c.ok()) bad = 1, what = "distances / parents";
+            }
+            if (!bad && checkEscher && dh.checkEscher(lg, std::cout) != 0)
+                bad = 1, what = "ESCHER contents";
+            if (bad) {
                 std::printf(
                     "FAIL cfg %d batch %d (cfgSeed %llu batchSeed %llu "
-                    "kind=%s place=%s size=%d del=%.0f)\n",
+                    "kind=%s place=%s size=%d del=%.0f): %s\n",
                     cfg, bi, (unsigned long long)gp.seed,
                     (unsigned long long)bp.seed, toString(bp.kind),
-                    toString(bp.placement), bp.size, bp.delPct);
-                for (int id = 1; id <= hg.maxId() && id <= 100000; ++id) {
-                    if (got[id - 1] != truth[id - 1]) {
-                        std::printf("  first mismatch he %d: got %lld "
-                                    "want %lld\n",
-                                    id, got[id - 1], truth[id - 1]);
-                        break;
-                    }
-                }
+                    toString(bp.placement), bp.size, bp.delPct, what);
+                if (c.distMismatches || c.parentErrors)
+                    std::printf("  %lld distance mismatches (first he %d: "
+                                "got %lld want %lld), %lld parent errors\n",
+                                c.distMismatches, c.firstBadId, c.firstGot,
+                                c.firstWant, c.parentErrors);
                 ++failures;
                 break;
             }

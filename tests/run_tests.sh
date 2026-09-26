@@ -16,7 +16,9 @@ BIN="$ROOT/bin"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/escher_mosp_tests.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-XFAIL=" test_h2h_delta "
+XFAIL=" test_h2h_delta cbst_scale cbst_reuse cbst_terminator cbst_erase \
+ cbst_surplus cbst_bestfit cbst_unfill-chain cbst_random test_hsosp_scale \
+ hsospStress_escher parallelStressTest_seed6 "
 FAILURES=0
 
 # run_case <name> <command...>: the command must exit with status 0.
@@ -26,7 +28,7 @@ run_case() {
     local status=0
     # The outer subshell keeps bash's "Aborted"/"Segmentation fault" job
     # messages out of the report; the status is still that of the command.
-    ( ( cd "$WORK" && "$@" ) >"$log" 2>&1 ) 2>/dev/null || status=$?
+    ( ( cd "$WORK" && "$@" ) >"$log" 2>&1; exit $? ) 2>/dev/null || status=$?
     local expected_fail=0
     [[ "$XFAIL" == *" $name "* ]] && expected_fail=1
     if [ "$status" -eq 0 ]; then
@@ -45,21 +47,33 @@ run_case() {
     fi
 }
 
-echo "=== unit tests ==="
+echo "=== ESCHER CBST: contents vs a host model after every operation ==="
 run_case test_cbst_smoke                 "$BIN/test_cbst_smoke"
+for scenario in scale reuse terminator erase surplus bestfit unfill-chain \
+                random; do
+    run_case "cbst_$scenario" "$BIN/test_cbst_ops" "$scenario"
+done
+
+echo "=== unit tests ==="
 run_case test_dynamicgraph_roundtrip     "$BIN/test_dynamicgraph_roundtrip"
 run_case test_snapshot_matches_updateCSR "$BIN/test_snapshot_matches_updateCSR"
 run_case test_h2h_construction           "$BIN/test_h2h_construction"
 run_case test_h2h_delta                  "$BIN/test_h2h_delta"
 run_case test_hsosp_matches_dijkstra     "$BIN/test_hsosp_matches_dijkstra"
+run_case test_hsosp_scale                "$BIN/test_hsosp_scale"
 
-echo "=== H-SOSP randomized stress (pipeline vs host Dijkstra) ==="
-run_case hsospStress "$BIN/hsospStress" --configs 50
+echo "=== H-SOSP randomized stress (pipeline vs independent oracle) ==="
+run_case hsospStress        "$BIN/hsospStress" --configs 50
+run_case hsospStress_escher "$BIN/hsospStress" --configs 20 --seed 11 \
+    --check-escher
 
 echo "=== MOSP pipeline and stress tests ==="
-run_case main               "$BIN/main"
-run_case stressTest         "$BIN/stressTest"
-run_case parallelStressTest "$BIN/parallelStressTest"
+# Fixed seeds keep the suite reproducible; seed 6 of parallelStressTest hits
+# the MOSP count-to-infinity defect (run 195).
+run_case main                    "$BIN/main"
+run_case stressTest              "$BIN/stressTest" 1 200
+run_case parallelStressTest      "$BIN/parallelStressTest" 1 200
+run_case parallelStressTest_seed6 "$BIN/parallelStressTest" 6 200
 
 if [ "$FAILURES" -eq 0 ]; then
     echo "=== all tests passed ==="

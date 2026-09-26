@@ -81,6 +81,10 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
 bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
                         const H2HDelta& delta);
 
+/** Copies the rows of nodes 0..m-1 to the host as sorted 1-based
+ *  hyperedge id lists (duplicates kept), for checks against an oracle. */
+std::vector<std::vector<int>> downloadRows(const DeviceH2H& dev, int m);
+
 /** Persistent SOSP state (distances over hyperedge nodes). */
 struct HsospState {
     int maxNodes = 0;
