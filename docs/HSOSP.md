@@ -29,21 +29,41 @@ project's parallel SOSP-update framework as the update engine.
 ## Architecture
 
 ```
- generator (pool model)          batches (he/vertex, del%, placement)
+ generator / file loader          batches (he/vertex, del%, placement)
         │                                   │
         ▼                                   ▼
- DynamicHypergraph  ──ESCHER──►  h2v / v2h / h2h CBSTs   (t_escher_ms)
-        │ host shadow (HostHypergraph)
-        ├── H2HDelta (net edge ins/del, new/dead nodes, seeds)  (t_delta_ms)
+ DynamicHypergraph::beginBatch: h2v insert (decides new ids)  (t_escher_ms)
+        │ host incidence model (HostHypergraph): validates the ops,
+        │ yields the incidence changes (v, h, ±1) + touched rows   (t_delta_ms)
         ▼
- DeviceH2H: resident slack-CSR line graph  ◄── applyDeltaToDevice (t_csr_apply_ms)
+ GPU unification (hsospDelta.cu): candidates from the vertex
+ lists before / after the batch, classified by overlap
+ → net line-graph delta in dev.delta                            (t_delta_ms)
+        ▼
+ DeviceH2H: resident slack-CSR line graph ◄── device sort +
+ warp-per-row apply (rebuilt on a tail overflow)             (t_csr_apply_ms)
+        ▼
+ DynamicHypergraph::finishBatch: remaining h2v / v2h / h2h
+ CBST maintenance from the sorted net delta                   (t_escher_ms)
         ▼
  hsospUpdate: invalidate subtrees, pull, push              (t_sosp_update_ms)
  hsospRecompute: static baseline from blank                (t_static_ms)
 ```
 
-- `hypergraph/include/HostHypergraph.hpp` — host shadow + delta rules
-  (pure C++, unit-tested off-GPU via `tests/local/`).
+`hsosp::applyBatch` runs the first four stages. The line graph itself is
+not kept on the host: the host holds the incidence (the sorted vertex list
+of every hyperedge, the hyperedge list of every vertex, weights, liveness,
+free ids) and the GPU holds a mirror of it (`DeviceIncidence`) from which
+it derives the net line-graph delta. The rule is order-free and exact: a
+pair (a, b) can only change if a shared vertex was added to or removed
+from one of them, so every changed pair is a candidate of some changed
+incidence (v, h) (the other hyperedge is in v's list before or after the
+batch), and each candidate is inserted if a and b overlap only after the
+batch, deleted if only before.
+
+- `hypergraph/include/HostHypergraph.hpp` — host incidence model and the
+  batch rules (pure C++, unit-tested off-GPU via `tests/local/`, which also
+  runs a host copy of the delta rule against the line-graph difference).
 - `hypergraph/include/DynamicHypergraph.hpp` — ESCHER routing. Hyperedge
   ids adopt the keys returned by the h2v `insertCBST` best-fit mapping
   (the ESCHER paper's id-reassignment scheme); the h2h CBST keeps its own
@@ -68,8 +88,8 @@ project's parallel SOSP-update framework as the update engine.
 |---|---|
 | `bin/hsospBench`  | experiment matrix -> CSV (`--suite smoke|full`) |
 | `bin/hsospStress` | randomized full-pipeline check vs host Dijkstra |
-| `bin/test_h2h_construction` | shadow + device CSR == brute-force line graph |
-| `bin/test_h2h_delta` | incremental maintenance == rebuild after every batch |
+| `bin/test_h2h_construction` | line graph + device CSR + incidence mirror == oracle |
+| `bin/test_h2h_delta` | device CSR (GPU-derived delta) and incidence mirror == rebuild after every batch |
 | `bin/test_hsosp_matches_dijkstra` | update + recompute == Dijkstra (incl. disconnects) |
 
 ## Experiments

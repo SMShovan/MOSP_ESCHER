@@ -34,16 +34,15 @@ inline long long deviceRowMismatches(const hsosp::DeviceH2H& dev,
     return bad;
 }
 
-/** Number of host-shadow rows that differ from the oracle's line graph. */
-inline long long shadowRowMismatches(const HostHypergraph& hg,
-                                     const LineGraphCSR& lg) {
+/** Number of rows of @p a that differ from @p b (both sorted). */
+inline long long lineGraphMismatches(const LineGraphCSR& a,
+                                     const LineGraphCSR& b) {
+    if (a.numIds != b.numIds) return 1;
     long long bad = 0;
-    for (int id = 1; id <= lg.numIds; ++id) {
-        std::vector<int> got = hg.h2h[id - 1];
-        std::sort(got.begin(), got.end());
-        std::vector<int> want(lg.row(id), lg.row(id) + lg.degree(id));
-        if (got != want) ++bad;
-    }
+    for (int id = 1; id <= a.numIds; ++id)
+        if (!std::equal(a.row(id), a.row(id) + a.degree(id), b.row(id),
+                        b.row(id) + b.degree(id)))
+            ++bad;
     return bad;
 }
 

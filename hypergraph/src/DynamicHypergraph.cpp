@@ -178,7 +178,7 @@ long long DynamicHypergraph::checkEscher(const LineGraphCSR& lg,
     return errors;
 }
 
-void DynamicHypergraph::bulkLoad(std::vector<std::vector<int>>&& rows,
+LineGraphCSR DynamicHypergraph::bulkLoad(std::vector<std::vector<int>>&& rows,
                                  std::vector<long long>&& weights,
                                  int sourceHe, int targetHe) {
     Impl& im = *pImpl;
@@ -230,19 +230,24 @@ void DynamicHypergraph::bulkLoad(std::vector<std::vector<int>>&& rows,
     }
 
     // ---- h2h: neighboring hyperedge list per hyperedge -------------------
+    LineGraphCSR lg = im.host.lineGraph();
+    im.host.h2hPairCount = lg.numEntries() / 2;
     {
         std::vector<std::vector<int>> h2hRows(m);
-        for (int id = 1; id <= m; ++id) h2hRows[id - 1] = im.host.h2h[id - 1];
+        for (int id = 1; id <= m; ++id)
+            h2hRows[id - 1].assign(lg.row(id), lg.row(id) + lg.degree(id));
         im.h2h = constructFromRows("h2h", h2hRows, hf, extra);
         im.h2hKeyOfHe.assign(im.caps.maxHyperedges + 1, 0);
         for (int id = 1; id <= m; ++id) im.h2hKeyOfHe[id] = id;
     }
+    return lg;
 }
 
-DynamicHypergraph::BatchResult DynamicHypergraph::applyBatch(
+DynamicHypergraph::BatchResult DynamicHypergraph::beginBatch(
     const HgBatch& batch) {
     Impl& im = *pImpl;
     BatchResult res;
+    // Validate the inserted hyperedges before any structure is modified.
     for (const auto& ins : batch.heInsert) {
         if (ins.weight < 1) {
             throw escher::EscherError(
@@ -253,6 +258,13 @@ DynamicHypergraph::BatchResult DynamicHypergraph::applyBatch(
             throw escher::EscherError(
                 "DynamicHypergraph::applyBatch: inserted hyperedge without "
                 "vertices");
+        }
+        for (int v : ins.vertices) {
+            if (v < 0 || v >= im.numVertices) {
+                throw escher::EscherError(
+                    "DynamicHypergraph::applyBatch: inserted hyperedge with "
+                    "vertex " + std::to_string(v) + " out of range");
+            }
         }
     }
 
@@ -294,93 +306,115 @@ DynamicHypergraph::BatchResult DynamicHypergraph::applyBatch(
     }
 
     // ---------------------------------------------------------------
-    // 2. Host shadow update + delta extraction (with the final ids).
+    // 2. Host incidence update (with the final ids); the line-graph
+    //    delta is derived from these incidence changes on the GPU.
     // ---------------------------------------------------------------
-    EscherHorizOps ops;
     {
         auto t0 = Clock::now();
-        im.host.applyBatch(batch, finalIds, res.delta, ops);
+        im.host.applyBatch(batch, finalIds, res.inc, res.ops);
         res.deltaMs = msSince(t0);
     }
+    return res;
+}
 
-    // ---------------------------------------------------------------
-    // 3. Remaining ESCHER maintenance, unfills/erases before fills.
-    // ---------------------------------------------------------------
-    {
-        auto t0 = Clock::now();
+double DynamicHypergraph::finishBatch(
+    BatchResult& res, const std::vector<std::uint64_t>& directedKeys) {
+    Impl& im = *pImpl;
+    const HostHypergraph& hg = im.host;
+    auto t0 = Clock::now();
+    const std::vector<int>& deadHe = res.inc.deadHe;
+    const std::vector<int>& newHe = res.inc.newHe;
 
-        // Vertical deletes on h2v (avail propagation, slots become
-        // reusable for future best-fit inserts).
-        if (!res.delta.deadHe.empty()) {
-            im.h2v->erase(res.delta.deadHe);
-        }
+    // Vertical deletes on h2v (avail propagation, slots become reusable
+    // for future best-fit inserts).
+    if (!deadHe.empty()) im.h2v->erase(deadHe);
 
-        // Horizontal removals.
-        flushGrouped(ops.h2vUnfill, *im.h2v, /*isFill=*/false);
-        flushGrouped(ops.v2hUnfill, *im.v2h, /*isFill=*/false);
-        {
-            // Translate h2h row ids to h2h keys (pre-insert mapping).
-            std::vector<std::pair<int, int>> translated;
-            translated.reserve(ops.h2hUnfill.size());
-            for (auto [row, val] : ops.h2hUnfill) {
+    // h2h operations from the line-graph delta: directed keys
+    // row << 33 | isInsert << 32 | col (0-based), sorted, so every row's
+    // changes are one run with its deletions first. Rows of dead
+    // hyperedges are erased below (no unfill); rows of new hyperedges are
+    // inserted whole (no fill).
+    std::vector<char> isNew(hg.maxId() + 1, 0);
+    for (int id : newHe) isNew[id] = 1;
+    std::vector<std::pair<int, int>> h2hUnfill, h2hFill;
+    // Rows of new hyperedges: runs of newRowVals (keys of one row are
+    // contiguous).
+    std::vector<int> newRowStart(hg.maxId() + 1, -1);
+    std::vector<int> newRowLen(hg.maxId() + 1, 0);
+    std::vector<int> newRowVals;
+    long long insKeys = 0, delKeys = 0;
+    for (std::uint64_t k : directedKeys) {
+        const int row = static_cast<int>(k >> 33) + 1;
+        const bool ins = (k >> 32) & 1ull;
+        const int val = static_cast<int>(k & 0xffffffffu) + 1;
+        if (!ins) {
+            ++delKeys;
+            if (hg.alive[row - 1]) {
                 const int key = im.h2hKeyOfHe[row];
-                if (key > 0) translated.emplace_back(key, val);
+                if (key > 0) h2hUnfill.emplace_back(key, val);
             }
-            flushGrouped(translated, *im.h2h, /*isFill=*/false);
-        }
-
-        // Vertical deletes on h2h.
-        if (!res.delta.deadHe.empty()) {
-            std::vector<int> keys;
-            keys.reserve(res.delta.deadHe.size());
-            for (int id : res.delta.deadHe) {
-                const int key = im.h2hKeyOfHe[id];
-                if (key > 0) {
-                    keys.push_back(key);
-                    im.h2hKeyOfHe[id] = 0;
-                }
-            }
-            if (!keys.empty()) im.h2h->erase(keys);
-        }
-
-        // Horizontal additions.
-        flushGrouped(ops.h2vFill, *im.h2v, /*isFill=*/true);
-        flushGrouped(ops.v2hFill, *im.v2h, /*isFill=*/true);
-        {
-            std::vector<std::pair<int, int>> translated;
-            translated.reserve(ops.h2hFill.size());
-            for (auto [row, val] : ops.h2hFill) {
+        } else {
+            ++insKeys;
+            if (isNew[row]) {
+                if (newRowStart[row] < 0)
+                    newRowStart[row] = static_cast<int>(newRowVals.size());
+                ++newRowLen[row];
+                newRowVals.push_back(val);
+            } else {
                 const int key = im.h2hKeyOfHe[row];
-                if (key > 0) translated.emplace_back(key, val);
-            }
-            flushGrouped(translated, *im.h2h, /*isFill=*/true);
-        }
-
-        // Vertical inserts on h2h: one row per new hyperedge with its
-        // final neighbor list; adopt whatever keys the best-fit returns.
-        if (!res.delta.newHe.empty()) {
-            std::vector<int> tentative;
-            std::vector<int> payload;
-            std::vector<int> prefix;
-            tentative.reserve(res.delta.newHe.size());
-            int run = 0;
-            for (int id : res.delta.newHe) {
-                tentative.push_back(id);
-                for (int nb : im.host.h2h[id - 1]) payload.push_back(nb);
-                run += static_cast<int>(im.host.h2h[id - 1].size());
-                prefix.push_back(run);
-            }
-            InsertMapping mapping =
-                im.h2h->insert(tentative, payload, prefix);
-            for (std::size_t i = 0; i < res.delta.newHe.size(); ++i) {
-                im.h2hKeyOfHe[res.delta.newHe[i]] = mapping.itemToKey[i];
+                if (key > 0) h2hFill.emplace_back(key, val);
             }
         }
+    }
+    im.host.h2hPairCount += (insKeys - delKeys) / 2;
 
-        res.escherMs += msSince(t0);
+    // Horizontal removals.
+    flushGrouped(res.ops.h2vUnfill, *im.h2v, /*isFill=*/false);
+    flushGrouped(res.ops.v2hUnfill, *im.v2h, /*isFill=*/false);
+    flushGrouped(h2hUnfill, *im.h2h, /*isFill=*/false);
+
+    // Vertical deletes on h2h.
+    if (!deadHe.empty()) {
+        std::vector<int> keys;
+        keys.reserve(deadHe.size());
+        for (int id : deadHe) {
+            const int key = im.h2hKeyOfHe[id];
+            if (key > 0) {
+                keys.push_back(key);
+                im.h2hKeyOfHe[id] = 0;
+            }
+        }
+        if (!keys.empty()) im.h2h->erase(keys);
     }
 
-    return res;
+    // Horizontal additions.
+    flushGrouped(res.ops.h2vFill, *im.h2v, /*isFill=*/true);
+    flushGrouped(res.ops.v2hFill, *im.v2h, /*isFill=*/true);
+    flushGrouped(h2hFill, *im.h2h, /*isFill=*/true);
+
+    // Vertical inserts on h2h: one row per new hyperedge with its final
+    // neighbour list; adopt whatever keys the best-fit returns.
+    if (!newHe.empty()) {
+        std::vector<int> tentative;
+        std::vector<int> payload;
+        std::vector<int> prefix;
+        tentative.reserve(newHe.size());
+        int run = 0;
+        for (int id : newHe) {
+            tentative.push_back(id);
+            if (newRowLen[id] > 0)
+                payload.insert(payload.end(),
+                               newRowVals.begin() + newRowStart[id],
+                               newRowVals.begin() + newRowStart[id] +
+                                   newRowLen[id]);
+            run += newRowLen[id];
+            prefix.push_back(run);
+        }
+        InsertMapping mapping = im.h2h->insert(tentative, payload, prefix);
+        for (std::size_t i = 0; i < newHe.size(); ++i)
+            im.h2hKeyOfHe[newHe[i]] = mapping.itemToKey[i];
+    }
+    return msSince(t0);
 }
 
 } // namespace escher_mosp

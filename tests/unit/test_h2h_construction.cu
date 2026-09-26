@@ -38,23 +38,28 @@ int main() {
         DynamicHypergraph::Caps caps;
         caps.maxHyperedges = static_cast<int>(g.rows.size()) + 64;
         DynamicHypergraph dh(g.numVertices, caps);
-        dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
-                    g.targetHe);
+        LineGraphCSR built = dh.bulkLoad(std::move(g.rows),
+                                         std::move(g.weights), g.sourceHe,
+                                         g.targetHe);
         HostHypergraph& hg = dh.host();
 
         LineGraphCSR lg = rebuildLineGraph(hg);
-        if (testutil::shadowRowMismatches(hg, lg) != 0) {
-            std::printf("FAIL cfg %d: shadow h2h != rebuilt line graph\n",
+        if (testutil::lineGraphMismatches(built, lg) != 0) {
+            std::printf("FAIL cfg %d: lineGraph() != rebuilt line graph\n",
                         cfg);
             ++failures;
             continue;
         }
 
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.5);
+        hsosp::buildDeviceH2H(dev, hg, built, caps.maxHyperedges, 1.5);
         if (testutil::deviceRowMismatches(dev, lg, "construction") != 0) {
             std::printf("FAIL cfg %d: device CSR != rebuilt line graph\n",
                         cfg);
+            ++failures;
+        }
+        if (hsosp::incidenceMirrorMismatches(dev.inc, hg) != 0) {
+            std::printf("FAIL cfg %d: device incidence != host\n", cfg);
             ++failures;
         }
     }
@@ -64,13 +69,13 @@ int main() {
         DynamicHypergraph::Caps caps;
         caps.maxHyperedges = 16;
         DynamicHypergraph dh(3, caps);
-        dh.bulkLoad(std::move(rows), {0, 3, 4, 0}, 1, 4);
+        LineGraphCSR lg = dh.bulkLoad(std::move(rows), {0, 3, 4, 0}, 1, 4);
         for (double bad : {0.0, 0.5, std::nan("")}) {
             hsosp::DeviceH2H dev;
             bool threw = false;
             try {
-                hsosp::buildDeviceH2H(dev, dh.host(), caps.maxHyperedges,
-                                      bad);
+                hsosp::buildDeviceH2H(dev, dh.host(), lg,
+                                      caps.maxHyperedges, bad);
             } catch (const std::invalid_argument&) {
                 threw = true;
             }

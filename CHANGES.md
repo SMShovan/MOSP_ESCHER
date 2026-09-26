@@ -328,3 +328,36 @@ medians of three runs are in [results/README.md](results/README.md).
   relocated row), with scratch kept across batches. DBLP 50K: CSR stage
   2.0-2.2 s → 24-31 ms (including building and uploading the pairs); the
   first batch's SOSP stage 386 → 10 ms (no allocator stall).
+- **P1 unification on the GPU** (`hsosp/src/hsospDelta.cu`,
+  `HostHypergraph`, `DynamicHypergraph`). The line-graph delta (the
+  paper's unification, Alg. 2) was computed single-threaded on a host copy
+  of the whole line graph (`h2h`, 125M pairs on DBLP), emulating every op
+  with +/-1 pair counts in a hash map; the same host copy was built at load
+  and fed the h2h CBST operations one pair event at a time. Now the host
+  keeps only the incidence (sorted vertex lists, vertex -> hyperedge
+  lists, weights, liveness, free ids with O(1) removal) and ships the
+  batch's incidence changes (v, h, +/-1) with the pre- and post-batch
+  vertex lists of the touched hyperedges. The GPU keeps a slack-row mirror
+  of the incidence and derives the net delta: net sign per (v, h) (sort +
+  reduce), candidates (h, o) for every o in v's list before and after the
+  batch (one warp per changed incidence, the mirror is patched between the
+  two passes), sort + unique, and a pre / post overlap test per candidate.
+  The rule looks only at the states before and after the batch, so it is
+  independent of the order of the batch's ops (the host version's
+  correctness depended on the phase order). The CBST maintenance then runs
+  from the net, sorted delta the CSR apply already produced
+  (`finishBatch`), so the h2h CBST sees net changes only. The line graph
+  is built on the host only at load (`HostHypergraph::lineGraph`) and for a
+  CSR overflow rebuild.
+  DBLP 50K hyperedge batches (3 consecutive batches, same seeds, GPU 1):
+  unification 5.7-6.1 s → 96-142 ms; ESCHER maintenance 4.3-4.5 s →
+  1.1-1.2 s; dynamic time per batch 10.1-10.4 s → 1.28-1.37 s; load 11.6 s
+  → 5.0 s. The SOSP update is unchanged (same invalidated counts and
+  iterations).
+  Tests: `test_h2h_delta` also compares the device incidence mirror with
+  the host after every batch and requires both overflow paths (CSR rebuild,
+  mirror re-upload) to run; `tests/local` runs a host copy of the delta
+  rule against the difference of the line graphs before and after each
+  batch (240 batches) and checks the emulated update against the oracle,
+  parents included. Mutation: dropping the post-batch candidate pass made
+  `test_h2h_delta` and `hsospStress` fail (device CSR rows).

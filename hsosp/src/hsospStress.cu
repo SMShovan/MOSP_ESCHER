@@ -73,12 +73,13 @@ int main(int argc, char** argv) {
         caps.extraPayloadInts = 1 << 20;
 
         DynamicHypergraph dh(g.numVertices, caps);
-        dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
-                    g.targetHe);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(g.rows),
+                                       std::move(g.weights), g.sourceHe,
+                                       g.targetHe);
         HostHypergraph& hg = dh.host();
 
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.5);
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.5);
         hsosp::HsospState st;
         st.allocate(caps.maxHyperedges);
 
@@ -129,11 +130,8 @@ int main(int argc, char** argv) {
             }
             HgBatch batch = generateBatch(hg, gp, bp, distSnap, parentSnap);
 
-            DynamicHypergraph::BatchResult br = dh.applyBatch(batch);
+            hsosp::applyBatch(dh, dev, batch, 1.5);
             ++batches;
-            if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
-                hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.5);
-            }
             hsosp::UpdateStats us = hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
             if (us.fallbackRecompute) ++fallbacks;
 
@@ -142,18 +140,6 @@ int main(int argc, char** argv) {
             const char* what = nullptr;
             long long bad = 0;
             {
-                auto rows = [&](int id) {
-                    std::vector<int> r = hg.h2h[id - 1];
-                    std::sort(r.begin(), r.end());
-                    return r;
-                };
-                for (int id = 1; id <= hg.maxId() && !bad; ++id)
-                    if (rows(id) != std::vector<int>(lg.row(id),
-                                                     lg.row(id) +
-                                                         lg.degree(id)))
-                        bad = 1, what = "h2h shadow";
-            }
-            if (!bad) {
                 auto devRows = hsosp::downloadRows(dev, hg.maxId());
                 for (int id = 1; id <= hg.maxId() && !bad; ++id)
                     if (devRows[id - 1] !=

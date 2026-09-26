@@ -6,17 +6,21 @@
 #include "HypergraphOracle.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <queue>
 #include <utility>
 
+#ifdef _OPENMP
+#include <parallel/algorithm>
+#endif
+
 namespace escher_mosp {
 
-bool LineGraphCSR::adjacent(int a, int b) const {
-    if (a < 1 || a > numIds || b < 1 || b > numIds) return false;
-    const int* r = row(a);
-    return std::binary_search(r, r + degree(a), b);
-}
+namespace {
+// Below this many rows the OpenMP team costs more than it saves.
+constexpr int kParallelMin = 1 << 14;
+} // namespace
 
 LineGraphCSR rebuildLineGraph(const HostHypergraph& hg) {
     const int m = hg.maxId();
@@ -38,42 +42,66 @@ LineGraphCSR rebuildLineGraph(const HostHypergraph& hg) {
         }
     }
 
-    // Neighbour rows: union of the vertex lists, sorted and deduplicated.
-    // Two passes (count, then write) keep the rows in one allocation.
+    // Every ordered pair (a, b), a != b, of hyperedges sharing a vertex,
+    // emitted per vertex, then sorted and deduplicated.
+    std::vector<long long> pairOff(static_cast<std::size_t>(n) + 1, 0);
+    for (int v = 0; v < n; ++v) {
+        const long long d = vOff[v + 1] - vOff[v];
+        pairOff[v + 1] = pairOff[v] + d * (d - 1);
+    }
+    std::vector<std::uint64_t> pairs(static_cast<std::size_t>(pairOff[n]));
+#pragma omp parallel for schedule(dynamic, 1024) if (n > kParallelMin)
+    for (int v = 0; v < n; ++v) {
+        long long k = pairOff[v];
+        for (long long i = vOff[v]; i < vOff[v + 1]; ++i)
+            for (long long j = vOff[v]; j < vOff[v + 1]; ++j)
+                if (i != j)
+                    pairs[k++] = (static_cast<std::uint64_t>(vHe[i]) << 32) |
+                                 static_cast<std::uint32_t>(vHe[j]);
+    }
+#ifdef _OPENMP
+    if (pairs.size() > (1u << 20))
+        __gnu_parallel::sort(pairs.begin(), pairs.end());
+    else
+#endif
+        std::sort(pairs.begin(), pairs.end());
+    pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+
     LineGraphCSR lg;
     lg.numIds = m;
     lg.offset.assign(static_cast<std::size_t>(m) + 1, 0);
-    auto gather = [&](int id, std::vector<int>& out) {
-        out.clear();
-        if (!hg.alive[id - 1]) return;
-        for (int v : hg.heVerts[id - 1])
-            for (long long k = vOff[v]; k < vOff[v + 1]; ++k)
-                if (vHe[k] != id) out.push_back(vHe[k]);
-        std::sort(out.begin(), out.end());
-        out.erase(std::unique(out.begin(), out.end()), out.end());
-    };
-#pragma omp parallel
-    {
-        std::vector<int> scratch;
-#pragma omp for schedule(dynamic, 1024)
-        for (int id = 1; id <= m; ++id) {
-            gather(id, scratch);
-            lg.offset[id] = static_cast<long long>(scratch.size());
-        }
+    lg.nbr.resize(pairs.size());
+    for (std::size_t k = 0; k < pairs.size(); ++k) {
+        ++lg.offset[pairs[k] >> 32];
+        lg.nbr[k] = static_cast<int>(pairs[k] & 0xffffffffu);
     }
     for (int id = 1; id <= m; ++id) lg.offset[id] += lg.offset[id - 1];
-    lg.nbr.resize(static_cast<std::size_t>(lg.offset[m]));
-#pragma omp parallel
-    {
-        std::vector<int> scratch;
-#pragma omp for schedule(dynamic, 1024)
-        for (int id = 1; id <= m; ++id) {
-            gather(id, scratch);
-            std::copy(scratch.begin(), scratch.end(),
-                      lg.nbr.begin() + lg.offset[id - 1]);
+    return lg;
+}
+
+H2HDelta lineGraphDelta(const LineGraphCSR& pre, const LineGraphCSR& post) {
+    H2HDelta d;
+    const int m = std::max(pre.numIds, post.numIds);
+    for (int a = 1; a <= m; ++a) {
+        const int* r0 = a <= pre.numIds ? pre.row(a) : nullptr;
+        const int* e0 = r0 ? r0 + pre.degree(a) : nullptr;
+        const int* r1 = a <= post.numIds ? post.row(a) : nullptr;
+        const int* e1 = r1 ? r1 + post.degree(a) : nullptr;
+        // Merge of the two sorted rows; keep b > a only.
+        while (r0 != e0 || r1 != e1) {
+            if (r1 == e1 || (r0 != e0 && *r0 < *r1)) {
+                if (*r0 > a) d.delEdges.emplace_back(a, *r0);
+                ++r0;
+            } else if (r0 == e0 || *r1 < *r0) {
+                if (*r1 > a) d.insEdges.emplace_back(a, *r1);
+                ++r1;
+            } else {
+                ++r0;
+                ++r1;
+            }
         }
     }
-    return lg;
+    return d;
 }
 
 std::vector<long long> referenceDistances(const HostHypergraph& hg,

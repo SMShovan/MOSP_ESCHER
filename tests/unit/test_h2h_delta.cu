@@ -1,8 +1,10 @@
 /**
  * @file test_h2h_delta.cu
- * @brief After every batch, the incrementally maintained h2h (host shadow
- *        AND resident device CSR) must equal the line graph rebuilt from the
- *        incidence lists (independent oracle; rows compared as multisets).
+ * @brief After every batch, the resident device CSR (patched with the
+ *        line-graph delta derived on the GPU) must equal the line graph
+ *        rebuilt from the incidence lists (independent oracle; rows
+ *        compared as multisets), and the device incidence mirror must
+ *        equal the host's.
  */
 
 #include <algorithm>
@@ -19,6 +21,7 @@ using namespace escher_mosp;
 
 static int failures = 0;
 static int rebuilds = 0;
+static int reuploads = 0;
 
 int main() {
     std::mt19937_64 meta(31337);
@@ -37,15 +40,17 @@ int main() {
         caps.maxHyperedges = static_cast<int>(g.rows.size()) + 2048;
         caps.headroomFactor = 2.0;
         DynamicHypergraph dh(g.numVertices, caps);
-        dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
-                    g.targetHe);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(g.rows),
+                                       std::move(g.weights), g.sourceHe,
+                                       g.targetHe);
         HostHypergraph& hg = dh.host();
 
-        // Every third configuration has no spare CSR capacity (headroom 1),
-        // so rows relocate into a full tail and the overflow rebuild runs.
+        // Every third configuration has no spare capacity (headroom 1), so
+        // rows relocate into a full tail: the CSR overflow rebuild and the
+        // re-upload of the incidence mirror run.
         const double headroom = (cfg % 3 == 0) ? 1.0 : 1.3;
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, headroom);
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, headroom);
 
         for (int bi = 0; bi < 6 && failures == 0; ++bi) {
             BatchParams bp;
@@ -56,16 +61,15 @@ int main() {
             bp.seed = meta();
             HgBatch batch = generateBatch(hg, gp, bp, {}, {});
 
-            DynamicHypergraph::BatchResult br = dh.applyBatch(batch);
-            if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
-                ++rebuilds;
-                hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, headroom);
-            }
+            hsosp::BatchTimes bt =
+                hsosp::applyBatch(dh, dev, batch, headroom);
+            if (bt.csrRebuilt) ++rebuilds;
+            reuploads += bt.mirrorReuploads;
 
             LineGraphCSR lg = rebuildLineGraph(hg);
-            if (testutil::shadowRowMismatches(hg, lg) != 0) {
-                std::printf("FAIL cfg %d batch %d: shadow != rebuild\n", cfg,
-                            bi);
+            if (hsosp::incidenceMirrorMismatches(dev.inc, hg) != 0) {
+                std::printf("FAIL cfg %d batch %d: device incidence != "
+                            "host\n", cfg, bi);
                 ++failures;
                 break;
             }
@@ -77,7 +81,13 @@ int main() {
             }
         }
     }
-    std::printf("device CSR overflow rebuilds: %d\n", rebuilds);
+    std::printf("device CSR overflow rebuilds: %d, incidence mirror "
+                "re-uploads: %d\n",
+                rebuilds, reuploads);
+    if (rebuilds == 0 || reuploads == 0) {
+        std::printf("FAIL: the overflow paths did not run\n");
+        ++failures;
+    }
     std::printf("test_h2h_delta: %s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }

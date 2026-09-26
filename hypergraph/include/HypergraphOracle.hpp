@@ -6,10 +6,11 @@
  * @brief Test oracle for the H-SOSP pipeline, independent of every
  *        incrementally maintained structure.
  *
- * The line graph is rebuilt from the incidence lists (HostHypergraph::heVerts
- * and alive flags) alone, so it does not share code or state with the
- * maintained h2h lists, the ESCHER CBSTs or the device CSR. Distances come
- * from a textbook binary-heap Dijkstra on that rebuilt graph.
+ * The line graph is rebuilt from the hyperedges' vertex lists
+ * (HostHypergraph::heVerts and alive flags) alone, so it does not share
+ * code or state with the incrementally maintained structures (the device
+ * CSR, the ESCHER CBSTs, the incidence lists). Distances come from a
+ * textbook binary-heap Dijkstra on that rebuilt graph.
  */
 
 #include <vector>
@@ -18,20 +19,17 @@
 
 namespace escher_mosp {
 
-/** Line graph in CSR form; row (id - 1) lists the ids of the alive
- *  hyperedges sharing a vertex with alive hyperedge id, sorted ascending. */
-struct LineGraphCSR {
-    int numIds = 0;                  ///< == hg.maxId() when built
-    std::vector<long long> offset;   ///< numIds + 1 entries
-    std::vector<int> nbr;            ///< 1-based hyperedge ids
-
-    long long degree(int id) const { return offset[id] - offset[id - 1]; }
-    const int* row(int id) const { return nbr.data() + offset[id - 1]; }
-    bool adjacent(int a, int b) const;
-};
-
-/** Rebuilds the line graph from heVerts (OpenMP-parallel). */
+/** Rebuilds the line graph from heVerts: every pair of alive hyperedges
+ *  sharing a vertex is emitted per vertex, then sorted and deduplicated
+ *  (a different algorithm from HostHypergraph::lineGraph, which unions
+ *  incidence lists per hyperedge). */
 LineGraphCSR rebuildLineGraph(const HostHypergraph& hg);
+
+/** Net line-graph change between two line graphs (pairs a < b adjacent
+ *  only in @p post: insEdges; only in @p pre: delEdges), by definition;
+ *  the reference for the GPU-derived delta. newHe / deadHe are left
+ *  empty. */
+H2HDelta lineGraphDelta(const LineGraphCSR& pre, const LineGraphCSR& post);
 
 /** Node-weighted Dijkstra from @p sourceId on @p lg (stepping into h costs
  *  hg.heW[h-1]); indexed by id - 1, HostHypergraph::INF if unreachable. */

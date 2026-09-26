@@ -189,6 +189,9 @@ struct LoadedDataset {
 
 int globalFailures = 0;
 
+/// colInd capacity of the device CSR relative to its initial layout.
+constexpr double kEntryHeadroom = 1.6;
+
 /** Builds ESCHER, the device CSR and the initial SOSP for @p g. */
 std::unique_ptr<LoadedDataset> buildDataset(const std::string& name,
                                             GeneratedHypergraph&& g,
@@ -208,8 +211,8 @@ std::unique_ptr<LoadedDataset> buildDataset(const std::string& name,
 
     auto ds = std::make_unique<LoadedDataset>(g.numVertices, caps);
     ds->gen = gen;
-    ds->dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
-                    g.targetHe);
+    LineGraphCSR lg = ds->dh.bulkLoad(std::move(g.rows), std::move(g.weights),
+                                      g.sourceHe, g.targetHe);
     double loadMs = msSince(t0);
 
     HostHypergraph& hg = ds->dh.host();
@@ -219,8 +222,9 @@ std::unique_ptr<LoadedDataset> buildDataset(const std::string& name,
                  hg.aliveCount ? 2.0 * hg.h2hPairCount / hg.aliveCount : 0.0);
 
     t0 = Clock::now();
-    hsosp::buildDeviceH2H(ds->dev, hg, caps.maxHyperedges,
-                          /*entryHeadroom=*/1.6);
+    hsosp::buildDeviceH2H(ds->dev, hg, lg, caps.maxHyperedges,
+                          kEntryHeadroom);
+    lg = LineGraphCSR{};   // release the host copy
     ds->stateA.allocate(caps.maxHyperedges);
     ds->stateB.allocate(caps.maxHyperedges);
     hsosp::UpdateConfig ucfg;
@@ -266,8 +270,8 @@ std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
 /** Timings, counters and checks of one batch. */
 struct BatchOutcome {
     bool ok = false;             ///< false: the pipeline threw
-    DynamicHypergraph::BatchResult br;
-    double csrMs = 0.0, sospMs = 0.0, staticMs = 0.0;
+    hsosp::BatchTimes bt;        ///< ESCHER, unification and CSR stages
+    double sospMs = 0.0, staticMs = 0.0;
     hsosp::UpdateStats us;
     int staticIterations = 0;
     long long mismatchStatic = 0;
@@ -278,7 +282,7 @@ struct BatchOutcome {
     }
     bool verified() const { return ok && oracleRan && oracle.ok(); }
     double dynamicMs() const {
-        return br.escherMs + br.deltaMs + csrMs + sospMs;
+        return bt.escherMs + bt.deltaMs + bt.csrMs + sospMs;
     }
 };
 
@@ -298,29 +302,23 @@ BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
     ucfg.workBudget = opt.workBudget;
 
     // ---- dynamic pipeline (timed) --------------------------------------
+    // (A CSR tail overflow rebuilds the CSR inside applyBatch, timed in
+    // the CSR stage; the original stopped the timer before it.)
     try {
-        o.br = ds.dh.applyBatch(batch);
+        o.bt = hsosp::applyBatch(ds.dh, ds.dev, batch, kEntryHeadroom);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[error] %s: applyBatch failed: %s\n",
                      what.c_str(), e.what());
         ++globalFailures;
         return o;
     }
+    if (o.bt.csrRebuilt) {
+        ++ds.overflowRebuilds;
+        std::fprintf(stderr, "[warn] %s: device CSR overflow, rebuilt\n",
+                     what.c_str());
+    }
 
     auto t0 = Clock::now();
-    bool ok = hsosp::applyDeltaToDevice(ds.dev, hg, o.br.delta);
-    if (!ok) {
-        // Tail exhausted: rebuild from the shadow; the rebuild installs the
-        // post-batch state and is part of this batch's CSR stage (the
-        // original stopped the timer before it).
-        ++ds.overflowRebuilds;
-        std::fprintf(stderr, "[warn] %s: device CSR overflow, rebuilding\n",
-                     what.c_str());
-        hsosp::buildDeviceH2H(ds.dev, hg, ds.stateA.maxNodes, 1.6);
-    }
-    o.csrMs = msSince(t0);
-
-    t0 = Clock::now();
     o.us = hsosp::hsospUpdate(ds.dev, ds.stateA, hg.sourceHe, ucfg);
     o.sospMs = msSince(t0);
 
@@ -373,8 +371,8 @@ void writeRow(CsvWriter& csv, const CliOptions& opt, const std::string& exp,
       << ds.gen.cMin << "," << ds.gen.cMax << "," << ds.gen.poolSize << ","
       << ds.gen.bridgeFrac << "," << avgDeg << "," << hg.h2hPairCount << ","
       << toString(kind) << "," << batchSize << "," << delPct << ","
-      << toString(pl) << "," << rep << "," << seed << "," << o.br.escherMs
-      << "," << o.br.deltaMs << "," << o.csrMs << "," << o.sospMs << ","
+      << toString(pl) << "," << rep << "," << seed << "," << o.bt.escherMs
+      << "," << o.bt.deltaMs << "," << o.bt.csrMs << "," << o.sospMs << ","
       << dynTotal << "," << o.staticMs << ","
       << (dynTotal > 0 ? o.staticMs / dynTotal : 0.0) << ","
       << o.us.iterations << "," << (o.us.fallbackRecompute ? 1 : 0) << ","
@@ -398,8 +396,8 @@ void writeRow(CsvWriter& csv, const CliOptions& opt, const std::string& exp,
                  "sosp=%.1f) static=%.1fms speedup=%.2f iters=%d "
                  "invalidated=%lld%s%s\n",
                  dataset.c_str(), exp.c_str(), toString(kind), batchSize,
-                 delPct, toString(pl), rep, dynTotal, o.br.escherMs,
-                 o.br.deltaMs, o.csrMs, o.sospMs, o.staticMs,
+                 delPct, toString(pl), rep, dynTotal, o.bt.escherMs,
+                 o.bt.deltaMs, o.bt.csrMs, o.sospMs, o.staticMs,
                  dynTotal > 0 ? o.staticMs / dynTotal : 0.0, o.us.iterations,
                  o.us.seedCount,
                  o.us.fallbackRecompute ? " FALLBACK" : "",

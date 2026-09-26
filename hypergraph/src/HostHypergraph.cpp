@@ -1,11 +1,12 @@
 /**
  * @file HostHypergraph.cpp
- * @brief Host model + h2h delta rules for the dynamic hypergraph. Pure C++.
+ * @brief Host incidence model of the dynamic hypergraph. Pure C++.
  *
- * The delta rules implement the maintenance discussed in the project
- * meeting: an h2h edge lives while the two hyperedges share at least one
- * vertex; a vertex removal deletes the edge only when the last common
- * vertex disappears; insertions are symmetric.
+ * applyBatch validates the ops and turns them into incidence changes
+ * (vertex, hyperedge, +/-1) plus the pre- and post-batch vertex lists of
+ * the touched hyperedges; the GPU derives the net line-graph delta from
+ * them (an h2h edge lives while the two hyperedges share at least one
+ * vertex).
  */
 
 #include "HostHypergraph.hpp"
@@ -14,6 +15,7 @@
 #include <cassert>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -24,19 +26,10 @@ const long long HostHypergraph::INF =
 
 namespace {
 
-inline std::uint64_t pairKey(int a, int b) {
-    if (a > b) std::swap(a, b);
-    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(a)) << 32) |
-           static_cast<std::uint32_t>(b);
-}
+// Below this many rows the OpenMP team costs more than it saves.
+constexpr int kParallelMin = 1 << 14;
 
-inline std::pair<int, int> orderedPair(int a, int b) {
-    return (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
-}
-
-} // namespace
-
-void HostHypergraph::removeValue_(std::vector<int>& v, int value) {
+void removeValue(std::vector<int>& v, int value) {
     for (std::size_t i = 0; i < v.size(); ++i) {
         if (v[i] == value) {
             v[i] = v.back();
@@ -46,60 +39,68 @@ void HostHypergraph::removeValue_(std::vector<int>& v, int value) {
     }
 }
 
-bool HostHypergraph::overlaps_(int a, int b) const {
-    const std::vector<int>& A = heVerts[a - 1];
-    const std::vector<int>& B = heVerts[b - 1];
-    std::size_t i = 0, j = 0;
-    while (i < A.size() && j < B.size()) {
-        if (A[i] == B[j]) return true;
-        if (A[i] < B[j]) ++i; else ++j;
-    }
-    return false;
+} // namespace
+
+bool LineGraphCSR::adjacent(int a, int b) const {
+    if (a < 1 || a > numIds || b < 1 || b > numIds) return false;
+    const int* r = row(a);
+    return std::binary_search(r, r + degree(a), b);
+}
+
+void HostHypergraph::freeListPush_(int id) {
+    if (static_cast<int>(freePos.size()) <= id) freePos.resize(id + 1, -1);
+    freePos[id] = static_cast<int>(freeIds.size());
+    freeIds.push_back(id);
+}
+
+// O(1) removal (the original scanned the whole free list for every
+// inserted hyperedge: 16 s per 200K batch on DBLP).
+void HostHypergraph::freeListRemove_(int id) {
+    if (id >= static_cast<int>(freePos.size()) || freePos[id] < 0) return;
+    const int pos = freePos[id];
+    const int last = freeIds.back();
+    freeIds[pos] = last;
+    freePos[last] = pos;
+    freeIds.pop_back();
+    freePos[id] = -1;
 }
 
 void HostHypergraph::buildFrom(int nVerts,
                                std::vector<std::vector<int>>&& rows,
                                std::vector<long long>&& weights) {
-    assert(rows.size() == weights.size());
+    if (rows.size() != weights.size())
+        throw std::invalid_argument("HostHypergraph::buildFrom: one weight "
+                                    "per hyperedge required");
     numVertices = nVerts;
     heVerts = std::move(rows);
     heW = std::move(weights);
     const int m = static_cast<int>(heVerts.size());
     alive.assign(m, 1);
     freeIds.clear();
+    freePos.clear();
     aliveCount = m;
 
-    for (auto& r : heVerts) {
+#pragma omp parallel for schedule(dynamic, 4096) if (m > kParallelMin)
+    for (int i = 0; i < m; ++i) {
+        std::vector<int>& r = heVerts[i];
         std::sort(r.begin(), r.end());
         r.erase(std::unique(r.begin(), r.end()), r.end());
     }
+    for (int id = 1; id <= m; ++id)
+        for (int v : heVerts[id - 1])
+            if (v < 0 || v >= numVertices)
+                throw std::invalid_argument(
+                    "HostHypergraph::buildFrom: vertex id out of range");
 
+    // v2h: counting pass, then fill in id order.
+    std::vector<int> count(numVertices, 0);
+    for (int id = 1; id <= m; ++id)
+        for (int v : heVerts[id - 1]) ++count[v];
     v2h.assign(numVertices, {});
-    for (int id = 1; id <= m; ++id) {
-        for (int v : heVerts[id - 1]) {
-            assert(v >= 0 && v < numVertices);
-            v2h[v].push_back(id);
-        }
-    }
-
-    // h2h: union of v2h lists over each hyperedge's vertices.
-    h2h.assign(m, {});
-    h2hPairCount = 0;
-    std::vector<int> scratch;
-    for (int id = 1; id <= m; ++id) {
-        scratch.clear();
-        for (int v : heVerts[id - 1]) {
-            for (int other : v2h[v]) {
-                if (other != id) scratch.push_back(other);
-            }
-        }
-        std::sort(scratch.begin(), scratch.end());
-        scratch.erase(std::unique(scratch.begin(), scratch.end()),
-                      scratch.end());
-        h2h[id - 1] = scratch;
-        h2hPairCount += static_cast<long long>(scratch.size());
-    }
-    h2hPairCount /= 2;
+    for (int v = 0; v < numVertices; ++v) v2h[v].reserve(count[v]);
+    for (int id = 1; id <= m; ++id)
+        for (int v : heVerts[id - 1]) v2h[v].push_back(id);
+    h2hPairCount = 0;   // set by the owner once the line graph is built
 }
 
 std::vector<int> HostHypergraph::reserveIds(int count) const {
@@ -119,251 +120,200 @@ std::vector<int> HostHypergraph::reserveIds(int count) const {
 
 void HostHypergraph::applyBatch(const HgBatch& b,
                                 const std::vector<int>& finalIds,
-                                H2HDelta& delta, EscherHorizOps& ops) {
-    assert(finalIds.size() == b.heInsert.size());
-    delta = H2HDelta{};
+                                IncidenceBatch& inc, EscherHorizOps& ops) {
+    if (finalIds.size() != b.heInsert.size())
+        throw std::invalid_argument(
+            "HostHypergraph::applyBatch: one id per inserted hyperedge");
+    inc = IncidenceBatch{};
     ops = EscherHorizOps{};
 
-    // Net edge effect: +1 insert, -1 delete; cancels to 0 for churn.
-    std::unordered_map<std::uint64_t, int> edgeNet;
-    edgeNet.reserve(b.totalOps() * 8 + 16);
-    std::vector<int> seedPool;   // candidate seeds, filtered at the end
-    std::unordered_set<int> recreated;
-
-    auto touchEdge = [&](int a, int bId, int d) {
-        edgeNet[pairKey(a, bId)] += d;
-        seedPool.push_back(a);
-        seedPool.push_back(bId);
+    // Touched hyperedges (pre-batch rows snapshotted on first touch) and
+    // touched vertices.
+    std::unordered_map<int, int> touchedSlot;
+    touchedSlot.reserve(b.totalOps() * 2 + 16);
+    std::vector<std::vector<int>> preRows;
+    auto touchHe = [&](int id) {
+        if (touchedSlot.emplace(id, static_cast<int>(inc.touched.size()))
+                .second) {
+            inc.touched.push_back(id);
+            preRows.push_back(id <= maxId() ? heVerts[id - 1]
+                                            : std::vector<int>{});
+        }
     };
+    std::unordered_set<int> touchedVertexSet;
+    auto incidence = [&](int v, int h, int sign) {
+        inc.incKey.push_back((static_cast<std::uint64_t>(
+                                  static_cast<std::uint32_t>(v))
+                              << 32) |
+                             static_cast<std::uint32_t>(h));
+        inc.incSign.push_back(sign);
+        if (touchedVertexSet.insert(v).second)
+            inc.touchedVertices.push_back(v);
+    };
+    std::vector<int> deletedAtAnyPoint;
 
     // ---------------- Phase 1: hyperedge deletions -----------------------
     for (int id : b.heDelete) {
         if (id < 1 || id > maxId() || !alive[id - 1]) {
-            ++delta.skippedOps;
+            ++inc.skippedOps;
             continue;
         }
-        // Kill all incident h2h edges.
-        for (int nb : h2h[id - 1]) {
-            touchEdge(id, nb, -1);
-            removeValue_(h2h[nb - 1], id);
-            ops.h2hUnfill.emplace_back(nb, id);
-        }
-        h2hPairCount -= static_cast<long long>(h2h[id - 1].size());
-        h2h[id - 1].clear();
-
-        // Remove from v2h rows.
+        touchHe(id);
         for (int v : heVerts[id - 1]) {
-            removeValue_(v2h[v], id);
+            removeValue(v2h[v], id);
             ops.v2hUnfill.emplace_back(v + 1, id);
+            incidence(v, id, -1);
         }
         heVerts[id - 1].clear();
         alive[id - 1] = 0;
         --aliveCount;
-        freeIds.push_back(id);
-        delta.deletedAtAnyPoint.push_back(id);
+        freeListPush_(id);
+        deletedAtAnyPoint.push_back(id);
     }
 
     // ---------------- Phase 2: incident vertex deletions ------------------
     for (const auto& c : b.vtxDelete) {
         if (c.heId < 1 || c.heId > maxId() || !alive[c.heId - 1] ||
             c.vertex < 0 || c.vertex >= numVertices) {
-            ++delta.skippedOps;
+            ++inc.skippedOps;
             continue;
         }
         std::vector<int>& verts = heVerts[c.heId - 1];
         auto it = std::lower_bound(verts.begin(), verts.end(), c.vertex);
         if (it == verts.end() || *it != c.vertex) {
-            ++delta.skippedOps;
+            ++inc.skippedOps;
             continue;
         }
         if (verts.size() == 1) {
             // Never reduce a hyperedge below one vertex (would be an
             // implicit hyperedge deletion; callers use heDelete for that).
-            ++delta.skippedOps;
+            ++inc.skippedOps;
             continue;
         }
+        touchHe(c.heId);
         verts.erase(it);
-        removeValue_(v2h[c.vertex], c.heId);
+        removeValue(v2h[c.vertex], c.heId);
         ops.h2vUnfill.emplace_back(c.heId, c.vertex + 1);
         ops.v2hUnfill.emplace_back(c.vertex + 1, c.heId);
-
-        // Only hyperedges that also contain the removed vertex can lose
-        // their edge to c.heId (meeting rule: edge dies when the LAST
-        // common vertex disappears).
-        for (int other : v2h[c.vertex]) {
-            if (other == c.heId) continue;
-            // Adjacent right now?
-            bool adjacent = false;
-            for (int nb : h2h[c.heId - 1]) {
-                if (nb == other) { adjacent = true; break; }
-            }
-            if (!adjacent) continue;
-            if (!overlaps_(c.heId, other)) {
-                touchEdge(c.heId, other, -1);
-                removeValue_(h2h[c.heId - 1], other);
-                removeValue_(h2h[other - 1], c.heId);
-                ops.h2hUnfill.emplace_back(c.heId, other);
-                ops.h2hUnfill.emplace_back(other, c.heId);
-                --h2hPairCount;
-            }
-        }
+        incidence(c.vertex, c.heId, -1);
     }
 
     // ---------------- Phase 3: incident vertex insertions -----------------
     for (const auto& c : b.vtxInsert) {
         if (c.heId < 1 || c.heId > maxId() || !alive[c.heId - 1] ||
             c.vertex < 0 || c.vertex >= numVertices) {
-            ++delta.skippedOps;
+            ++inc.skippedOps;
             continue;
         }
         std::vector<int>& verts = heVerts[c.heId - 1];
         auto it = std::lower_bound(verts.begin(), verts.end(), c.vertex);
         if (it != verts.end() && *it == c.vertex) {
-            ++delta.skippedOps;   // already a member
+            ++inc.skippedOps;   // already a member
             continue;
         }
-        // New h2h edges to hyperedges containing this vertex that were not
-        // adjacent before.
-        for (int other : v2h[c.vertex]) {
-            if (other == c.heId) continue;
-            bool adjacent = false;
-            for (int nb : h2h[c.heId - 1]) {
-                if (nb == other) { adjacent = true; break; }
-            }
-            if (!adjacent) {
-                touchEdge(c.heId, other, +1);
-                h2h[c.heId - 1].push_back(other);
-                h2h[other - 1].push_back(c.heId);
-                ops.h2hFill.emplace_back(c.heId, other);
-                ops.h2hFill.emplace_back(other, c.heId);
-                ++h2hPairCount;
-            }
-        }
+        touchHe(c.heId);
         verts.insert(it, c.vertex);
         v2h[c.vertex].push_back(c.heId);
         ops.h2vFill.emplace_back(c.heId, c.vertex + 1);
         ops.v2hFill.emplace_back(c.vertex + 1, c.heId);
+        incidence(c.vertex, c.heId, +1);
     }
 
     // ---------------- Phase 4: hyperedge insertions -----------------------
-    std::unordered_set<int> newHeSet;
-    for (std::size_t i = 0; i < b.heInsert.size(); ++i) {
-        newHeSet.insert(finalIds[i]);
-    }
     for (std::size_t i = 0; i < b.heInsert.size(); ++i) {
         const int id = finalIds[i];
-        assert(id >= 1);
+        if (id < 1)
+            throw std::invalid_argument(
+                "HostHypergraph::applyBatch: invalid hyperedge id");
         if (id > maxId()) {
             heVerts.resize(id);
             heW.resize(id, 0);
             alive.resize(id, 0);
-            h2h.resize(id);
         }
-        assert(!alive[id - 1] && "hyperedge id collision on insert");
-        // Recycled ids are removed from the free list.
-        for (std::size_t f = 0; f < freeIds.size(); ++f) {
-            if (freeIds[f] == id) {
-                freeIds[f] = freeIds.back();
-                freeIds.pop_back();
-                recreated.insert(id);
-                break;
-            }
-        }
-
+        if (alive[id - 1])
+            throw std::logic_error(
+                "HostHypergraph::applyBatch: hyperedge id collision on insert");
         std::vector<int> verts = b.heInsert[i].vertices;
         std::sort(verts.begin(), verts.end());
         verts.erase(std::unique(verts.begin(), verts.end()), verts.end());
-        assert(!verts.empty());
-
+        if (verts.empty() || verts.front() < 0 || verts.back() >= numVertices)
+            throw std::invalid_argument(
+                "HostHypergraph::applyBatch: inserted hyperedge without "
+                "vertices or with a vertex out of range");
+        touchHe(id);
+        freeListRemove_(id);   // recycled ids leave the free list
         heVerts[id - 1] = verts;
         heW[id - 1] = b.heInsert[i].weight;
         alive[id - 1] = 1;
         ++aliveCount;
-        delta.newHe.push_back(id);
-
-        // Neighbors: every alive hyperedge sharing a vertex.
-        std::vector<int> nbs;
-        for (int v : verts) {
-            for (int other : v2h[v]) {
-                if (other != id) nbs.push_back(other);
-            }
-        }
-        std::sort(nbs.begin(), nbs.end());
-        nbs.erase(std::unique(nbs.begin(), nbs.end()), nbs.end());
-        for (int nb : nbs) {
-            touchEdge(id, nb, +1);
-            h2h[id - 1].push_back(nb);
-            h2h[nb - 1].push_back(id);
-            // The new row itself is inserted wholesale into the h2h CBST
-            // (with its final neighbor list) by DynamicHypergraph; only
-            // pre-existing rows need a fill. Edges between two new
-            // hyperedges are covered by both new rows.
-            if (newHeSet.find(nb) == newHeSet.end()) {
-                ops.h2hFill.emplace_back(nb, id);
-            }
-            ++h2hPairCount;
-        }
-
+        inc.newHe.push_back(id);
+        inc.newW.push_back(b.heInsert[i].weight);
         for (int v : verts) {
             v2h[v].push_back(id);
             ops.v2hFill.emplace_back(v + 1, id);
+            incidence(v, id, +1);
         }
-        seedPool.push_back(id);
     }
 
-    // ---------------- Net delta + seeds -----------------------------------
-    for (const auto& kv : edgeNet) {
-        if (kv.second == 0) continue;
-        int a = static_cast<int>(kv.first >> 32);
-        int bId = static_cast<int>(kv.first & 0xffffffffu);
-        if (kv.second > 0) {
-            delta.insEdges.push_back(orderedPair(a, bId));
-        } else {
-            delta.delEdges.push_back(orderedPair(a, bId));
-        }
-    }
-    for (int id : delta.deletedAtAnyPoint) {
-        if (!alive[id - 1]) delta.deadHe.push_back(id);
-    }
-    // Recreated nodes may keep identical adjacency but a different weight;
-    // they and their neighbors must be reseeded.
-    for (int id : recreated) {
-        seedPool.push_back(id);
-        for (int nb : h2h[id - 1]) seedPool.push_back(nb);
-    }
+    for (int id : deletedAtAnyPoint)
+        if (!alive[id - 1]) inc.deadHe.push_back(id);
 
-    std::sort(seedPool.begin(), seedPool.end());
-    seedPool.erase(std::unique(seedPool.begin(), seedPool.end()),
-                   seedPool.end());
-    for (int id : seedPool) {
-        if (id >= 1 && id <= maxId() && alive[id - 1] && id != sourceHe) {
-            delta.seeds.push_back(id);
-        }
+    // Pre / post rows of the touched hyperedges, post lengths of the
+    // touched vertices.
+    inc.preOff.assign(1, 0);
+    inc.postOff.assign(1, 0);
+    for (std::size_t t = 0; t < inc.touched.size(); ++t) {
+        const int id = inc.touched[t];
+        inc.preVals.insert(inc.preVals.end(), preRows[t].begin(),
+                           preRows[t].end());
+        inc.preOff.push_back(static_cast<int>(inc.preVals.size()));
+        const std::vector<int>& post = heVerts[id - 1];
+        inc.postVals.insert(inc.postVals.end(), post.begin(), post.end());
+        inc.postOff.push_back(static_cast<int>(inc.postVals.size()));
     }
+    inc.touchedVertexLen.reserve(inc.touchedVertices.size());
+    for (int v : inc.touchedVertices)
+        inc.touchedVertexLen.push_back(static_cast<int>(v2h[v].size()));
 }
 
-std::vector<long long> HostHypergraph::dijkstra(int sourceId) const {
+LineGraphCSR HostHypergraph::lineGraph() const {
     const int m = maxId();
-    std::vector<long long> dist(m, INF);
-    if (sourceId < 1 || sourceId > m || !alive[sourceId - 1]) return dist;
-
-    using QE = std::pair<long long, int>;
-    std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
-    dist[sourceId - 1] = 0;
-    pq.push({0, sourceId});
-    while (!pq.empty()) {
-        auto [d, u] = pq.top();
-        pq.pop();
-        if (d != dist[u - 1]) continue;
-        for (int nb : h2h[u - 1]) {
-            long long nd = d + heW[nb - 1];
-            if (nd < dist[nb - 1]) {
-                dist[nb - 1] = nd;
-                pq.push({nd, nb});
-            }
+    LineGraphCSR lg;
+    lg.numIds = m;
+    lg.offset.assign(static_cast<std::size_t>(m) + 1, 0);
+    // Row of id: union of the incidence lists of its vertices. Two passes
+    // (count, then write) keep the rows in one allocation.
+    auto gather = [&](int id, std::vector<int>& out) {
+        out.clear();
+        if (!alive[id - 1]) return;
+        for (int v : heVerts[id - 1])
+            for (int other : v2h[v])
+                if (other != id) out.push_back(other);
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+    };
+#pragma omp parallel if (m > kParallelMin)
+    {
+        std::vector<int> scratch;
+#pragma omp for schedule(dynamic, 1024)
+        for (int id = 1; id <= m; ++id) {
+            gather(id, scratch);
+            lg.offset[id] = static_cast<long long>(scratch.size());
         }
     }
-    return dist;
+    for (int id = 1; id <= m; ++id) lg.offset[id] += lg.offset[id - 1];
+    lg.nbr.resize(static_cast<std::size_t>(lg.offset[m]));
+#pragma omp parallel if (m > kParallelMin)
+    {
+        std::vector<int> scratch;
+#pragma omp for schedule(dynamic, 1024)
+        for (int id = 1; id <= m; ++id) {
+            gather(id, scratch);
+            std::copy(scratch.begin(), scratch.end(),
+                      lg.nbr.begin() + lg.offset[id - 1]);
+        }
+    }
+    return lg;
 }
 
 std::vector<std::vector<int>> HostHypergraph::bruteForceH2H() const {
@@ -394,7 +344,8 @@ std::vector<std::vector<int>> HostHypergraph::bruteForceH2H() const {
 
 namespace {
 
-int emulateLoop(const HostHypergraph& hg, std::vector<long long>& dist,
+int emulateLoop(const HostHypergraph& hg, const LineGraphCSR& lg,
+                std::vector<long long>& dist,
                 std::vector<int>& parent, std::vector<int> candidates,
                 int maxIterations) {
     const long long INF = HostHypergraph::INF;
@@ -411,7 +362,8 @@ int emulateLoop(const HostHypergraph& hg, std::vector<long long>& dist,
             if (v == source) continue;
             long long best = INF;
             int bestP = -1;
-            for (int p : hg.h2h[v - 1]) {
+            for (long long k = 0; k < lg.degree(v); ++k) {
+                const int p = lg.row(v)[k];
                 long long dp = dist[p - 1];
                 if (dp >= INF / 2) continue;
                 long long cd = dp + hg.heW[v - 1];
@@ -430,7 +382,8 @@ int emulateLoop(const HostHypergraph& hg, std::vector<long long>& dist,
         }
         candidates.clear();
         for (int u : affected) {
-            for (int nb : hg.h2h[u - 1]) {
+            for (long long k = 0; k < lg.degree(u); ++k) {
+                const int nb = lg.row(u)[k];
                 if (nb == source) continue;
                 if (!inCand[nb]) { inCand[nb] = 1; candidates.push_back(nb); }
             }
@@ -441,7 +394,7 @@ int emulateLoop(const HostHypergraph& hg, std::vector<long long>& dist,
 
 } // namespace
 
-int emulateSospRecompute(const HostHypergraph& hg,
+int emulateSospRecompute(const HostHypergraph& hg, const LineGraphCSR& lg,
                          std::vector<long long>& dist,
                          std::vector<int>& parent, int maxIterations) {
     const long long INF = HostHypergraph::INF;
@@ -451,13 +404,15 @@ int emulateSospRecompute(const HostHypergraph& hg,
         dist[hg.sourceHe - 1] = 0;
     }
     std::vector<int> firstCands;
-    for (int nb : hg.h2h[hg.sourceHe - 1]) firstCands.push_back(nb);
-    return emulateLoop(hg, dist, parent, std::move(firstCands),
+    for (long long k = 0; k < lg.degree(hg.sourceHe); ++k)
+        firstCands.push_back(lg.row(hg.sourceHe)[k]);
+    return emulateLoop(hg, lg, dist, parent, std::move(firstCands),
                        maxIterations);
 }
 
-int emulateSospUpdate(const HostHypergraph& hg, std::vector<long long>& dist,
-                      std::vector<int>& parent, const H2HDelta& delta) {
+int emulateSospUpdate(const HostHypergraph& hg, const LineGraphCSR& lg,
+                      std::vector<long long>& dist, std::vector<int>& parent,
+                      const H2HDelta& delta) {
     const long long INF = HostHypergraph::INF;
     const int m = hg.maxId();
     if (static_cast<int>(dist.size()) < m) {
@@ -512,8 +467,10 @@ int emulateSospUpdate(const HostHypergraph& hg, std::vector<long long>& dist,
     };
     for (int id = 1; id <= m; ++id) {
         if (!inv[id] || !hg.alive[id - 1]) continue;
-        for (int p : hg.h2h[id - 1])
+        for (long long k = 0; k < lg.degree(id); ++k) {
+            const int p = lg.row(id)[k];
             if (dist[p - 1] < INF) offer(id, dist[p - 1] + hg.heW[id - 1], p);
+        }
     }
     for (auto [a, b] : delta.insEdges) {
         if (dist[a - 1] < INF) offer(b, dist[a - 1] + hg.heW[b - 1], a);
@@ -523,7 +480,10 @@ int emulateSospUpdate(const HostHypergraph& hg, std::vector<long long>& dist,
         const auto [key, u] = pq.top();
         pq.pop();
         if (key != Key(dist[u - 1], parent[u - 1])) continue;
-        for (int v : hg.h2h[u - 1]) offer(v, dist[u - 1] + hg.heW[v - 1], u);
+        for (long long k = 0; k < lg.degree(u); ++k) {
+            const int v = lg.row(u)[k];
+            offer(v, dist[u - 1] + hg.heW[v - 1], u);
+        }
     }
     return invalidated;
 }

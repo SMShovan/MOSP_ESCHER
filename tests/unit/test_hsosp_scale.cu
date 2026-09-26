@@ -37,12 +37,13 @@ int main() {
         caps.headroomFactor = 1.5;
         caps.extraPayloadInts = 8 << 20;
         DynamicHypergraph dh(g.numVertices, caps);
-        dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
-                    g.targetHe);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(g.rows),
+                                       std::move(g.weights), g.sourceHe,
+                                       g.targetHe);
         HostHypergraph& hg = dh.host();
 
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.5);
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.5);
         hsosp::HsospState st;
         st.allocate(caps.maxHyperedges);
         hsosp::UpdateConfig ucfg;
@@ -73,9 +74,7 @@ int main() {
                 bp.kind = s.kind;
                 bp.seed = 1000 + i;
                 HgBatch batch = generateBatch(hg, gp, bp, {}, {});
-                DynamicHypergraph::BatchResult br = dh.applyBatch(batch);
-                if (!hsosp::applyDeltaToDevice(dev, hg, br.delta))
-                    hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.5);
+                hsosp::applyBatch(dh, dev, batch, 1.5);
                 hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
             }
             LineGraphCSR lg = rebuildLineGraph(hg);

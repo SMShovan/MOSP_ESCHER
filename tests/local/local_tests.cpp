@@ -4,20 +4,26 @@
  *
  * Compiled with plain g++ (see tests/local/Makefile). Validates, over many
  * randomized configurations:
- *   1. bulk h2h build == brute-force line graph;
- *   2. incrementally maintained h2h == rebuilt-from-scratch line graph
- *      after every batch (all four op kinds);
- *   3. the NET H2HDelta applied to the pre-batch adjacency reproduces the
- *      post-batch adjacency (this is exactly what the device CSR does);
+ *   1. HostHypergraph::lineGraph (used to build the device CSR) == the
+ *      brute-force line graph == the oracle's rebuild;
+ *   2. after every batch (all four op kinds) the incidence model is
+ *      consistent (v2h is the transpose of heVerts) and the shipped
+ *      IncidenceBatch describes it (pre / post rows, post lengths);
+ *   3. the GPU's delta rule, run here on the host from the IncidenceBatch
+ *      (candidates from the incidence lists of every changed incidence
+ *      before and after the batch, classified by pre / post overlap),
+ *      gives exactly the difference of the line graphs before and after;
  *   4. the sequential emulation of the device SOSP update matches Dijkstra
- *      after every batch (including disconnections and id recycling).
+ *      and the canonical tree after every batch (including disconnections
+ *      and id recycling).
  *
- * These mirror tests/unit/*.cu which run the same checks through the real
- * ESCHER + CUDA path on the cluster.
+ * The tests in tests/unit/*.cu run the same checks through the real ESCHER
+ * + CUDA path.
  */
 
 #include "HostHypergraph.hpp"
 #include "HypergraphGen.hpp"
+#include "HypergraphOracle.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -41,12 +47,81 @@ static int failures = 0;
         }                                                                     \
     } while (0)
 
-static std::vector<std::set<int>> asSets(
-    const std::vector<std::vector<int>>& rows) {
-    std::vector<std::set<int>> out(rows.size());
-    for (std::size_t i = 0; i < rows.size(); ++i)
-        out[i] = std::set<int>(rows[i].begin(), rows[i].end());
+static std::vector<std::vector<int>> rowsOf(const LineGraphCSR& lg) {
+    std::vector<std::vector<int>> out(lg.numIds);
+    for (int id = 1; id <= lg.numIds; ++id)
+        out[id - 1].assign(lg.row(id), lg.row(id) + lg.degree(id));
     return out;
+}
+
+static bool overlap(const int* a, int la, const int* b, int lb) {
+    int i = 0, j = 0;
+    while (i < la && j < lb) {
+        if (a[i] == b[j]) return true;
+        if (a[i] < b[j]) ++i;
+        else ++j;
+    }
+    return false;
+}
+
+/** Host version of the GPU delta rule (hsospDelta.cu deriveDelta). */
+static H2HDelta deriveOnHost(const std::vector<std::vector<int>>& preV2h,
+                             const HostHypergraph& hg,
+                             const std::vector<std::vector<int>>& preHeVerts,
+                             const IncidenceBatch& inc) {
+    // Net sign per (vertex, hyperedge).
+    std::map<std::uint64_t, int> net;
+    for (std::size_t i = 0; i < inc.incKey.size(); ++i)
+        net[inc.incKey[i]] += inc.incSign[i];
+    std::set<std::pair<int, int>> cand;
+    for (auto [key, sign] : net) {
+        if (sign == 0) continue;
+        const int v = static_cast<int>(key >> 32);
+        const int h = static_cast<int>(key & 0xffffffffu);
+        for (int o : preV2h[v])
+            if (o != h) cand.emplace(std::min(h, o), std::max(h, o));
+        for (int o : hg.v2h[v])
+            if (o != h) cand.emplace(std::min(h, o), std::max(h, o));
+    }
+    auto preRow = [&](int id) -> const std::vector<int>& {
+        static const std::vector<int> empty;
+        return id <= static_cast<int>(preHeVerts.size()) ? preHeVerts[id - 1]
+                                                         : empty;
+    };
+    auto postRow = [&](int id) -> const std::vector<int>& {
+        static const std::vector<int> empty;
+        return hg.alive[id - 1] ? hg.heVerts[id - 1] : empty;
+    };
+    H2HDelta d;
+    for (auto [a, b] : cand) {
+        const auto &pa = preRow(a), &pb = preRow(b);
+        const auto &qa = postRow(a), &qb = postRow(b);
+        const bool pre = overlap(pa.data(), static_cast<int>(pa.size()),
+                                 pb.data(), static_cast<int>(pb.size()));
+        const bool post = overlap(qa.data(), static_cast<int>(qa.size()),
+                                  qb.data(), static_cast<int>(qb.size()));
+        if (post && !pre) d.insEdges.emplace_back(a, b);
+        if (pre && !post) d.delEdges.emplace_back(a, b);
+    }
+    return d;
+}
+
+/** Distances and 1-based parents against the oracle (canonical tree). */
+static void checkAgainstOracle(const HostHypergraph& hg,
+                               const LineGraphCSR& lg,
+                               const std::vector<long long>& dist,
+                               const std::vector<int>& parent, int cfg,
+                               int bi) {
+    std::vector<int> parent0(parent.size());
+    for (std::size_t i = 0; i < parent.size(); ++i)
+        parent0[i] = parent[i] >= 1 ? parent[i] - 1 : -1;
+    SospCheck c = checkSosp(hg, lg, referenceDistances(hg, lg, hg.sourceHe),
+                            dist, parent0);
+    CHECK(c.ok(),
+          "cfg %d batch %d: %lld distance mismatches (first he %d: got %lld "
+          "want %lld), %lld parent errors",
+          cfg, bi, c.distMismatches, c.firstBadId, c.firstGot, c.firstWant,
+          c.parentErrors);
 }
 
 int main() {
@@ -69,27 +144,22 @@ int main() {
 
         GeneratedHypergraph g = generateHypergraph(gp);
         HostHypergraph hg;
-        {
-            auto rows = g.rows;       // keep a copy for the build check
-            auto ws = g.weights;
-            hg.buildFrom(g.numVertices, std::move(rows), std::move(ws));
-        }
+        hg.buildFrom(g.numVertices, std::move(g.rows), std::move(g.weights));
         hg.sourceHe = g.sourceHe;
         hg.targetHe = g.targetHe;
 
-        // ---- 1. build == brute force -----------------------------------
-        auto bf = asSets(hg.bruteForceH2H());
-        auto cur = asSets(hg.h2h);
-        CHECK(bf == cur, "cfg %d: bulk h2h != brute force", cfg);
+        // ---- 1. line graph == brute force == oracle rebuild ------------
+        LineGraphCSR lg = hg.lineGraph();
+        CHECK(rowsOf(lg) == hg.bruteForceH2H(),
+              "cfg %d: lineGraph != brute force", cfg);
+        CHECK(rowsOf(lg) == rowsOf(rebuildLineGraph(hg)),
+              "cfg %d: lineGraph != oracle rebuild", cfg);
 
         // Initial SOSP state via recompute (the device does the same).
         std::vector<long long> dist;
         std::vector<int> parent;
-        emulateSospRecompute(hg, dist, parent, hg.maxId() + 2);
-        {
-            auto truth = hg.dijkstra(hg.sourceHe);
-            CHECK(truth == dist, "cfg %d: initial recompute != dijkstra", cfg);
-        }
+        emulateSospRecompute(hg, lg, dist, parent, hg.maxId() + 2);
+        checkAgainstOracle(hg, lg, dist, parent, cfg, -1);
 
         // ---- batches ----------------------------------------------------
         const int BATCHES = 4;
@@ -111,79 +181,86 @@ int main() {
             std::vector<int> finalIds =
                 hg.reserveIds(static_cast<int>(batch.heInsert.size()));
 
-            // Pre-batch adjacency snapshot for the delta-replay check.
-            auto preH2h = asSets(hg.h2h);
+            const LineGraphCSR pre = lg;
+            const auto preV2h = hg.v2h;
+            std::vector<std::vector<int>> preHeVerts(hg.maxId());
+            for (int id = 1; id <= hg.maxId(); ++id)
+                if (hg.alive[id - 1]) preHeVerts[id - 1] = hg.heVerts[id - 1];
 
-            H2HDelta delta;
+            IncidenceBatch inc;
             EscherHorizOps ops;
-            hg.applyBatch(batch, finalIds, delta, ops);
+            hg.applyBatch(batch, finalIds, inc, ops);
             ++totalBatches;
+            lg = hg.lineGraph();
 
-            // ---- 2. incremental == rebuilt ------------------------------
-            auto bf2 = asSets(hg.bruteForceH2H());
-            auto cur2 = asSets(hg.h2h);
-            CHECK(bf2 == cur2, "cfg %d batch %d: incremental h2h broke", cfg,
-                  bi);
-
-            // ---- 3. delta replay reproduces post-state ------------------
+            // ---- 2. incidence model and the shipped batch --------------
             {
-                auto replay = preH2h;
-                replay.resize(hg.maxId());
-                for (auto [a, b] : delta.delEdges) {
-                    replay[a - 1].erase(b);
-                    replay[b - 1].erase(a);
+                std::vector<std::vector<int>> v2h(hg.numVertices);
+                for (int id = 1; id <= hg.maxId(); ++id)
+                    if (hg.alive[id - 1])
+                        for (int v : hg.heVerts[id - 1]) v2h[v].push_back(id);
+                bool same = true;
+                for (int v = 0; v < hg.numVertices; ++v) {
+                    std::vector<int> got = hg.v2h[v];
+                    std::sort(got.begin(), got.end());
+                    same = same && got == v2h[v];
                 }
-                for (auto [a, b] : delta.insEdges) {
-                    replay[a - 1].insert(b);
-                    replay[b - 1].insert(a);
+                CHECK(same, "cfg %d batch %d: v2h != transpose of heVerts",
+                      cfg, bi);
+                for (std::size_t t = 0; t < inc.touched.size(); ++t) {
+                    const int id = inc.touched[t];
+                    std::vector<int> preR(inc.preVals.begin() + inc.preOff[t],
+                                          inc.preVals.begin() +
+                                              inc.preOff[t + 1]);
+                    std::vector<int> postR(
+                        inc.postVals.begin() + inc.postOff[t],
+                        inc.postVals.begin() + inc.postOff[t + 1]);
+                    const std::vector<int> wantPre =
+                        id <= static_cast<int>(preHeVerts.size())
+                            ? preHeVerts[id - 1]
+                            : std::vector<int>{};
+                    const std::vector<int> wantPost =
+                        hg.alive[id - 1] ? hg.heVerts[id - 1]
+                                         : std::vector<int>{};
+                    CHECK(preR == wantPre && postR == wantPost,
+                          "cfg %d batch %d: shipped rows of he %d wrong", cfg,
+                          bi, id);
                 }
-                CHECK(replay == cur2,
-                      "cfg %d batch %d: delta replay != post adjacency", cfg,
-                      bi);
+                for (std::size_t i = 0; i < inc.touchedVertices.size(); ++i)
+                    CHECK(inc.touchedVertexLen[i] ==
+                              static_cast<int>(
+                                  hg.v2h[inc.touchedVertices[i]].size()),
+                          "cfg %d batch %d: post length of vertex %d wrong",
+                          cfg, bi, inc.touchedVertices[i]);
             }
 
-            // ---- pair-count bookkeeping ---------------------------------
-            long long pairs = 0;
-            for (auto& s : cur2) pairs += static_cast<long long>(s.size());
-            CHECK(pairs / 2 == hg.h2hPairCount,
-                  "cfg %d batch %d: pair count %lld != tracked %lld", cfg, bi,
-                  pairs / 2, hg.h2hPairCount);
-
-            // ---- 4. dynamic update == dijkstra --------------------------
-            emulateSospUpdate(hg, dist, parent, delta);
-            auto truth = hg.dijkstra(hg.sourceHe);
-            for (int id = 1; id <= hg.maxId(); ++id) {
-                if (truth[id - 1] != dist[id - 1]) {
-                    CHECK(false,
-                          "cfg %d batch %d: dist mismatch at he %d "
-                          "(got %lld want %lld) kind=%s place=%s",
-                          cfg, bi, id, dist[id - 1], truth[id - 1],
-                          toString(bp.kind), toString(bp.placement));
-                    break;
-                }
+            // ---- 3. delta rule == difference of the line graphs --------
+            H2HDelta delta = lineGraphDelta(pre, lg);
+            {
+                H2HDelta derived = deriveOnHost(preV2h, hg, preHeVerts, inc);
+                std::sort(derived.insEdges.begin(), derived.insEdges.end());
+                std::sort(derived.delEdges.begin(), derived.delEdges.end());
+                CHECK(derived.insEdges == delta.insEdges &&
+                          derived.delEdges == delta.delEdges,
+                      "cfg %d batch %d: derived delta (+%zu -%zu) != line "
+                      "graph difference (+%zu -%zu)",
+                      cfg, bi, derived.insEdges.size(),
+                      derived.delEdges.size(), delta.insEdges.size(),
+                      delta.delEdges.size());
             }
 
-            // Parent consistency: dist[v] == dist[parent] + w[v].
-            for (int id = 1; id <= hg.maxId(); ++id) {
-                if (id == hg.sourceHe || !hg.alive[id - 1]) continue;
-                if (dist[id - 1] >= HostHypergraph::INF / 2) continue;
-                int p = parent[id - 1];
-                CHECK(p >= 1 && p <= hg.maxId(),
-                      "cfg %d batch %d: reachable he %d has no parent", cfg,
-                      bi, id);
-                if (p >= 1 && p <= hg.maxId()) {
-                    CHECK(dist[id - 1] == dist[p - 1] + hg.heW[id - 1],
-                          "cfg %d batch %d: parent invariant broken at %d",
-                          cfg, bi, id);
-                }
-            }
+            // ---- 4. dynamic update == dijkstra (canonical tree) --------
+            delta.newHe = inc.newHe;
+            delta.deadHe = inc.deadHe;
+            emulateSospUpdate(hg, lg, dist, parent, delta);
+            checkAgainstOracle(hg, lg, dist, parent, cfg, bi);
         }
     }
 
     // ---- forced disconnection scenario ---------------------------------
     {
         // Two pools joined by a single bridge hyperedge; deleting the
-        // bridge must drive the far side to INF via the fallback path.
+        // bridge must drive the far side to INF.
         HostHypergraph hg;
         std::vector<std::vector<int>> rows = {
             {0},          // 1: virtual source {s}
@@ -199,24 +276,29 @@ int main() {
         hg.sourceHe = 1;
         hg.targetHe = 7;
 
+        LineGraphCSR lg = hg.lineGraph();
         std::vector<long long> dist;
         std::vector<int> parent;
-        emulateSospRecompute(hg, dist, parent, 64);
+        emulateSospRecompute(hg, lg, dist, parent, 64);
         CHECK(dist[6] == 5 + 7 + 3 + 11 + 2 + 0,
               "forced: pre-delete target dist wrong (%lld)", dist[6]);
 
         HgBatch batch;
         batch.heDelete.push_back(4);
-        H2HDelta delta;
+        IncidenceBatch inc;
         EscherHorizOps ops;
-        hg.applyBatch(batch, {}, delta, ops);
-        emulateSospUpdate(hg, dist, parent, delta);
+        const LineGraphCSR pre = lg;
+        hg.applyBatch(batch, {}, inc, ops);
+        lg = hg.lineGraph();
+        H2HDelta delta = lineGraphDelta(pre, lg);
+        delta.newHe = inc.newHe;
+        delta.deadHe = inc.deadHe;
+        emulateSospUpdate(hg, lg, dist, parent, delta);
         CHECK(dist[4] >= HostHypergraph::INF / 2 &&
                   dist[5] >= HostHypergraph::INF / 2 &&
                   dist[6] >= HostHypergraph::INF / 2,
               "forced: disconnected side not INF");
-        auto truth = hg.dijkstra(hg.sourceHe);
-        CHECK(truth == dist, "forced: update != dijkstra after disconnect");
+        checkAgainstOracle(hg, lg, dist, parent, -1, 0);
     }
 
     std::printf("local_tests: %d configs, %d batches, "

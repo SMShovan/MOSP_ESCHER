@@ -8,6 +8,7 @@
  */
 
 #include "hsosp.cuh"
+#include "hsospInternal.cuh"
 
 #include <cub/cub.cuh>
 #include <thrust/iterator/transform_iterator.h>
@@ -20,16 +21,7 @@
 namespace escher_mosp {
 namespace hsosp {
 
-#define HSOSP_CUDA_CHECK(call)                                                \
-    do {                                                                      \
-        cudaError_t err__ = (call);                                           \
-        if (err__ != cudaSuccess) {                                           \
-            throw std::runtime_error(std::string("CUDA error: ") +            \
-                                     cudaGetErrorString(err__) + " at " +     \
-                                     __FILE__ + ":" +                         \
-                                     std::to_string(__LINE__));               \
-        }                                                                     \
-    } while (0)
+using detail::gridFor;
 
 namespace {
 
@@ -253,9 +245,6 @@ __global__ void countMismatchesKernel(const long long* a, const long long* b,
     }
 }
 
-int gridFor(long long n, int block) {
-    return static_cast<int>((n + block - 1) / block);
-}
 
 // ---------------------------------------------------------------------------
 // Incremental update kernels (hsospUpdate)
@@ -565,11 +554,13 @@ void DeviceDelta::free() {
     *this = DeviceDelta{};
 }
 
-// free() releases the graph arrays only: buildDeviceH2H (also used to
-// rebuild after a tail overflow) keeps the last delta for hsospUpdate.
+// free() releases the graph arrays only: detail::buildCsr (also used to
+// rebuild after a tail overflow) keeps the last delta for hsospUpdate and
+// the incidence mirror.
 DeviceH2H::~DeviceH2H() {
     free();
     delta.free();
+    inc.free();
 }
 
 DeviceH2H::DeviceH2H(DeviceH2H&& o) noexcept { *this = std::move(o); }
@@ -592,6 +583,7 @@ DeviceH2H& DeviceH2H::operator=(DeviceH2H&& o) noexcept {
         delta.free();
         delta = o.delta;
         o.delta = DeviceDelta{};
+        inc = std::move(o.inc);
         o.d_rowStart = nullptr;
         o.d_deg = nullptr;
         o.d_cap = nullptr;
@@ -606,11 +598,20 @@ DeviceH2H& DeviceH2H::operator=(DeviceH2H&& o) noexcept {
 long long DeviceH2H::deviceBytes() const {
     return static_cast<long long>(maxNodes) *
                (sizeof(long long) + 2 * sizeof(int) + sizeof(long long)) +
-           capEntries * sizeof(int) + sizeof(unsigned long long) + sizeof(int);
+           capEntries * sizeof(int) + sizeof(unsigned long long) +
+           sizeof(int) + inc.deviceBytes();
 }
 
-void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
+void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg,
+                    const LineGraphCSR& lg, int maxNodes,
                     double entryHeadroom) {
+    detail::buildCsr(dev, hg, lg, maxNodes, entryHeadroom);
+    dev.inc.build(hg, maxNodes, entryHeadroom);
+}
+
+void detail::buildCsr(DeviceH2H& dev, const HostHypergraph& hg,
+                      const LineGraphCSR& lg, int maxNodes,
+                      double entryHeadroom) {
     const int m = hg.maxId();
     if (m > maxNodes) {
         throw std::runtime_error(
@@ -635,7 +636,7 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
     dev.numEntries = 0;
     for (int id = 1; id <= m; ++id) {
         const int d =
-            hg.alive[id - 1] ? static_cast<int>(hg.h2h[id - 1].size()) : 0;
+            hg.alive[id - 1] ? static_cast<int>(lg.degree(id)) : 0;
         dev.numEntries += d;
         const int c = rowCapacityFor(d);
         rowStart[id - 1] = cursor;
@@ -654,8 +655,8 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
     for (int id = 1; id <= m; ++id) {
         if (!hg.alive[id - 1]) continue;
         long long base = rowStart[id - 1];
-        const auto& nbs = hg.h2h[id - 1];
-        for (std::size_t e = 0; e < nbs.size(); ++e) {
+        const int* nbs = lg.row(id);
+        for (long long e = 0; e < lg.degree(id); ++e) {
             colInd[base + e] = nbs[e] - 1;   // device nodes are 0-based
         }
     }
@@ -691,7 +692,7 @@ void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
     HSOSP_CUDA_CHECK(cudaMemset(dev.d_overflowFlag, 0, sizeof(int)));
 }
 
-namespace {
+namespace detail {
 
 /**
  * Applies the pairs in dev.delta to the CSR on the device: directed keys
@@ -703,10 +704,12 @@ bool applyDeltaPairs(DeviceH2H& dev) {
     DeviceDelta& dd = dev.delta;
     const int block = 256;
     const long long nPairs = static_cast<long long>(dd.numDel) + dd.numIns;
+    dd.d_sortedKeys = nullptr;
+    dd.numSortedKeys = 0;
     if (nPairs > 0) {
         const long long nKeys = 2 * nPairs;
         if (nKeys > std::numeric_limits<int>::max())
-            throw std::runtime_error("applyDeltaToDevice: batch too large");
+            throw std::runtime_error("applyBatch: batch too large");
         dd.reserveKeys(nKeys);
         expandDeltaKeysKernel<<<gridFor(nPairs, block), block>>>(
             dd.d_pairs, dd.numDel, static_cast<int>(nPairs), dd.d_keys);
@@ -732,6 +735,8 @@ bool applyDeltaPairs(DeviceH2H& dev) {
         HSOSP_CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
             dd.d_temp, dd.tempBytes, keys, n, 0, endBit));
         const unsigned long long* sorted = keys.Current();
+        dd.d_sortedKeys = sorted;
+        dd.numSortedKeys = nKeys;
         auto rows = thrust::make_transform_iterator(sorted, KeyRow());
         HSOSP_CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
             dd.d_temp, dd.tempBytes, rows, dd.d_rows, dd.d_rowLen,
@@ -764,56 +769,7 @@ bool applyDeltaPairs(DeviceH2H& dev) {
     return overflow == 0;
 }
 
-} // namespace
-
-bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
-                        const H2HDelta& delta) {
-    // Grow the node range for fresh ids introduced by the batch.
-    const int m = hg.maxId();
-    if (m > dev.maxNodes) {
-        throw std::runtime_error(
-            "applyDeltaToDevice: node capacity exceeded; raise maxHyperedges");
-    }
-    dev.numNodes = m;
-    dev.numEntries += 2LL * (static_cast<long long>(delta.insEdges.size()) -
-                             static_cast<long long>(delta.delEdges.size()));
-
-    // Upload the delta once (0-based indices); it stays on the device for
-    // the CSR apply and for hsospUpdate.
-    DeviceDelta& dd = dev.delta;
-    std::vector<int2> pairs;
-    pairs.reserve(delta.delEdges.size() + delta.insEdges.size());
-    for (auto [a, b] : delta.delEdges) pairs.push_back(make_int2(a - 1, b - 1));
-    for (auto [a, b] : delta.insEdges) pairs.push_back(make_int2(a - 1, b - 1));
-    std::vector<int> ids;
-    std::vector<long long> newW;
-    ids.reserve(delta.newHe.size() + delta.deadHe.size());
-    newW.reserve(delta.newHe.size());
-    for (int id : delta.newHe) {
-        ids.push_back(id - 1);
-        newW.push_back(hg.heW[id - 1]);
-    }
-    for (int id : delta.deadHe) ids.push_back(id - 1);
-    dd.reserve(static_cast<long long>(pairs.size()),
-               static_cast<long long>(ids.size()));
-    if (!pairs.empty())
-        HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_pairs, pairs.data(),
-                                    sizeof(int2) * pairs.size(),
-                                    cudaMemcpyHostToDevice));
-    if (!ids.empty())
-        HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_ids, ids.data(),
-                                    sizeof(int) * ids.size(),
-                                    cudaMemcpyHostToDevice));
-    if (!newW.empty())
-        HSOSP_CUDA_CHECK(cudaMemcpy(dd.d_newW, newW.data(),
-                                    sizeof(long long) * newW.size(),
-                                    cudaMemcpyHostToDevice));
-    dd.numDel = static_cast<int>(delta.delEdges.size());
-    dd.numIns = static_cast<int>(delta.insEdges.size());
-    dd.numNew = static_cast<int>(delta.newHe.size());
-    dd.numDead = static_cast<int>(delta.deadHe.size());
-    return applyDeltaPairs(dev);
-}
+} // namespace detail
 
 std::vector<std::vector<int>> downloadRows(const DeviceH2H& dev, int m) {
     std::vector<long long> rowStart(m);

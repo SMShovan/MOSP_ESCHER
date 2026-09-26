@@ -60,12 +60,13 @@ int main() {
         caps.maxHyperedges = static_cast<int>(g.rows.size()) + 2048;
         caps.headroomFactor = 2.0;
         DynamicHypergraph dh(g.numVertices, caps);
-        dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
-                    g.targetHe);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(g.rows),
+                                       std::move(g.weights), g.sourceHe,
+                                       g.targetHe);
         HostHypergraph& hg = dh.host();
 
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.4);
         hsosp::HsospState st;
         st.allocate(caps.maxHyperedges);
 
@@ -81,10 +82,7 @@ int main() {
             bp.seed = meta();
             HgBatch batch = generateBatch(hg, gp, bp, {}, {});
 
-            DynamicHypergraph::BatchResult br = dh.applyBatch(batch);
-            if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
-                hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
-            }
+            hsosp::applyBatch(dh, dev, batch, 1.4);
             // Every other batch with a zero budget: the fallback recompute
             // (taken unless the batch needs no propagation) must give the
             // same canonical result.
@@ -107,21 +105,18 @@ int main() {
         DynamicHypergraph::Caps caps;
         caps.maxHyperedges = 32;
         DynamicHypergraph dh(7, caps);
-        dh.bulkLoad(std::move(rows), std::move(ws), 1, 7);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(rows), std::move(ws), 1, 7);
         HostHypergraph& hg = dh.host();
 
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.4);
         hsosp::HsospState st;
         st.allocate(caps.maxHyperedges);
         hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
 
         HgBatch batch;
         batch.heDelete.push_back(4);   // the bridge hyperedge
-        DynamicHypergraph::BatchResult br = dh.applyBatch(batch);
-        if (!hsosp::applyDeltaToDevice(dev, hg, br.delta)) {
-            hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
-        }
+        hsosp::applyBatch(dh, dev, batch, 1.4);
         hsosp::hsospUpdate(dev, st, hg.sourceHe, ucfg);
         distsMatch(st, hg, "disconnect", 9999);
     }
@@ -146,11 +141,12 @@ int main() {
         DynamicHypergraph::Caps caps;
         caps.maxHyperedges = static_cast<int>(g.rows.size()) + 64;
         DynamicHypergraph dh(g.numVertices, caps);
-        dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
-                    g.targetHe);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(g.rows),
+                                       std::move(g.weights), g.sourceHe,
+                                       g.targetHe);
         HostHypergraph& hg = dh.host();
         hsosp::DeviceH2H dev;
-        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.4);
         hsosp::HsospState st;
         st.allocate(caps.maxHyperedges);
         hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
@@ -204,7 +200,7 @@ int main() {
             dh.bulkLoad({{0}, {0, 1}, {1, 2}, {3}}, {0, 5, 4, 0}, 1, 4);
             HgBatch b;
             b.heInsert.push_back({{2, 3}, 0});
-            dh.applyBatch(b);
+            dh.beginBatch(b);
         });
     }
 

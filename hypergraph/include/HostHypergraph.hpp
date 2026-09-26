@@ -3,19 +3,20 @@
 
 /**
  * @file HostHypergraph.hpp
- * @brief Host-side model of a dynamic weighted hypergraph and its h2h
- *        (hyperedge-to-hyperedge / line graph) view.
+ * @brief Host-side incidence model of a dynamic weighted hypergraph.
  *
- * This is the authoritative *shadow* that mirrors the ESCHER CBSTs, in the
- * same spirit as DynamicGraph's host shadow for ordinary graphs: every
- * dynamic update flows through the ESCHER structures (see
- * DynamicHypergraph), while reads (CSR materialization, delta extraction,
- * ground truth) are served from this linear-time host model.
+ * The host keeps the small, branchy part of the state: the sorted vertex
+ * list of every hyperedge (heVerts), the vertex -> hyperedge incidence
+ * lists (v2h), weights, liveness and the free-id list. It validates each
+ * batch and turns it into incidence changes (IncidenceBatch). The line
+ * graph (h2h) itself is not kept on the host: its net change for a batch
+ * is derived on the GPU from the incidence changes (see hsosp.cuh), and the
+ * host builds it only at load (lineGraph()).
  *
- * Everything in this translation unit is plain C++ (no CUDA), so the
- * correctness-critical delta rules are unit-testable off-GPU.
+ * Everything in this translation unit is plain C++ (no CUDA), so it is
+ * unit-testable off-GPU (tests/local).
  *
- * Model (from the project meeting):
+ * Model (from the project meeting and the paper):
  *  - Hyperedge h_i carries one positive weight w_i >= 1 (the virtual
  *    source and target hyperedges: 0). DynamicHypergraph rejects other
  *    weights; with a zero-weight pair cut off from the source the update
@@ -62,7 +63,36 @@ struct HgBatch {
     }
 };
 
-/** Net structural effect of a batch on the h2h line graph. */
+/**
+ * Incidence changes of one batch (what the host ships to the GPU, which
+ * derives the net line-graph delta from them).
+ */
+struct IncidenceBatch {
+    /// (vertex << 32 | heId) of every incidence added (+1) or removed (-1);
+    /// a pair may appear more than once (e.g. removed, then re-added).
+    std::vector<std::uint64_t> incKey;
+    std::vector<int> incSign;
+    /// Hyperedges whose vertex list changed (unique ids), with their vertex
+    /// lists before and after the batch (CSR; dead = empty).
+    std::vector<int> touched;
+    std::vector<int> preOff, preVals;
+    std::vector<int> postOff, postVals;
+    /// Vertices whose incidence list changed (unique), with the length of
+    /// their list after the batch.
+    std::vector<int> touchedVertices;
+    std::vector<int> touchedVertexLen;
+    /// Final ids of hyperedges inserted by the batch (includes recycled
+    /// ids) and their weights.
+    std::vector<int> newHe;
+    std::vector<long long> newW;
+    /// Ids deleted by the batch and still dead at the end of it.
+    std::vector<int> deadHe;
+    /// Number of batch ops skipped as no-ops (dead target, missing vertex...).
+    int skippedOps = 0;
+};
+
+/** Net structural effect of a batch on the h2h line graph (test oracles
+ *  and the host emulation of the update). */
 struct H2HDelta {
     /// Undirected pairs (a,b), a<b, that exist after the batch but not before.
     std::vector<std::pair<int, int>> insEdges;
@@ -72,30 +102,33 @@ struct H2HDelta {
     std::vector<int> newHe;
     /// Ids deleted by the batch and still dead at the end of it.
     std::vector<int> deadHe;
-    /// Ids deleted at some point during the batch (superset of deadHe).
-    std::vector<int> deletedAtAnyPoint;
-    /// Seed candidates for the SOSP update: every alive node whose distance
-    /// may have changed (endpoints of touched edges, new nodes, recreated
-    /// nodes). Excludes the source node and dead nodes.
-    std::vector<int> seeds;
-    /// Number of batch ops skipped as no-ops (dead target, missing vertex...).
-    int skippedOps = 0;
 };
 
-/** Batched instructions for the ESCHER routing layer, grouped by the phase
- *  in which they must execute. Values follow the CBST payload conventions:
- *  hyperedge ids stored as-is (1-based), vertex ids stored +1, so payload
- *  values are always strictly positive (ESCHER treats 0 / INT_MIN as
- *  empty / sentinel). */
+/** Batched instructions for the ESCHER routing layer. Values follow the
+ *  CBST payload conventions: hyperedge ids stored as-is (1-based), vertex
+ *  ids stored +1, so payload values are always strictly positive (ESCHER
+ *  treats 0 / INT_MIN as empty / sentinel). The h2h CBST operations come
+ *  from the line-graph delta (DynamicHypergraph::finishBatch). */
 struct EscherHorizOps {
-    // Phase A+B (deletion-driven), execute before fills:
+    // Deletion-driven, execute before fills:
     std::vector<std::pair<int, int>> v2hUnfill;  ///< (vertex+1, heId)
     std::vector<std::pair<int, int>> h2vUnfill;  ///< (heId, vertex+1)
-    std::vector<std::pair<int, int>> h2hUnfill;  ///< (rowHeId, valueHeId)
-    // Phase C+D (insertion-driven), execute after unfills:
+    // Insertion-driven, execute after unfills:
     std::vector<std::pair<int, int>> v2hFill;    ///< (vertex+1, heId)
     std::vector<std::pair<int, int>> h2vFill;    ///< (heId, vertex+1)
-    std::vector<std::pair<int, int>> h2hFill;    ///< (rowHeId, valueHeId)
+};
+
+/** Line graph in CSR form; row (id - 1) lists the ids of the alive
+ *  hyperedges sharing a vertex with alive hyperedge id, sorted ascending. */
+struct LineGraphCSR {
+    int numIds = 0;                  ///< == hg.maxId() when built
+    std::vector<long long> offset;   ///< numIds + 1 entries
+    std::vector<int> nbr;            ///< 1-based hyperedge ids
+
+    long long degree(int id) const { return offset[id] - offset[id - 1]; }
+    const int* row(int id) const { return nbr.data() + offset[id - 1]; }
+    long long numEntries() const { return offset.empty() ? 0 : offset.back(); }
+    bool adjacent(int a, int b) const;
 };
 
 class HostHypergraph {
@@ -110,19 +143,19 @@ public:
     std::vector<std::uint8_t>     alive;
 
     std::vector<int> freeIds;               ///< dead ids available for reuse (LIFO)
+    std::vector<int> freePos;               ///< position of an id in freeIds (-1: none)
 
     std::vector<std::vector<int>> v2h;      ///< per vertex: alive he ids (unsorted)
-    std::vector<std::vector<int>> h2h;      ///< per (heId-1): alive neighbor he ids (unsorted)
 
-    long long h2hPairCount = 0;             ///< number of undirected h2h pairs
+    long long h2hPairCount = 0;             ///< undirected line-graph pairs
     int aliveCount = 0;
 
     int sourceHe = 0;                       ///< virtual source hyperedge id
     int targetHe = 0;                       ///< virtual target hyperedge id
 
     /** Bulk build from rows (vertex lists) + weights. Row i becomes
-     *  hyperedge id i+1. Rows are sorted in place. Builds v2h and the full
-     *  h2h line graph. */
+     *  hyperedge id i+1. Rows are sorted in place. Builds v2h and counts the
+     *  line-graph pairs. */
     void buildFrom(int nVerts,
                    std::vector<std::vector<int>>&& rows,
                    std::vector<long long>&& weights);
@@ -133,15 +166,16 @@ public:
      *  fresh ids past maxId(). Does not commit anything. */
     std::vector<int> reserveIds(int count) const;
 
-    /** Apply a batch. @p finalIds are the ids to use for b.heInsert (one per
-     *  entry; from reserveIds or from the ESCHER insert mapping). Fills
-     *  @p delta and @p ops. */
+    /** Apply a batch to the incidence model. @p finalIds are the ids to use
+     *  for b.heInsert (one per entry; from reserveIds or from the ESCHER
+     *  insert mapping). Fills @p inc (for the GPU line-graph delta) and
+     *  @p ops (ESCHER h2v / v2h operations). */
     void applyBatch(const HgBatch& b, const std::vector<int>& finalIds,
-                    H2HDelta& delta, EscherHorizOps& ops);
+                    IncidenceBatch& inc, EscherHorizOps& ops);
 
-    /** Ground-truth node-weighted SSSP on the current h2h graph.
-     *  Returns dist indexed by (heId-1); INF for dead / unreachable. */
-    std::vector<long long> dijkstra(int sourceId) const;
+    /** The current line graph (per-hyperedge union of the incidence lists,
+     *  OpenMP-parallel). */
+    LineGraphCSR lineGraph() const;
 
     /** Brute-force rebuild of the h2h adjacency from heVerts (test oracle).
      *  Returns per-(id-1) sorted neighbor lists. */
@@ -151,8 +185,8 @@ public:
     long long h2hEntryCount() const { return 2 * h2hPairCount; }
 
 private:
-    bool overlaps_(int a, int b) const;          // heVerts intersection test
-    static void removeValue_(std::vector<int>& v, int value);
+    void freeListRemove_(int id);
+    void freeListPush_(int id);
 };
 
 /**
@@ -163,17 +197,17 @@ private:
  * every new, recreated or dead node (distance INF), pull the best
  * (distance, id) for the invalidated nodes, relax both directions of the
  * inserted pairs, then propagate the decreases (in Dijkstra order; the
- * device pushes in frontiers, which gives the same result). Parents are
- * 1-based ids (-1 = none) and ties go to the lowest id. Returns the number
- * of invalidated nodes.
+ * device pushes in frontiers, which gives the same result). @p lg is the
+ * post-batch line graph. Parents are 1-based ids (-1 = none) and ties go
+ * to the lowest id. Returns the number of invalidated nodes.
  */
-int emulateSospUpdate(const HostHypergraph& hg,
+int emulateSospUpdate(const HostHypergraph& hg, const LineGraphCSR& lg,
                       std::vector<long long>& dist,
                       std::vector<int>& parent,
                       const H2HDelta& delta);
 
 /** Sequential emulation of recompute-from-blank (static baseline). */
-int emulateSospRecompute(const HostHypergraph& hg,
+int emulateSospRecompute(const HostHypergraph& hg, const LineGraphCSR& lg,
                          std::vector<long long>& dist,
                          std::vector<int>& parent,
                          int maxIterations);

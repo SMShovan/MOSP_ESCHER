@@ -107,7 +107,7 @@ HYPERGRAPH_SRCS := \
     hypergraph/src/HypergraphGen.cpp \
     hypergraph/src/HypergraphOracle.cpp \
     hypergraph/src/DynamicHypergraph.cpp
-HSOSP_DEV_SRCS  := hsosp/src/hsospDevice.cu
+HSOSP_DEV_SRCS  := hsosp/src/hsospDevice.cu hsosp/src/hsospDelta.cu
 
 HYPERGRAPH_OBJS := $(HYPERGRAPH_SRCS:%=$(BUILDDIR)/%.o)
 HSOSP_DEV_OBJS  := $(HSOSP_DEV_SRCS:%=$(BUILDDIR)/%.o)

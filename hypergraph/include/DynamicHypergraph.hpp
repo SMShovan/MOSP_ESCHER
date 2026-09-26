@@ -32,6 +32,7 @@
  * through the ESCHER structures and is timed as data structure maintenance.
  */
 
+#include <cstdint>
 #include <iosfwd>
 #include <memory>
 #include <vector>
@@ -51,10 +52,12 @@ public:
         long long extraPayloadInts = 1 << 20;
     };
 
+    /** State of a batch between beginBatch and finishBatch. */
     struct BatchResult {
-        double escherMs = 0.0;   ///< CBST maintenance (all three mappings)
-        double deltaMs = 0.0;    ///< host shadow update + delta extraction
-        H2HDelta delta;
+        double escherMs = 0.0;   ///< CBST maintenance: the h2v insert
+        double deltaMs = 0.0;    ///< host incidence update
+        IncidenceBatch inc;      ///< incidence changes (to the GPU)
+        EscherHorizOps ops;      ///< pending h2v / v2h CBST operations
     };
 
     DynamicHypergraph(int numVertices, const Caps& caps);
@@ -62,14 +65,32 @@ public:
     DynamicHypergraph(const DynamicHypergraph&) = delete;
     DynamicHypergraph& operator=(const DynamicHypergraph&) = delete;
 
-    /** Initial build: host shadow + all three CBSTs (with the occupancy fix
-     *  so later fills append correctly). Rows become ids 1..rows.size(). */
-    void bulkLoad(std::vector<std::vector<int>>&& rows,
-                  std::vector<long long>&& weights, int sourceHe,
-                  int targetHe);
+    /** Initial build: host incidence model + all three CBSTs (with the
+     *  occupancy fix so later fills append correctly). Rows become ids
+     *  1..rows.size(). Returns the line graph (built once, also used to
+     *  build the device CSR). */
+    LineGraphCSR bulkLoad(std::vector<std::vector<int>>&& rows,
+                          std::vector<long long>&& weights, int sourceHe,
+                          int targetHe);
 
-    /** Apply one batch through ESCHER + shadow; returns timings + delta. */
-    BatchResult applyBatch(const HgBatch& batch);
+    /**
+     * First half of a batch: the h2v insert (its mapping decides the ids
+     * of the inserted hyperedges, ESCHER's id reassignment) and the host
+     * incidence update, which yields the incidence changes the GPU derives
+     * the line-graph delta from.
+     */
+    BatchResult beginBatch(const HgBatch& batch);
+
+    /**
+     * Second half: the remaining CBST maintenance (h2v erase / unfill /
+     * fill, v2h unfill / fill, h2h unfill / erase / fill / insert), driven
+     * by the net line-graph delta @p directedKeys: every changed pair in
+     * both directions as row << 33 | isInsert << 32 | col (0-based node
+     * indices), sorted, as the device CSR apply produces them. Returns the
+     * elapsed milliseconds.
+     */
+    double finishBatch(BatchResult& res,
+                       const std::vector<std::uint64_t>& directedKeys);
 
     HostHypergraph& host();
     const HostHypergraph& host() const;

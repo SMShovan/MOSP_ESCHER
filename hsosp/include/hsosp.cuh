@@ -30,15 +30,16 @@
 #include <string>
 #include <vector>
 
+#include "DynamicHypergraph.hpp"
 #include "HostHypergraph.hpp"
 
 namespace escher_mosp {
 namespace hsosp {
 
 /**
- * The last batch delta in device memory (0-based node indices), uploaded
- * by applyDeltaToDevice and read by hsospUpdate: deleted pairs first, then
- * inserted pairs; ids = new (inserted or recreated) nodes, then dead ones.
+ * The last batch delta in device memory (0-based node indices), derived by
+ * applyBatch and read by hsospUpdate: deleted pairs first, then inserted
+ * pairs; ids = new (inserted or recreated) nodes, then dead ones.
  */
 struct DeviceDelta {
     int2* d_pairs = nullptr;
@@ -51,7 +52,7 @@ struct DeviceDelta {
     int numNew = 0;
     int numDead = 0;
 
-    // Scratch of the device-side grouping (applyDeltaToDevice): directed
+    // Scratch of the device-side grouping of the CSR apply: directed
     // row keys (double buffered for the radix sort), row runs and offsets,
     // and the CUB temporary storage. Grown on demand, reused across batches.
     unsigned long long* d_keys = nullptr;
@@ -63,10 +64,61 @@ struct DeviceDelta {
     void* d_temp = nullptr;
     std::size_t tempBytes = 0;
     long long keyCapacity = 0;
+    /// After the CSR apply: the sorted directed keys (row << 33 |
+    /// isInsert << 32 | col), 2 per pair (one of d_keys / d_keysAlt).
+    const unsigned long long* d_sortedKeys = nullptr;
+    long long numSortedKeys = 0;
 
     void reserve(long long pairs, long long ids);
     void reserveKeys(long long keys);
     void reserveTemp(std::size_t bytes);
+    void free();
+};
+
+/**
+ * Device mirror of the incidence model, input of the line-graph delta
+ * derivation: the vertex list of every hyperedge and the hyperedge list of
+ * every vertex, as slack rows. The host decides the layout (it knows every
+ * row length) and keeps a copy of the offsets and capacities; rows that
+ * outgrow their capacity move to the tail, and a full tail triggers a
+ * re-upload with more capacity.
+ */
+struct DeviceIncidence {
+    int maxNodes = 0;
+    int numVertices = 0;
+    // Hyperedge -> vertices (node-indexed).
+    long long* d_heOff = nullptr;
+    int* d_heLen = nullptr;
+    int* d_heVal = nullptr;
+    long long heCapacity = 0;
+    long long heTail = 0;
+    std::vector<long long> heOff;
+    std::vector<int> heCap;
+    // Vertex -> hyperedges (0-based node indices).
+    long long* d_vOff = nullptr;
+    int* d_vLen = nullptr;
+    int* d_vVal = nullptr;
+    long long vCapacity = 0;
+    long long vTail = 0;
+    std::vector<long long> vOff;
+    std::vector<int> vCap;
+    // Per-batch scratch, grown on demand.
+    int* d_touchedIdx = nullptr;          ///< node -> touched slot or -1
+    int* d_postLen = nullptr;             ///< vertex -> post-batch length
+    struct Scratch;
+    Scratch* scratch = nullptr;
+
+    DeviceIncidence() = default;
+    ~DeviceIncidence();
+    DeviceIncidence(const DeviceIncidence&) = delete;
+    DeviceIncidence& operator=(const DeviceIncidence&) = delete;
+    DeviceIncidence(DeviceIncidence&&) noexcept;
+    DeviceIncidence& operator=(DeviceIncidence&&) noexcept;
+
+    /** Uploads the incidence of @p hg; the value arrays get free tail
+     *  space of (headroom - 1) x their initial size (+64 entries). */
+    void build(const HostHypergraph& hg, int maxNodes, double headroom);
+    long long deviceBytes() const;
     void free();
 };
 
@@ -87,6 +139,7 @@ struct DeviceH2H {
     long long numEntries = 0;      ///< live adjacency entries (2 x pairs)
 
     DeviceDelta delta;             ///< last applied batch delta
+    DeviceIncidence inc;           ///< incidence mirror for the delta
 
     DeviceH2H() = default;
     ~DeviceH2H();
@@ -100,27 +153,59 @@ struct DeviceH2H {
 };
 
 /**
- * Build (or rebuild) the resident device graph from the host shadow.
+ * Build (or rebuild) the resident device graph: the CSR from the line
+ * graph @p lg of @p hg, and the incidence mirror from @p hg.
  *
- * @param hg            host hypergraph (adjacency + weights + liveness).
+ * @param hg            host hypergraph (incidence + weights + liveness).
+ * @param lg            its line graph (HostHypergraph::lineGraph).
  * @param maxNodes      node capacity; must cover every id the run will see.
  * @param entryHeadroom colInd capacity = initial slack entries *
  *                      entryHeadroom (+4096); growth room for relocations.
  *                      Must be >= 1 (std::invalid_argument otherwise).
  */
-void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg, int maxNodes,
+void buildDeviceH2H(DeviceH2H& dev, const HostHypergraph& hg,
+                    const LineGraphCSR& lg, int maxNodes,
                     double entryHeadroom);
 
+/** Timings (ms) and counts of one batch (applyBatch). */
+struct BatchTimes {
+    double escherMs = 0.0;   ///< ESCHER maintenance (all three CBSTs)
+    double deltaMs = 0.0;    ///< unification: host incidence + GPU delta
+    double csrMs = 0.0;      ///< device CSR apply (and a rebuild if needed)
+    long long candidates = 0;   ///< candidate pairs examined
+    long long insPairs = 0;     ///< net line-graph pairs inserted
+    long long delPairs = 0;     ///< net line-graph pairs deleted
+    int newHe = 0;
+    int deadHe = 0;
+    int skippedOps = 0;
+    bool csrRebuilt = false;    ///< the CSR tail overflowed
+    int mirrorReuploads = 0;    ///< incidence mirror tails that overflowed
+};
+
 /**
- * Apply a net H2HDelta to the resident device graph and keep the delta on
- * the device (dev.delta) for the following hsospUpdate.
- *
- * @return false if the tail region overflowed (caller must rebuild via
- *         buildDeviceH2H, which keeps dev.delta; the graph contents are
- *         unspecified until then).
+ * Applies one batch to the whole pipeline except the SOSP update:
+ *  1. DynamicHypergraph::beginBatch: h2v insert (ids) + host incidence;
+ *  2. unification on the GPU: for every changed incidence (v, h), every o
+ *     in v's hyperedge list before or after the batch gives a candidate
+ *     pair (h, o); each distinct candidate is classified by whether the
+ *     two vertex lists overlap before and after the batch (inserted if
+ *     only after, deleted if only before). This is order-free and exact:
+ *     a pair can only change when a shared vertex was added or removed.
+ *     The pairs go to dev.delta;
+ *  3. CSR apply (device sort + warp per row), rebuilding the CSR from the
+ *     host incidence if its tail overflows (timed in csrMs);
+ *  4. DynamicHypergraph::finishBatch: the remaining CBST maintenance from
+ *     the sorted pairs.
+ * Stages are separated by device synchronization so each time is complete.
  */
-bool applyDeltaToDevice(DeviceH2H& dev, const HostHypergraph& hg,
-                        const H2HDelta& delta);
+BatchTimes applyBatch(DynamicHypergraph& dh, DeviceH2H& dev,
+                      const HgBatch& batch, double entryHeadroom = 1.6);
+
+/** Number of rows of the incidence mirror (hyperedge -> vertices and
+ *  vertex -> hyperedges, compared as sorted lists) that differ from @p hg;
+ *  a test check, it copies the whole mirror to the host. */
+long long incidenceMirrorMismatches(const DeviceIncidence& inc,
+                                    const HostHypergraph& hg);
 
 /** Copies the rows of nodes 0..m-1 to the host as sorted 1-based
  *  hyperedge id lists (duplicates kept), for checks against an oracle. */
@@ -194,7 +279,7 @@ struct UpdateStats {
 
 /**
  * Exact dynamic SOSP update for the delta last applied by
- * applyDeltaToDevice (dev.delta):
+ * applyBatch (dev.delta):
  *  1. roots: the endpoint b of every deleted pair (a, b) whose tree parent
  *     was a, and every new, recreated or dead node;
  *  2. every descendant of a root in the pre-batch shortest-path tree is
