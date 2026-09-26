@@ -37,8 +37,9 @@ average about 8 during the runs), CUDA 12.9 (final build) and 13.1
   `hsospBench`. The tables were not re-measured after them. A check on
   DBLP (hyperedge batches of 50K and 200K, vertex batches of 50K; three
   batches, median of three runs) found the same h2h pairs and iterations
-  in every batch, no fallback, and per-batch dynamic times 2.5-5% lower
-  than before the review fixes.
+  in every batch, no fallback, and per-batch dynamic times unchanged
+  within run-to-run noise (within 1.5% of the times before the review
+  fixes).
 
 Every vertex batch and the first two hyperedge batches of each
 configuration are identical in the two builds (the batch generator is
