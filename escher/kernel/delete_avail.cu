@@ -30,7 +30,10 @@ __global__ void applyDeletes(CBSTNode *nodes, int *positions, int deleteSize,
   if (tid < deleteSize) {
     int pos = positions[tid];
     if (pos >= 0) {
-      nodes[pos].index = -1;
+      // The node keeps its key: overwriting it (the original set -1) broke
+      // the BST order, so keys in the node's left subtree could no longer be
+      // found and later fills / unfills / erases on them were silently
+      // skipped until the next rebuild. Deletion is recorded in avail[].
       avail[pos] = 1;
       nodes[pos].occupancy = 0;
       nodes[pos].tailBase = nodes[pos].value;

@@ -26,12 +26,13 @@ struct LessThan {
 #include "../kernel/kernels.cuh"
 #include "../kernel/device_utils.cuh"
 
-// Utility: dump node index and value to plain arrays
-__global__ void dumpNodeIndexValue(CBSTNode *nodes, int n, int *outIndex,
-                                   int *outValue) {
+// Utility: dump node index and value to plain arrays; deleted nodes
+// (avail = 1) are reported with index -1 so the rebuild drops them.
+__global__ void dumpNodeIndexValue(CBSTNode *nodes, const int *avail, int n,
+                                   int *outIndex, int *outValue) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid < n) {
-    outIndex[tid] = nodes[tid].index;
+    outIndex[tid] = avail[tid] ? -1 : nodes[tid].index;
     outValue[tid] = nodes[tid].value;
   }
 }
@@ -744,8 +745,8 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     checkCuda(cudaMalloc(&d_idx, oldN * sizeof(int)));
     checkCuda(cudaMalloc(&d_val, oldN * sizeof(int)));
     int blocksDump = (oldN + blockSize - 1) / blockSize;
-    dumpNodeIndexValue<<<blocksDump, blockSize>>>(ctx.d_nodes, oldN, d_idx,
-                                                  d_val);
+    dumpNodeIndexValue<<<blocksDump, blockSize>>>(ctx.d_nodes, ctx.d_avail,
+                                                  oldN, d_idx, d_val);
     checkCuda(cudaDeviceSynchronize());
 
     // Sort (key, startOffset) pairs on the DEVICE. The upstream code copied

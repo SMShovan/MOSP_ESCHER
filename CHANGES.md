@@ -100,3 +100,11 @@ made there; these commits port those fixes, adapted to this copy's API
   the h2v / h2h rows are affected. Rows are now padded to the next multiple
   of 4 above their length (the device rule), and the fill kernels clamp the
   free space of a row at 0. Regression: `test_cbst_ops terminator`.
+- **E4 erase overwrote the key** (`kernel/delete_avail.cu`). `applyDeletes`
+  set the deleted node's key to -1, so every search passing that node went
+  right and the keys of its left subtree became unfindable until the next
+  rebuild; later fills, unfills and erases of those keys were silently
+  skipped (erasing the root of a 15-key tree made 7 keys unfindable). The
+  node now keeps its key and deletion is recorded in `avail[]` only; the
+  surplus rebuild drops nodes by `avail[]`. Regression:
+  `test_cbst_ops erase`.
