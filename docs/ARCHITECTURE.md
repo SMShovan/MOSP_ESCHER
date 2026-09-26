@@ -87,17 +87,19 @@ void dumpToCSR(rowPtr, colInd, values) const;
 `DynamicGraph::Impl` owns:
 
 - `edgesCBST` — one record per directed edge, key = 1-based edge id,
-  payload = `[src, dst, w_0 … w_{K-1}]` (fixed stride).
+  payload = `[src+1, dst+1, w_0+1 … w_{K-1}+1]` (fixed stride; every field
+  is shifted by one because 0 ends a CBST row).
 - `outAdjCBST` — one record per source vertex (always present, even for
   isolated vertices), key = vertex+1, payload = variable-length edge id list.
 - `inAdjCBST` — one record per destination vertex, same shape as out.
 - `outAdjShadow` / `inAdjShadow` — host mirror of the adjacency payloads.
 - `edgeSrc / edgeDst / edgeWeights` — per-edge metadata indexed by (edge_id - 1).
-- `freeEdgeIds` — LIFO free-list driving ESCHER's best-fit reuse.
 - `edgeIdBySrcDst` — `unordered_map<(src,dst), edge_id>` used by `deleteEdges`.
 
-`insertEdges` calls `edgesCBST->insert(...)` for best-fit slot reuse and
-`outAdjCBST->fill(...)` / `inAdjCBST->fill(...)` to grow the adjacency lists.
+`insertEdges` runs `edgesCBST->insert(...)` first and adopts the keys it
+returns (ESCHER's best-fit slot reuse decides them) as the edge ids; there
+is no host free list. It then calls `outAdjCBST->fill(...)` /
+`inAdjCBST->fill(...)` to grow the adjacency lists.
 `deleteEdges` calls `unfillCBST(...)` on each adjacency CBST and
 `edgesCBST->erase(...)` on the edge records.
 
@@ -119,17 +121,30 @@ delete/insert batches through `DynamicGraph`, and the writing through
 
 ## 3. MOSP (`mosp/`)
 
-Unchanged except for a single call-site swap in four files:
+Two kinds of change (details in CHANGES.md):
 
-- `mosp/src/main.cu` — step 3 now calls `updateGraphWithESCHER`.
-- `mosp/src/stressTest.cu` — same swap.
-- `mosp/src/parallelStressTest.cu` — same swap.
-- `mosp/src/generateTestCases.cu` — same swap.
+1. The ESCHER integration: a single call-site swap in four files, which now
+   call `updateGraphWithESCHER` instead of the legacy `updateGraphCSR`:
+   - `mosp/src/main.cu` — step 3 of the pipeline.
+   - `mosp/src/stressTest.cu`, `mosp/src/parallelStressTest.cu` — per-run
+     update call.
+   - `mosp/src/generateTestCases.cu` — per-test-case update call.
+2. The fixed SOSP update ported from MOSP-CUDA (the original counted to
+   infinity after deletions and gave too-small distances):
+   - `mosp/src/sospUpdateGpu.cu`, `mosp/headers/sospUpdateGpu.cuh`,
+     `mosp/headers/deviceArray.cuh` (new) — roots from the change list,
+     subtree invalidation by pointer jumping, a pull pass, then a monotone
+     near-far push with a packed 64-bit atomicMin. It replaces the
+     collect-candidates / update-distances / BFS / mark-unreachable
+     kernels.
+   - `mosp/src/parallelSOSPUpdate.cu` — drives `sospUpdateGpu`.
+   - `mosp/src/sequentialSOSPUpdate.cu` — the host update with the same
+     subtree invalidation.
+   - `mosp/src/Dijkstra.cu` — lowest-id parent tie-break (canonical trees),
+     and graphs without edges are accepted.
 
-All CUDA kernels (`parallelSOSPUpdate` collect/update/bfs/mark,
-`sequentialSOSPUpdate` host baseline, `Dijkstra`, `parallelCombinedGraph`)
-are untouched. They continue to read the updated CSR files from disk —
-those files are now written by the ESCHER-backed adapter.
+The update still reads the updated CSR files from disk; those files are
+written by the ESCHER-backed adapter.
 
 The legacy `updateGraphCSR.cu` stays in the tree because
 `test_snapshot_matches_updateCSR` needs it as a reference implementation.

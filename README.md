@@ -103,11 +103,13 @@ escher-mosp/
 │   └── src/         DynamicGraph.cpp, snapshot.cu, updateGraphWithESCHER.cpp
 │
 ├── mosp/            MOSP-CUDA sources, re-targeted to call through the adapter
-│   ├── headers/     (unchanged .cuh files)
+│   ├── headers/     MOSP-CUDA headers, plus deviceArray.cuh and sospUpdateGpu.cuh
+│   │                of the ported SOSP update
 │   └── src/         main, stressTest, parallelStressTest, generateTestCases
-│                    and the Dijkstra / sequentialSOSPUpdate / parallelSOSPUpdate
-│                    kernels (unchanged bodies; only the graph-update call site
-│                    was swapped)
+│                    (graph-update call site swapped to the adapter); Dijkstra,
+│                    sequentialSOSPUpdate and parallelSOSPUpdate with the fixed
+│                    update ported from MOSP-CUDA (sospUpdateGpu.cu) and a
+│                    lowest-id tie-break
 │
 ├── tests/unit/      Smoke + round-trip + equivalence tests
 ├── tests/run_all.sh Test driver (cluster-side)
@@ -134,7 +136,8 @@ escher-mosp/
                 │    DynamicGraph::dumpToCSR     ──► writes updatedPrefix{RowPtr,ColInd,Values}.txt
                 ▼
   [ Dijkstra / sequentialSOSPUpdate / parallelSOSPUpdate / parallelCombinedGraph ]
-            unchanged — consume the updated CSR files as before
+            consume the updated CSR files as before; parallelSOSPUpdate
+            runs the ported sospUpdateGpu engine
 ```
 
 - The **ESCHER CBST** is the authoritative store between update batches. Every
@@ -143,11 +146,14 @@ escher-mosp/
 - The **host shadow** of the adjacency topology is kept in lock-step so
   `dumpToCSR` and `snapshot(objective)` run in linear time without reading
   the CBST back.
-- The **MOSP CUDA kernels** (collectCandidates / updateDistances / bfs /
-  markUnreachable / Dijkstra relaxation) are untouched. They still read a
-  device CSR that MOSP allocates from the updated files on disk. A
-  `GraphSnapshot` API is also provided for a future rewiring that skips the
-  disk round-trip entirely.
+- The **MOSP SOSP update** is the fixed engine ported from MOSP-CUDA
+  (`sospUpdateGpu`): it finds the roots from the change list, invalidates
+  their subtrees by pointer jumping, runs a pull pass, then a monotone
+  near-far push with a packed 64-bit atomicMin (see CHANGES.md; the
+  original collect / update / BFS / mark-unreachable kernels counted to
+  infinity after deletions). It still reads a device CSR that MOSP
+  allocates from the updated files on disk. A `GraphSnapshot` API is also
+  provided for a future rewiring that skips the disk round-trip entirely.
 - **Motif counting code from ESCHER is dropped** — we do not need 30-bin
   triangle motifs here. Just the CBST core.
 
@@ -222,13 +228,18 @@ on any failure:
 
 ## Key decisions
 
-1. **Snapshot-to-CSR at the update boundary**, not per-kernel. MOSP's kernels
-   stay untouched; we replace only the graph-update step. Rewriting kernels
-   to walk CBST pointers is possible but not necessary to claim the integration.
+1. **Snapshot-to-CSR at the update boundary**, not per-kernel. The ESCHER
+   integration replaces only the graph-update step; MOSP's kernels read the
+   CSR as before. Rewriting kernels to walk CBST pointers is possible but
+   not necessary to claim the integration. (The SOSP update itself was
+   later replaced by the fixed engine ported from MOSP-CUDA, independently
+   of ESCHER; see CHANGES.md.)
 2. **Regular graph as a hypergraph of 2-vertex hyperedges**. `edgesCBST` has
-   one record per directed edge with fixed payload `[src, dst, w_0 … w_{K-1}]`;
-   `outAdjCBST` and `inAdjCBST` hold variable-length edge-id lists keyed by
-   source / destination vertex.
+   one record per directed edge with fixed payload
+   `[src+1, dst+1, w_0+1 … w_{K-1}+1]` (every field is shifted by one
+   because 0 ends a CBST row); edge ids are the keys ESCHER's insert
+   assigns. `outAdjCBST` and `inAdjCBST` hold variable-length edge-id lists
+   keyed by source / destination vertex.
 3. **Host shadow for linear-time snapshot**. Every ESCHER operation also
    mirrors into a `std::vector<std::vector<int>>` shadow so dumps don't need
    to read the CBST back. The claim "MOSP uses ESCHER" holds because every

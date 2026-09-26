@@ -74,8 +74,8 @@ batch, deleted if only before.
   (the ESCHER paper's id-reassignment scheme); the h2h CBST keeps its own
   key space with a host-side translation.
 - `hsosp/include/hsosp.cuh` — device line graph + node-weighted SOSP
-  kernels (adapted from `mosp/src/parallelSOSPUpdate.cu`, originals
-  untouched).
+  kernels (adapted from the original MOSP-CUDA `parallelSOSPUpdate`
+  kernels).
 - Update (exact): the pre-batch shortest-path subtree of every deleted
   tree edge and of every new, recreated or dead node is invalidated
   (pointer jumping), invalidated nodes pull their best neighbour, inserted

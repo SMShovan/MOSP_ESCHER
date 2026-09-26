@@ -2,9 +2,10 @@
 
 > The original design plan (July 2026), kept for reference. The code now
 > differs in places: there is no host copy of the line graph, the
-> line-graph delta is derived on the GPU, and the SOSP update is exact
-> (subtree invalidation + push). See [HSOSP.md](HSOSP.md) and
-> [CHANGES.md](../CHANGES.md).
+> line-graph delta is derived on the GPU, the SOSP update is exact
+> (subtree invalidation + push), and the MOSP kernels this plan calls
+> untouched were replaced by the fixed update ported from MOSP-CUDA. See
+> [HSOSP.md](HSOSP.md) and [CHANGES.md](../CHANGES.md).
 
 Prepared from: the meeting video + handwritten notes (Meeting/video1989311071.mp4), the escher-mosp
 codebase, the DynaMOSP paper (MOSP GPU), the ESCHER/Dynamic Hypergraph papers (conference + TKDE),

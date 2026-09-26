@@ -99,9 +99,13 @@ No logic changes.
 
 ## MOSP (`mosp/`)
 
-No kernel bodies were modified. Four files had exactly one call-site swap
-each, replacing the legacy `updateGraphCSR(...)` with
-`escher_mosp::updateGraphWithESCHER(...)`:
+This section describes the original integration, which changed no MOSP
+kernel. The SOSP update kernels were later replaced by the fixed engine
+ported from MOSP-CUDA (`mosp/src/sospUpdateGpu.cu`, subtree invalidation
+and a monotone push; see CHANGES.md and docs/ARCHITECTURE.md).
+
+Four files had exactly one call-site swap each, replacing the legacy
+`updateGraphCSR(...)` with `escher_mosp::updateGraphWithESCHER(...)`:
 
 - `mosp/src/main.cu` — step 3 of the pipeline.
 - `mosp/src/stressTest.cu` — per-run update call.
@@ -122,6 +126,6 @@ and are left for a follow-up:
 - `sequentialSOSPUpdate` and `parallelSOSPUpdate` still round-trip through
   disk files rather than consuming a `GraphSnapshot` directly. The
   `GraphSnapshot` API is implemented and ready — only the kernel wiring
-  has not been done because it would require changes inside otherwise
-  untouched CUDA code, and `test_snapshot_matches_updateCSR` already
-  proves the ESCHER-backed update is correct.
+  has not been done because it would change how every MOSP driver loads
+  its graph, and `test_snapshot_matches_updateCSR` already proves the
+  ESCHER-backed update is correct.
