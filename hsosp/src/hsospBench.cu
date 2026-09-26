@@ -248,7 +248,7 @@ void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
         std::vector<int> parentSnapshot;
         if (sc.placement != Placement::Random) {
             ds.stateA.downloadDistances(distSnapshot, hg.maxId());
-            ds.stateA.downloadParents(parentSnapshot, hg.maxId());
+            ds.stateA.downloadParentIds(parentSnapshot, hg.maxId());
         }
         BatchParams bp;
         bp.size = sc.batchSize;

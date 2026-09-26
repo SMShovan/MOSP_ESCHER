@@ -109,7 +109,12 @@ struct HsospState {
     void free();
 
     void downloadDistances(std::vector<long long>& dist, int n) const;
+    /** Parents as 0-based node indices (the device convention), -1 for
+     *  none. */
     void downloadParents(std::vector<int>& parent, int n) const;
+    /** Parents as 1-based hyperedge ids (the host convention, e.g. for
+     *  generateBatch), -1 for none. */
+    void downloadParentIds(std::vector<int>& parentIds, int n) const;
 };
 
 struct UpdateConfig {

@@ -217,3 +217,11 @@ test with other seeds, 0 failures.
   >= 1; only the virtual source and target have weight 0. `bulkLoad` and
   `applyBatch` reject other weights (and empty inserted hyperedges) before
   touching any structure. Regression: `test_hsosp_matches_dijkstra`.
+- **S4 "targeted" change placement** (`hsospBench.cu`, `hsospStress.cu`,
+  `HypergraphGen.hpp`). Device parents are 0-based node indices but
+  `generateBatch` reads them as 1-based hyperedge ids, so the targeted
+  placement (experiment E7, not in the paper) deleted the hyperedge before
+  each SOSP-tree parent. `HsospState::downloadParentIds` converts, the call
+  sites use it and the convention is documented. Regression:
+  `test_hsosp_matches_dijkstra` (every deletion of a targeted batch is a
+  tree parent; 153 of 200 were not with the old conversion).

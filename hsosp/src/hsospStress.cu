@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
             std::vector<int> parentSnap;
             if (bp.placement != Placement::Random) {
                 st.downloadDistances(distSnap, hg.maxId());
-                st.downloadParents(parentSnap, hg.maxId());
+                st.downloadParentIds(parentSnap, hg.maxId());
             }
             HgBatch batch = generateBatch(hg, gp, bp, distSnap, parentSnap);
 

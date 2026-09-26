@@ -590,6 +590,13 @@ void HsospState::downloadParents(std::vector<int>& parent, int n) const {
                                 cudaMemcpyDeviceToHost));
 }
 
+void HsospState::downloadParentIds(std::vector<int>& parentIds,
+                                   int n) const {
+    downloadParents(parentIds, n);
+    for (int& p : parentIds)
+        if (p >= 0) p += 1;
+}
+
 // ---------------------------------------------------------------------------
 // Propagation loop
 // ---------------------------------------------------------------------------

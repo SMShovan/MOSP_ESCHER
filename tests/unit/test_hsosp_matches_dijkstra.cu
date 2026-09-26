@@ -116,6 +116,51 @@ int main() {
         distsMatch(st, hg, "disconnect", 9999);
     }
 
+    // ---- targeted placement deletes SOSP-tree parents ------------------
+    // (The device stores 0-based node indices; generateBatch treated them as
+    // 1-based ids and deleted the hyperedge before each parent.)
+    {
+        GenParams gp;
+        gp.numHyperedges = 2000;
+        gp.numVertices = 1500;
+        gp.cMin = 2;
+        gp.cMax = 5;
+        gp.poolSize = 64;
+        gp.seed = 99;
+        GeneratedHypergraph g = generateHypergraph(gp);
+        DynamicHypergraph::Caps caps;
+        caps.maxHyperedges = static_cast<int>(g.rows.size()) + 64;
+        DynamicHypergraph dh(g.numVertices, caps);
+        dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
+                    g.targetHe);
+        HostHypergraph& hg = dh.host();
+        hsosp::DeviceH2H dev;
+        hsosp::buildDeviceH2H(dev, hg, caps.maxHyperedges, 1.4);
+        hsosp::HsospState st;
+        st.allocate(caps.maxHyperedges);
+        hsosp::hsospRecompute(dev, st, hg.sourceHe, ucfg);
+        std::vector<int> parents0, parents;
+        st.downloadParents(parents0, hg.maxId());   // 0-based node indices
+        st.downloadParentIds(parents, hg.maxId());  // 1-based ids
+        std::vector<char> isParent(hg.maxId() + 1, 0);
+        for (int p : parents0)
+            if (p >= 0) isParent[p + 1] = 1;
+        BatchParams bp;
+        bp.size = 200;
+        bp.delPct = 100;
+        bp.placement = Placement::Targeted;
+        bp.seed = 5;
+        HgBatch batch = generateBatch(hg, gp, bp, {}, parents);
+        int notParent = 0;
+        for (int id : batch.heDelete) notParent += !isParent[id];
+        if (batch.heDelete.empty() || notParent != 0) {
+            std::printf("FAIL: targeted batch: %d of %zu deletions are not "
+                        "SOSP-tree parents\n",
+                        notParent, batch.heDelete.size());
+            ++failures;
+        }
+    }
+
     // ---- non-positive weights are rejected ----------------------------
     // (With two adjacent zero-weight hyperedges cut off from the source the
     // update kept a stale finite distance: {1,2} and {2,3} of weight 0

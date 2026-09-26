@@ -72,7 +72,10 @@ struct BatchParams {
  * @param bp      batch parameters.
  * @param dist    current SOSP distances indexed by (heId-1); required for
  *                Targeted / Near / Far placements (pass empty for Random).
- * @param parent  current SOSP parents; required for Targeted.
+ * @param parent  current SOSP parents as 1-based hyperedge ids (-1 or 0
+ *                for none), indexed by (heId-1); required for Targeted.
+ *                Device parents are 0-based node indices: download them
+ *                with HsospState::downloadParentIds.
  */
 HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
                       const BatchParams& bp,
