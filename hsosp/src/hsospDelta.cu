@@ -487,6 +487,9 @@ void uploadHeRows(DeviceIncidence& di, const HostHypergraph& hg,
     HSOSP_CUDA_CHECK(cudaMalloc(&di.d_heVal, sizeof(int) * capacity));
     di.heCapacity = capacity;
     upload(di.d_heVal, val);
+    // The free tail is zeroed too (rows move there with slack).
+    HSOSP_CUDA_CHECK(cudaMemset(di.d_heVal + cursor, 0,
+                                sizeof(int) * (capacity - cursor)));
     upload(di.d_heOff, di.heOff);
     upload(di.d_heLen, len);
 }
@@ -517,6 +520,9 @@ void uploadVertexRows(DeviceIncidence& di, const HostHypergraph& hg,
     HSOSP_CUDA_CHECK(cudaMalloc(&di.d_vVal, sizeof(int) * capacity));
     di.vCapacity = capacity;
     upload(di.d_vVal, val);
+    // The free tail is zeroed too (rows move there with slack).
+    HSOSP_CUDA_CHECK(cudaMemset(di.d_vVal + cursor, 0,
+                                sizeof(int) * (capacity - cursor)));
     upload(di.d_vOff, di.vOff);
     upload(di.d_vLen, len);
 }
@@ -558,7 +564,7 @@ long long incidenceMirrorMismatches(const DeviceIncidence& di,
     const int m = hg.maxId();
     download(di.d_heOff, m, off);
     download(di.d_heLen, m, len);
-    download(di.d_heVal, di.heCapacity, val);
+    download(di.d_heVal, di.heTail, val);   // rows lie below the tail
     for (int id = 1; id <= m; ++id) {
         std::vector<int> got(val.begin() + off[id - 1],
                              val.begin() + off[id - 1] + len[id - 1]);
@@ -570,7 +576,7 @@ long long incidenceMirrorMismatches(const DeviceIncidence& di,
     // Vertex rows (0-based node indices).
     download(di.d_vOff, di.numVertices, off);
     download(di.d_vLen, di.numVertices, len);
-    download(di.d_vVal, di.vCapacity, val);
+    download(di.d_vVal, di.vTail, val);
     for (int v = 0; v < di.numVertices; ++v) {
         std::vector<int> got(val.begin() + off[v],
                              val.begin() + off[v] + len[v]);

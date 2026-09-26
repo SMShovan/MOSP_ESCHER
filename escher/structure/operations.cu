@@ -213,6 +213,9 @@ void constructCBST(int *keys, int *startOffsets, int numRecords,
   }
 
   checkCuda(cudaMalloc(&ctx.d_nodes, numRecords * sizeof(CBSTNode)));
+  // Zeroed so that host copies of the nodes (checks) never read bytes the
+  // device did not write (struct padding).
+  checkCuda(cudaMemset(ctx.d_nodes, 0, numRecords * sizeof(CBSTNode)));
   checkCuda(cudaMalloc(&ctx.d_keys, numRecords * sizeof(int)));
   checkCuda(cudaMalloc(&ctx.d_startOffsets, numRecords * sizeof(int)));
   checkCuda(cudaMalloc(&ctx.d_flatPayload, ctx.fixedSize * sizeof(int)));
@@ -678,6 +681,7 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
 
     ctx.numRecords = newN;
     checkCuda(cudaMalloc(&ctx.d_nodes, newN * sizeof(CBSTNode)));
+    checkCuda(cudaMemset(ctx.d_nodes, 0, newN * sizeof(CBSTNode)));
     checkCuda(cudaMalloc(&ctx.d_keys, newN * sizeof(int)));
     checkCuda(cudaMalloc(&ctx.d_startOffsets, newN * sizeof(int)));
     checkCuda(cudaMalloc(&ctx.d_avail, newN * sizeof(int)));
