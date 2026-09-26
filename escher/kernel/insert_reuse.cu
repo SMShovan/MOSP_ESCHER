@@ -105,14 +105,7 @@ __global__ void extractKeysFromPositions(int *d_keys, int *positions,
     outKeys[tid] = 0;
     return;
   }
-  int log2_pos = floor_log2(pos + 1);
-  int log2_n = floor_log2(numRecords);
-  int index =
-      ((2 * (pos + 1 - (1 << log2_pos))) + 1) * (1 << log2_n) / (1 << log2_pos);
-  int index2 =
-      min(index, index - (index / 2) + (numRecords + 1 - (1 << log2_n)));
-  index2--;
-  outKeys[tid] = d_keys[index2];
+  outKeys[tid] = d_keys[cbstRankOfPosition(pos, numRecords)];
 }
 
 // ── Phase 2: Apply reuse ────────────────────────────────────────────────

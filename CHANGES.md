@@ -60,3 +60,21 @@ On the original code the new cases fail as expected: every `test_cbst_ops`
 scenario, `test_hsosp_scale` (abort on a colliding hyperedge id),
 `hsospStress --check-escher` (wrong h2v / v2h / h2h rows after one batch),
 and `parallelStressTest` seed 6 (a wrong MOSP distance in run 195).
+
+## Correctness: ESCHER core
+
+The CBST code is the motif-free copy of ESCHER-GPU that predates the fixes
+made there; these commits port those fixes, adapted to this copy's API
+(exceptions instead of `exit`, caller-supplied row occupancy).
+
+- **E1 CBST rank overflow** (`kernel/device_utils.cuh`, used by
+  `build_tree.cu`, `operations.cu` `setInitialOccupancy`, `insert_reuse.cu`
+  `extractKeysFromPositions`). The in-order rank
+  `(2*(pos+1-2^k)+1) * 2^log2(n) / 2^k` was computed in `int` and overflowed
+  for n > 65,535: the tree lost its BST order (at n = 65,536 only 49,152 of
+  the keys were found; at 2^20 far fewer) and negative ranks indexed the key
+  and offset arrays out of bounds. The three copies now share
+  `cbstRankOfPosition`, a 64-bit shift. With the original code the H-SOSP
+  pipeline aborts on the first batch at 70K hyperedges (colliding
+  hyperedge id) and crashes in construct at 1M. Regression:
+  `test_cbst_ops scale` (every key of n = 1..1,100 and 65,535..2^20).

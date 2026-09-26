@@ -50,12 +50,7 @@ __global__ void setInitialOccupancy(CBSTNode *nodes, const int *rowOccupancy,
                                     int n) {
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid < n) {
-    int log2_tid = floor_log2(tid + 1);
-    int log2_n = floor_log2(n);
-    int index = ((2 * (tid + 1 - (1 << log2_tid))) + 1) * (1 << log2_n) /
-                (1 << log2_tid);
-    int index2 = min(index, index - (index / 2) + (n + 1 - (1 << log2_n)));
-    index2--;
+    int index2 = cbstRankOfPosition(tid, n);
     if (index2 < n) {
       nodes[tid].occupancy = rowOccupancy[index2];
     }
