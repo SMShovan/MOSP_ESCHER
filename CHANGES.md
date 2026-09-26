@@ -55,6 +55,8 @@ committed) `make test` failed:
 | pull kernel adds the neighbour's weight instead of the node's | `test_hsosp_matches_dijkstra` (125 wrong distances), `hsospStress` (50/50 configurations) |
 | pull kernel records a wrong (non-tight) parent, distances unchanged | `hsospStress` (parent check, 15 configurations) |
 | CSR apply skips the last deletion of each row | `hsospStress` (device CSR rows) |
+| (after E1-E7) unfill ignores the last value of each removal list | `test_cbst_ops` (4 scenarios), `hsospStress --check-escher`, `test_hsosp_scale` |
+| (after E8) `DynamicGraph` keeps its own edge ids instead of ESCHER's keys | `test_dynamicgraph_roundtrip` |
 
 On the original code the new cases fail as expected: every `test_cbst_ops`
 scenario, `test_hsosp_scale` (abort on a colliding hyperedge id),
@@ -143,3 +145,15 @@ made there; these commits port those fixes, adapted to this copy's API
 With E1-E7, every `test_cbst_ops` scenario (including the random sequences
 at 70,000 records), `test_hsosp_scale` and `hsospStress --check-escher`
 pass: after every batch the three CBSTs hold exactly the host model's rows.
+- **E8 `DynamicGraph::insertEdges` ignored the insert mapping**
+  (`graph/src/DynamicGraph.cpp`). Host edge ids came from a LIFO free list
+  while `insertCBST` stored each record under the key its best-fit reuse
+  chose; the returned mapping was discarded, so host ids and ESCHER keys
+  diverged and a later erase by host id removed another edge's record. Edge
+  records also started with the source vertex, and 0 ends a CBST row, so
+  edges leaving vertex 0 read back empty. The insert now runs first and its
+  keys become the edge ids (no host free list); records are stored as
+  [src+1, dst+1, w_0+1, ...] and negative weights are rejected. MOSP
+  results were not affected (its CSR files come from the host shadow).
+  Regression: `test_dynamicgraph_roundtrip` (delete / insert rounds with
+  `DynamicGraph::checkEscher`).

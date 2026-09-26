@@ -1,6 +1,7 @@
 #ifndef ESCHER_MOSP_DYNAMIC_GRAPH_HPP
 #define ESCHER_MOSP_DYNAMIC_GRAPH_HPP
 
+#include <iosfwd>
 #include <memory>
 #include <vector>
 
@@ -111,6 +112,14 @@ public:
     void dumpToCSR(std::vector<int>& rowPtr,
                    std::vector<int>& colInd,
                    std::vector<std::vector<int>>& values) const;
+
+    /**
+     * @brief Test oracle: reads the three CBSTs back and compares them with
+     *        the host metadata (edge records by edge-id, adjacency rows by
+     *        vertex). Returns the number of violations (see integrity.hpp);
+     *        details go to @p log.
+     */
+    long long checkEscher(std::ostream& log) const;
 
     int numVertices() const noexcept;
     int numEdges()    const noexcept;

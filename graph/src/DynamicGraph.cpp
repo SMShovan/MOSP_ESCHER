@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <numeric>
+#include <ostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@
 #include "structure.hpp"
 #include "flatten.hpp"
 #include "escher_errors.hpp"
+#include "integrity.hpp"
 
 namespace escher_mosp {
 
@@ -37,6 +39,31 @@ namespace {
  */
 inline std::int64_t packSrcDst(int src, int dst) noexcept {
     return (static_cast<std::int64_t>(src) << 32) | static_cast<std::uint32_t>(dst);
+}
+
+/**
+ * @brief ESCHER record of one edge: [src+1, dst+1, w_0+1, ..., w_{K-1}+1].
+ *
+ * Every field is shifted by one because a 0 value ends a CBST row: the
+ * original stored [src, dst, w...], so edges leaving vertex 0 (or with a
+ * zero weight) read back empty or truncated. Weights must be non-negative.
+ */
+std::vector<int> edgeRecord(int src, int dst, const std::vector<int>& w) {
+    std::vector<int> rec;
+    rec.reserve(2 + w.size());
+    rec.push_back(src + 1);
+    rec.push_back(dst + 1);
+    for (int x : w) rec.push_back(x + 1);
+    return rec;
+}
+
+void checkWeights(const std::vector<int>& w, const char* where) {
+    for (int x : w) {
+        if (x < 0) {
+            throw escher::EscherError(std::string(where) +
+                                      ": edge weights must be non-negative");
+        }
+    }
 }
 
 /**
@@ -74,51 +101,28 @@ struct DynamicGraph::Impl {
     std::vector<std::vector<int>> outAdjShadow; // outAdjShadow[v] = list of edge-ids outgoing from v
     std::vector<std::vector<int>> inAdjShadow;  // inAdjShadow[v]  = list of edge-ids incoming to v
 
-    // Per-edge metadata, indexed by (edge-id - 1). A free-list on edge-ids
-    // lets us recycle slots that ESCHER has marked available via @c erase,
-    // keeping the edge-id space dense.
+    // Per-edge metadata, indexed by (edge-id - 1). Edge-ids are the keys of
+    // the edge records in edgesCBST; inserts adopt the key ESCHER assigns
+    // (a reused deleted slot or a fresh key).
     std::vector<int>              edgeSrc;      // edgeSrc[eid-1] = source vertex (or -1 if slot free)
     std::vector<int>              edgeDst;      // edgeDst[eid-1] = destination vertex (or -1 if slot free)
     std::vector<std::vector<int>> edgeWeights;  // edgeWeights[eid-1] = K weights
-
-    std::vector<int>              freeEdgeIds;  // LIFO free-list of deleted edge-ids
 
     // (src,dst) -> edge-id lookup for @c deleteEdges.
     std::unordered_map<std::int64_t, int> edgeIdBySrcDst;
 
     /**
-     * @brief Allocate the next edge-id, reusing a free slot if possible.
+     * @brief Clear the metadata of a deleted edge-id. Ids are chosen by
+     *        ESCHER (the key its insert assigns), so no host free list is
+     *        kept.
      *
-     * Preferring a free-list entry over a fresh id matches ESCHER's best-fit
-     * slot-reuse philosophy in @c insertCBST and keeps the dense edge-id
-     * space tidy.
-     *
-     * @return A valid 1-based edge-id.
-     */
-    int allocateEdgeId_() {
-        if (!freeEdgeIds.empty()) {
-            int id = freeEdgeIds.back();
-            freeEdgeIds.pop_back();
-            return id;
-        }
-        int id = static_cast<int>(edgeSrc.size()) + 1;
-        edgeSrc.push_back(-1);
-        edgeDst.push_back(-1);
-        edgeWeights.emplace_back();
-        return id;
-    }
-
-    /**
-     * @brief Release an edge-id back to the free-list and clear its metadata.
-     *
-     * @param edgeId 1-based edge-id previously returned from @c allocateEdgeId_.
+     * @param edgeId 1-based edge-id.
      */
     void releaseEdgeId_(int edgeId) {
         int idx = edgeId - 1;
         edgeSrc[idx] = -1;
         edgeDst[idx] = -1;
         edgeWeights[idx].clear();
-        freeEdgeIds.push_back(edgeId);
     }
 
     /**
@@ -217,13 +221,13 @@ void DynamicGraph::loadFromCSR(const std::vector<int>& rowPtr,
         if (static_cast<int>(w.size()) != K) {
             throw escher::EscherError("loadFromCSR: per-edge weights must have numObjectives entries");
         }
+        checkWeights(w, "loadFromCSR");
     }
 
     pImpl->numEdges_ = E;
     pImpl->edgeSrc.assign(E, -1);
     pImpl->edgeDst.assign(E, -1);
     pImpl->edgeWeights.assign(E, std::vector<int>{});
-    pImpl->freeEdgeIds.clear();
     pImpl->edgeIdBySrcDst.clear();
     pImpl->edgeIdBySrcDst.reserve(static_cast<std::size_t>(E) * 2);
 
@@ -242,12 +246,7 @@ void DynamicGraph::loadFromCSR(const std::vector<int>& rowPtr,
             pImpl->edgeDst[idx]     = v;
             pImpl->edgeWeights[idx] = values[k];
 
-            // Record layout: [src, dst, w_0, ..., w_{K-1}]
-            std::vector<int>& rec = perEdgeRecords[idx];
-            rec.reserve(2 + K);
-            rec.push_back(u);
-            rec.push_back(v);
-            for (int w : values[k]) rec.push_back(w);
+            perEdgeRecords[idx] = edgeRecord(u, v, values[k]);
 
             pImpl->outAdjShadow[u].push_back(edgeId);
             pImpl->inAdjShadow[v].push_back(edgeId);
@@ -279,6 +278,7 @@ void DynamicGraph::insertEdges(const std::vector<EdgeInsert>& edges) {
         if (static_cast<int>(e.weights.size()) != K) {
             throw escher::EscherError("insertEdges: weights must have numObjectives entries");
         }
+        checkWeights(e.weights, "insertEdges");
         // Guard against parallel-edge leaks: re-inserting an existing (src,dst)
         // previously allocated a second edge record and orphaned the first one
         // in the (src,dst)->id map. Upsert semantics are handled one level up
@@ -290,42 +290,52 @@ void DynamicGraph::insertEdges(const std::vector<EdgeInsert>& edges) {
         }
     }
 
-    // Allocate edge-ids (reusing freed slots first) and build flat payload
-    // vectors in the format @c insertCBST expects:
-    //   - newKeys[i]          = edge-id for item i
-    //   - newPayload          = concatenation of per-item payloads
-    //   - newPrefixSizes[i]   = cumulative payload size up to and including item i
+    // Build the flat payload vectors in the format @c insertCBST expects
+    // and route the insert through ESCHER first: its best-fit slot reuse
+    // decides the key of every record, and that key becomes the edge-id.
+    // (The original allocated ids from a host free list and discarded the
+    // returned mapping, so host ids and ESCHER keys diverged and a later
+    // erase by host id removed the wrong record.)
     const int M = static_cast<int>(edges.size());
-    std::vector<int> newKeys;
+    std::vector<int> tentativeKeys;
     std::vector<int> newPayload;
     std::vector<int> newPrefixSizes;
-    newKeys.reserve(M);
+    tentativeKeys.reserve(M);
     newPrefixSizes.reserve(M);
     newPayload.reserve(static_cast<std::size_t>(M) * (2 + K));
-
-    std::vector<int> assignedIds(M);
     int running = 0;
     for (int i = 0; i < M; ++i) {
         const auto& e = edges[i];
-        const int eid = pImpl->allocateEdgeId_();
-        assignedIds[i] = eid;
+        tentativeKeys.push_back(static_cast<int>(pImpl->edgeSrc.size()) + i + 1);
+        std::vector<int> rec = edgeRecord(e.src, e.dst, e.weights);
+        newPayload.insert(newPayload.end(), rec.begin(), rec.end());
+        running += static_cast<int>(rec.size());
+        newPrefixSizes.push_back(running);
+    }
+    InsertMapping mapping =
+        pImpl->edgesCBST->insert(tentativeKeys, newPayload, newPrefixSizes);
 
+    std::vector<int> assignedIds(M);
+    for (int i = 0; i < M; ++i) {
+        const auto& e = edges[i];
+        const int eid = mapping.itemToKey[i];
+        if (eid < 1) {
+            throw escher::EscherError("insertEdges: ESCHER returned an invalid edge key");
+        }
+        if (eid > static_cast<int>(pImpl->edgeSrc.size())) {
+            pImpl->edgeSrc.resize(eid, -1);
+            pImpl->edgeDst.resize(eid, -1);
+            pImpl->edgeWeights.resize(eid);
+        }
+        if (pImpl->edgeSrc[eid - 1] != -1) {
+            throw escher::EscherError("insertEdges: ESCHER reused the key of a live edge");
+        }
+        assignedIds[i] = eid;
         pImpl->edgeSrc[eid - 1]     = e.src;
         pImpl->edgeDst[eid - 1]     = e.dst;
         pImpl->edgeWeights[eid - 1] = e.weights;
         pImpl->edgeIdBySrcDst[packSrcDst(e.src, e.dst)] = eid;
-
-        newKeys.push_back(eid);
-        newPayload.push_back(e.src);
-        newPayload.push_back(e.dst);
-        for (int w : e.weights) newPayload.push_back(w);
-        running += (2 + K);
-        newPrefixSizes.push_back(running);
     }
-
-    // Route through ESCHER: insertCBST applies best-fit slot reuse for
-    // edges whose slots were freed by a prior @c erase.
-    pImpl->edgesCBST->insert(newKeys, newPayload, newPrefixSizes);
 
     // Push the new edge-ids into outAdj / inAdj per-vertex payload lists.
     // Group by source vertex for outAdj and by destination for inAdj, then
@@ -436,6 +446,35 @@ void DynamicGraph::deleteEdges(const std::vector<EdgeDelete>& edges) {
 // ---------------------------------------------------------------------------
 // dumpToCSR (snapshot is implemented in snapshot.cu so it can call cudaMemcpy)
 // ---------------------------------------------------------------------------
+
+long long DynamicGraph::checkEscher(std::ostream& log) const {
+    const int V = pImpl->numVertices_;
+    std::vector<std::vector<int>> edgeRows(pImpl->edgeSrc.size());
+    for (std::size_t i = 0; i < edgeRows.size(); ++i) {
+        if (pImpl->edgeSrc[i] < 0) continue;
+        edgeRows[i] = edgeRecord(pImpl->edgeSrc[i], pImpl->edgeDst[i],
+                                 pImpl->edgeWeights[i]);
+    }
+    std::vector<std::vector<int>> outRows(V), inRows(V);
+    for (std::size_t i = 0; i < edgeRows.size(); ++i) {
+        if (pImpl->edgeSrc[i] < 0) continue;
+        outRows[pImpl->edgeSrc[i]].push_back(static_cast<int>(i) + 1);
+        inRows[pImpl->edgeDst[i]].push_back(static_cast<int>(i) + 1);
+    }
+    long long errors = 0;
+    if (pImpl->edgesCBST) {
+        errors += checkTreeRows(pImpl->edgesCBST->context(), edgeRows,
+                                /*orderInsensitive=*/false, "edges", log);
+        errors += checkSubtreeAvail(pImpl->edgesCBST->context(), "edges", log);
+    }
+    if (pImpl->outAdjCBST)
+        errors += checkTreeRows(pImpl->outAdjCBST->context(), outRows, true,
+                                "outAdj", log);
+    if (pImpl->inAdjCBST)
+        errors += checkTreeRows(pImpl->inAdjCBST->context(), inRows, true,
+                                "inAdj", log);
+    return errors;
+}
 
 void DynamicGraph::dumpToCSR(std::vector<int>& rowPtr,
                              std::vector<int>& colInd,
