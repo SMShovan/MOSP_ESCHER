@@ -20,7 +20,7 @@ and passes `make test`. Hardware for all measurements: RTX A5000 (sm_86,
 | P4 ESCHER maintenance | done (P4a grouping without std::map, P4b copies / allocations / syncs) |
 | P5 host costs, -O3, sm_86 | done |
 | Sanitizers | memcheck, racecheck, initcheck, synccheck clean |
-| Datasets | DBLP and Geology measured; Orkut, AMiner, MAG exceed the int32 CBST payload; Threads not downloaded |
+| Datasets | DBLP and Geology measured; Orkut, AMiner, MAG not loaded (their estimated h2h payloads exceed the 2.0 x 10^9 cap per CBST); Threads not downloaded |
 
 Measured on coauth-DBLP with the paper's preprocessing and batch model
 (medians of three runs of three batches; details in
@@ -537,9 +537,11 @@ fallback), `hsospStress --configs 3 --check-escher`, `test_mosp_update` and
   checked by the tests, but the shortest-path results do not depend on
   them (as in the original code).
 - **Datasets.** Only DBLP and Geology were measured. Orkut, AMiner and MAG
-  exceed the `int`-indexed CBST payload (2^31 values) and cannot be
-  loaded; Threads was not downloaded; the synthetic full suite was not
-  rerun.
+  were not loaded: their h2h payloads, estimated from the paper's Table I
+  at about 2.1, 2.5 and 2.9 x 10^9 values, exceed the cap of 2.0 x 10^9
+  values per CBST in `constructFromRows` (the CBST core is `int`-indexed),
+  so `bulkLoad` would reject them. Threads was not downloaded; the
+  synthetic full suite was not rerun.
 - **Measurement conditions.** One RTX A5000 per run (exclusive), but the
   host was shared with other jobs; host-side stages vary by about 10-30 %
   between runs, hence medians of three runs. The baseline was built with

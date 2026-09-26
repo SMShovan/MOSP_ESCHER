@@ -171,11 +171,13 @@ coauth-MAG-Geology:
 
 ## Not measured
 
-- Orkut, AMiner and MAG: their h2h CBST payloads (about 2.1, 2.5 and 2.9 x
-  10^9 values) exceed the `int`-indexed CBST payload limit of 2^31, so
-  `bulkLoad` rejects them regardless of GPU memory. Threads (about 1.55 x
-  10^9) would fit that limit but was not downloaded (size and time
-  budget).
+- Orkut, AMiner and MAG were not loaded. Their h2h CBST payloads,
+  estimated from the paper's Table I (hyperedges x average h2h degree), are
+  about 2.1, 2.5 and 2.9 x 10^9 values, above the cap of 2.0 x 10^9 values
+  per CBST that `constructFromRows` enforces (the CBST core is
+  `int`-indexed), so `bulkLoad` would reject them regardless of GPU
+  memory. Threads (estimated the same way at about 1.55 x 10^9) would fit
+  but was not downloaded (size and time budget).
 - The synthetic suites (`--suite full`, HG-S ... HG-XL) were not rerun.
 
 ## Files and reproduction

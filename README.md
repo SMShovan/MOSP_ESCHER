@@ -77,10 +77,11 @@ the before/after tables on coauth-DBLP and coauth-MAG-Geology. In short:
 - **Baseline.** The static baseline is the GPU recompute with the same
   kernels (as in the paper). Those kernels became about 4x faster (P3 in
   CHANGES.md), which lowers the reported speedups.
-- **Scale.** The CBST payloads are `int`-indexed (at most 2^31 values per
-  tree), so Orkut, AMiner and MAG (about 2.1-2.9 x 10^9 h2h entries)
-  cannot be loaded, independently of GPU memory. Only DBLP and Geology
-  were measured here.
+- **Scale.** The CBST payloads are `int`-indexed, and `constructFromRows`
+  caps each at 2.0 x 10^9 values, so Orkut, AMiner and MAG (about 2.1-2.9
+  x 10^9 h2h entries, estimated from the paper's Table I; not loaded
+  here) would be rejected, independently of GPU memory. Only DBLP and
+  Geology were measured.
 - **Results.** On an RTX A5000 the dynamic time per batch (maintenance +
   unification + CSR apply + update, the paper's metric) is below the
   recompute only for DBLP vertex batches of 25K (1.28x); elsewhere it is

@@ -83,11 +83,14 @@ std::unique_ptr<CBSTOperations> constructFromRows(
     long long capacity = static_cast<long long>(
                              static_cast<double>(flat.size()) * headroom) +
                          extra;
-    if (capacity > 2000000000LL) capacity = 2000000000LL;   // int-indexed
+    // The CBST core is int-indexed; the cap leaves room below 2^31.
+    constexpr long long kMaxPayload = 2000000000LL;
+    if (capacity > kMaxPayload) capacity = kMaxPayload;
     if (capacity < static_cast<long long>(flat.size())) {
-        throw escher::EscherError(std::string("DynamicHypergraph: ") + name +
-                                  " initial payload exceeds the 2^31 int "
-                                  "payload limit of the CBST core");
+        throw escher::EscherError(
+            std::string("DynamicHypergraph: ") + name + " initial payload (" +
+            std::to_string(flat.size()) + " values) exceeds the cap of " +
+            std::to_string(kMaxPayload) + " values per CBST");
     }
     auto cbst = std::make_unique<CBSTOperations>(
         name, static_cast<int>(capacity), 4);
