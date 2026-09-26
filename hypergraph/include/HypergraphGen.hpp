@@ -17,6 +17,7 @@
  */
 
 #include <cstdint>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,41 @@ HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
                       const BatchParams& bp,
                       const std::vector<long long>& dist,
                       const std::vector<int>& parent);
+
+/**
+ * @brief Loads a real hypergraph with the paper's preprocessing.
+ *
+ * Input: one hyperedge per line, vertex ids separated by spaces, tabs or
+ * commas (e.g. coauth-DBLP). Duplicate vertices of a line are merged,
+ * hyperedges with more than @p maxCardinality vertices are dropped, and the
+ * vertex ids are renumbered 0..n-1 in order of first appearance. Real
+ * hyperedges get weights U[1,100] (seeded; the paper does not say how it
+ * weights real data). The virtual source hyperedge {s} is row 1 (s = a
+ * vertex of maximum degree) and the virtual target {t} the last row (t =
+ * a uniformly random vertex), both with weight 0.
+ *
+ * @throws std::runtime_error if the file cannot be read or has no
+ *         hyperedge within the cardinality bound.
+ */
+GeneratedHypergraph loadHypergraphFile(const std::string& path,
+                                       int maxCardinality,
+                                       std::uint64_t seed);
+
+/**
+ * @brief Change batch following the paper's model (Section VI).
+ *
+ * Hyperedge batch: @p delPct % of @p size are deletions of distinct random
+ * hyperedges; each insertion clones a random hyperedge, replaces about
+ * @p replaceFrac of its vertices by vertices of a neighbouring hyperedge
+ * (one that shares a vertex with it) and draws a weight U[1,100]. Vertex
+ * batch: each change removes a random member of a random hyperedge
+ * (probability @p delPct %) or adds a vertex of a neighbouring hyperedge.
+ * The virtual source and target hyperedges are never changed. Neighbours
+ * are found through the incidence lists (HostHypergraph::v2h).
+ */
+HgBatch generatePaperBatch(const HostHypergraph& hg, BatchKind kind,
+                           int size, double delPct, double replaceFrac,
+                           std::mt19937_64& rng);
 
 const char* toString(BatchKind k);
 const char* toString(Placement p);

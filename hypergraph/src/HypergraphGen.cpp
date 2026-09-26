@@ -7,8 +7,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <random>
+#include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace escher_mosp {
@@ -265,6 +269,157 @@ HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
         }
     }
     return batch;
+}
+
+GeneratedHypergraph loadHypergraphFile(const std::string& path,
+                                       int maxCardinality,
+                                       std::uint64_t seed) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot open hypergraph file " + path);
+    std::vector<std::vector<int>> raw;
+    std::string line;
+    std::vector<int> r;
+    while (std::getline(in, line)) {
+        r.clear();
+        const char* p = line.c_str();
+        while (*p) {
+            while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\r') ++p;
+            if (!*p) break;
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p) {
+                throw std::runtime_error("non-numeric token in " + path +
+                                         ": " + line);
+            }
+            r.push_back(static_cast<int>(v));
+            p = end;
+        }
+        if (r.empty()) continue;
+        std::sort(r.begin(), r.end());
+        r.erase(std::unique(r.begin(), r.end()), r.end());
+        if (static_cast<int>(r.size()) > maxCardinality) continue;
+        raw.push_back(r);
+    }
+    if (raw.empty()) {
+        throw std::runtime_error("no hyperedge of at most " +
+                                 std::to_string(maxCardinality) +
+                                 " vertices in " + path);
+    }
+    // Renumber the vertices 0..n-1 in order of first appearance.
+    std::unordered_map<int, int> remap;
+    remap.reserve(raw.size() * 2);
+    for (auto& row : raw)
+        for (int& v : row) {
+            auto it = remap.find(v);
+            if (it == remap.end())
+                it = remap.emplace(v, static_cast<int>(remap.size())).first;
+            v = it->second;
+        }
+    GeneratedHypergraph g;
+    g.numVertices = static_cast<int>(remap.size());
+    std::vector<int> deg(g.numVertices, 0);
+    for (const auto& row : raw)
+        for (int v : row) ++deg[v];
+    std::mt19937_64 rng(seed);
+    g.sourceVertex = static_cast<int>(
+        std::max_element(deg.begin(), deg.end()) - deg.begin());
+    g.targetVertex =
+        std::uniform_int_distribution<int>(0, g.numVertices - 1)(rng);
+    std::uniform_int_distribution<long long> wDist(1, 100);
+    g.rows.reserve(raw.size() + 2);
+    g.weights.reserve(raw.size() + 2);
+    g.rows.push_back({g.sourceVertex});
+    g.weights.push_back(0);
+    for (auto& row : raw) {
+        g.rows.push_back(std::move(row));
+        g.weights.push_back(wDist(rng));
+    }
+    g.rows.push_back({g.targetVertex});
+    g.weights.push_back(0);
+    g.sourceHe = 1;
+    g.targetHe = static_cast<int>(g.rows.size());
+    return g;
+}
+
+HgBatch generatePaperBatch(const HostHypergraph& hg, BatchKind kind,
+                           int size, double delPct, double replaceFrac,
+                           std::mt19937_64& rng) {
+    HgBatch b;
+    std::vector<int> pool;
+    pool.reserve(hg.aliveCount);
+    for (int id = 1; id <= hg.maxId(); ++id)
+        if (hg.alive[id - 1] && id != hg.sourceHe && id != hg.targetHe)
+            pool.push_back(id);
+    if (pool.empty() || size <= 0) return b;
+    std::uniform_int_distribution<std::size_t> pick(0, pool.size() - 1);
+    std::uniform_int_distribution<long long> wDist(1, 100);
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+    auto randomOf = [&](const std::vector<int>& v) {
+        return v[std::uniform_int_distribution<std::size_t>(0, v.size() - 1)(
+            rng)];
+    };
+    // A hyperedge sharing a vertex with id (through a random vertex of id).
+    auto randomNeighbor = [&](int id) -> int {
+        const std::vector<int>& verts = hg.heVerts[id - 1];
+        for (int tries = 0; tries < 8 && !verts.empty(); ++tries) {
+            const std::vector<int>& inc = hg.v2h[randomOf(verts)];
+            if (inc.size() < 2) continue;
+            const int x = randomOf(inc);
+            if (x != id && x != hg.sourceHe && x != hg.targetHe) return x;
+        }
+        return 0;
+    };
+    const int nDel = static_cast<int>(size * delPct / 100.0 + 0.5);
+    const int nIns = size - nDel;
+    if (kind == BatchKind::Hyperedge) {
+        std::unordered_set<int> chosen;
+        const int want = std::min<int>(nDel, static_cast<int>(pool.size()));
+        while (static_cast<int>(chosen.size()) < want)
+            chosen.insert(pool[pick(rng)]);
+        b.heDelete.assign(chosen.begin(), chosen.end());
+        std::sort(b.heDelete.begin(), b.heDelete.end());
+        for (int i = 0; i < nIns; ++i) {
+            const int src = pool[pick(rng)];
+            std::vector<int> verts = hg.heVerts[src - 1];
+            const int nb = randomNeighbor(src);
+            if (nb > 0 && verts.size() >= 2) {
+                const std::vector<int>& nv = hg.heVerts[nb - 1];
+                const int r = std::max(
+                    1, static_cast<int>(std::lround(replaceFrac * verts.size())));
+                std::shuffle(verts.begin(), verts.end(), rng);
+                for (int k = 0; k < r && k < static_cast<int>(verts.size()); ++k)
+                    verts[k] = randomOf(nv);
+            }
+            HgBatch::HeIns ins;
+            ins.vertices = std::move(verts);
+            ins.weight = wDist(rng);
+            b.heInsert.push_back(std::move(ins));
+        }
+    } else {
+        long long retries = 0;
+        const long long maxRetries = 10LL * size + 1000;
+        for (int i = 0; i < size; ++i) {
+            const int id = pool[pick(rng)];
+            const std::vector<int>& verts = hg.heVerts[id - 1];
+            if (unif(rng) < delPct / 100.0) {
+                if (verts.size() < 2) {
+                    if (++retries > maxRetries) break;
+                    --i;
+                    continue;
+                }
+                b.vtxDelete.push_back({id, randomOf(verts)});
+            } else {
+                const int nb = randomNeighbor(id);
+                if (nb <= 0) {
+                    if (++retries > maxRetries) break;
+                    --i;
+                    continue;
+                }
+                b.vtxInsert.push_back({id, randomOf(hg.heVerts[nb - 1])});
+            }
+        }
+    }
+    return b;
 }
 
 } // namespace escher_mosp

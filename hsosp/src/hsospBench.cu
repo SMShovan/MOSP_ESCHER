@@ -7,6 +7,13 @@
  *   hsospBench --suite smoke --out results/results.csv
  *   hsospBench --suite full  --out results/results.csv
  *   hsospBench --suite full  --exp E1,E3 --reps 3 --seed 42
+ *   hsospBench --hg coauth.hg --kind hyperedge --batch 50000 --batches 3
+ *
+ * --hg runs a real hypergraph (one hyperedge per line) with the paper's
+ * preprocessing and batch model (Section VI; see loadHypergraphFile and
+ * generatePaperBatch): consecutive batches of --batch changes, --del %
+ * deletions, of --kind hyperedge or vertex, one CSV row per batch. The
+ * oracle checks the batches selected by --verify (all, first, none).
  *
  * Experiments (see docs/HSOSP.md):
  *   E1 time vs changed-batch size (hyperedge + incident-vertex batches)
@@ -27,6 +34,8 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <memory>
+#include <random>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -59,6 +68,15 @@ struct CliOptions {
     int maxIterations = 512;
     unsigned long long seed = 20260725ull;
     bool listOnly = false;
+    // Real-hypergraph mode (--hg).
+    std::string hgPath;
+    int maxCardinality = 25;
+    BatchKind kind = BatchKind::Hyperedge;
+    int batchSize = 50000;
+    int batches = 3;
+    double delPct = 50.0;
+    double replaceFrac = 0.3;
+    std::string verifyMode = "first";   ///< all | first | none
 };
 
 struct DatasetCfg {
@@ -169,30 +187,24 @@ struct LoadedDataset {
 
 int globalFailures = 0;
 
-std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
-                                           const CliOptions& opt,
-                                           unsigned long long seed,
-                                           int plannedInsertTotal) {
-    GenParams gen = toGenParams(d, seed);
-    std::fprintf(stderr,
-                 "[load] %s: m=%lld n=%d c=[%d,%d] pool=%d degTarget=%d\n",
-                 d.name.c_str(), gen.numHyperedges, gen.numVertices, gen.cMin,
-                 gen.cMax, gen.poolSize, d.degTarget);
-
+/** Builds ESCHER, the device CSR and the initial SOSP for @p g. */
+std::unique_ptr<LoadedDataset> buildDataset(const std::string& name,
+                                            GeneratedHypergraph&& g,
+                                            const GenParams& gen,
+                                            const CliOptions& opt,
+                                            int plannedInsertTotal,
+                                            long long payloadPerInsert) {
     auto t0 = Clock::now();
-    GeneratedHypergraph g = generateHypergraph(gen);
-
     DynamicHypergraph::Caps caps;
     caps.maxHyperedges =
         static_cast<int>(g.rows.size()) + plannedInsertTotal + 1024;
     caps.headroomFactor = 1.3;
     // Growth headroom: every planned insert appends into h2v/v2h/h2h.
     caps.extraPayloadInts =
-        static_cast<long long>(plannedInsertTotal) *
-            (gen.cMax + d.degTarget * 2 + 16) +
+        static_cast<long long>(plannedInsertTotal) * payloadPerInsert +
         (8LL << 20);
 
-    auto ds = std::make_unique<LoadedDataset>(gen.numVertices, caps);
+    auto ds = std::make_unique<LoadedDataset>(g.numVertices, caps);
     ds->gen = gen;
     ds->dh.bulkLoad(std::move(g.rows), std::move(g.weights), g.sourceHe,
                     g.targetHe);
@@ -201,7 +213,7 @@ std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
     HostHypergraph& hg = ds->dh.host();
     std::fprintf(stderr,
                  "[load] %s: built in %.0f ms; h2h pairs=%lld avgDeg=%.1f\n",
-                 d.name.c_str(), loadMs, hg.h2hPairCount,
+                 name.c_str(), loadMs, hg.h2hPairCount,
                  hg.aliveCount ? 2.0 * hg.h2hPairCount / hg.aliveCount : 0.0);
 
     t0 = Clock::now();
@@ -216,7 +228,7 @@ std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
     std::fprintf(stderr,
                  "[load] %s: device build+initial SOSP in %.0f ms "
                  "(%d iterations)\n",
-                 d.name.c_str(), msSince(t0), is.iterations);
+                 name.c_str(), msSince(t0), is.iterations);
 
     // Reachable fraction from the initial solve.
     {
@@ -229,16 +241,166 @@ std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
         ds->reachableFrac =
             hg.aliveCount ? static_cast<double>(reach) / hg.aliveCount : 0.0;
         std::fprintf(stderr, "[load] %s: reachable fraction %.3f\n",
-                     d.name.c_str(), ds->reachableFrac);
+                     name.c_str(), ds->reachableFrac);
     }
     return ds;
+}
+
+std::unique_ptr<LoadedDataset> loadDataset(const DatasetCfg& d,
+                                           const CliOptions& opt,
+                                           unsigned long long seed,
+                                           int plannedInsertTotal) {
+    GenParams gen = toGenParams(d, seed);
+    std::fprintf(stderr,
+                 "[load] %s: m=%lld n=%d c=[%d,%d] pool=%d degTarget=%d\n",
+                 d.name.c_str(), gen.numHyperedges, gen.numVertices, gen.cMin,
+                 gen.cMax, gen.poolSize, d.degTarget);
+    GeneratedHypergraph g = generateHypergraph(gen);
+    return buildDataset(d.name, std::move(g), gen, opt, plannedInsertTotal,
+                        gen.cMax + d.degTarget * 2 + 16);
+}
+
+/** Timings, counters and checks of one batch. */
+struct BatchOutcome {
+    bool ok = false;             ///< false: the pipeline threw
+    DynamicHypergraph::BatchResult br;
+    double csrMs = 0.0, sospMs = 0.0, staticMs = 0.0;
+    hsosp::UpdateStats us;
+    long long mismatchStatic = 0;
+    bool oracleRan = false;
+    SospCheck oracle;
+    bool correct() const {
+        return ok && mismatchStatic == 0 && (!oracleRan || oracle.ok());
+    }
+    bool verified() const { return ok && oracleRan && oracle.ok(); }
+    double dynamicMs() const {
+        return br.escherMs + br.deltaMs + csrMs + sospMs;
+    }
+};
+
+/**
+ * Runs one batch: the dynamic pipeline (timed: ESCHER maintenance +
+ * unification + CSR apply + SOSP update, the paper's dynamic time), the
+ * static recompute baseline (timed separately) and the checks: update ==
+ * recompute always, and the independent oracle when @p verify.
+ */
+BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
+                      const CliOptions& opt, bool verify,
+                      const std::string& what) {
+    BatchOutcome o;
+    HostHypergraph& hg = ds.dh.host();
+    hsosp::UpdateConfig ucfg;
+    ucfg.maxIterations = opt.maxIterations;
+
+    // ---- dynamic pipeline (timed) --------------------------------------
+    try {
+        o.br = ds.dh.applyBatch(batch);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[error] %s: applyBatch failed: %s\n",
+                     what.c_str(), e.what());
+        ++globalFailures;
+        return o;
+    }
+
+    auto t0 = Clock::now();
+    bool ok = hsosp::applyDeltaToDevice(ds.dev, hg, o.br.delta);
+    o.csrMs = msSince(t0);
+    if (!ok) {
+        // Tail exhausted: rebuild from the shadow (counted, not timed
+        // as part of the update) and re-run this batch's CSR stage as
+        // a rebuild (the rebuild itself installs the post-batch state).
+        ++ds.overflowRebuilds;
+        std::fprintf(stderr, "[warn] %s: device CSR overflow, rebuilding\n",
+                     what.c_str());
+        hsosp::buildDeviceH2H(ds.dev, hg, ds.stateA.maxNodes, 1.6);
+    }
+
+    t0 = Clock::now();
+    o.us = hsosp::hsospUpdate(ds.dev, ds.stateA, o.br.delta.seeds,
+                              o.br.delta.deadHe, hg.sourceHe, ucfg);
+    o.sospMs = msSince(t0);
+
+    // ---- static baseline (timed) ---------------------------------------
+    t0 = Clock::now();
+    hsosp::hsospRecompute(ds.dev, ds.stateB, hg.sourceHe, ucfg);
+    o.staticMs = msSince(t0);
+
+    // ---- correctness ---------------------------------------------------
+    // update == static recompute (same kernels, so not independent),
+    // and, when the oracle runs, update == Dijkstra on the line graph
+    // rebuilt from the incidence lists, with a valid shortest-path tree.
+    o.mismatchStatic =
+        hsosp::compareDistances(ds.stateA, ds.stateB, hg.maxId());
+    o.oracleRan = verify;
+    if (verify) {
+        LineGraphCSR lg = rebuildLineGraph(hg);
+        std::vector<long long> got;
+        std::vector<int> par;
+        ds.stateA.downloadDistances(got, hg.maxId());
+        ds.stateA.downloadParents(par, hg.maxId());
+        o.oracle = checkSosp(hg, lg, referenceDistances(hg, lg, hg.sourceHe),
+                             got, par);
+    }
+    o.ok = true;
+    if (!o.correct()) {
+        ++globalFailures;
+        std::fprintf(stderr,
+                     "[FAIL] %s: %lld mismatches vs static, %lld vs oracle, "
+                     "%lld parent errors\n",
+                     what.c_str(), o.mismatchStatic, o.oracle.distMismatches,
+                     o.oracle.parentErrors);
+    }
+    return o;
+}
+
+/** Appends the CSV row of one batch. */
+void writeRow(CsvWriter& csv, const CliOptions& opt, const std::string& exp,
+              const std::string& dataset, const LoadedDataset& ds,
+              BatchKind kind, int batchSize, double delPct, Placement pl,
+              int rep, unsigned long long seed, const BatchOutcome& o) {
+    const HostHypergraph& hg = ds.dh.host();
+    const double dynTotal = o.dynamicMs();
+    const double avgDeg =
+        hg.aliveCount ? 2.0 * hg.h2hPairCount / hg.aliveCount : 0.0;
+    auto& r = csv.row();
+    r << nowString() << "," << opt.suite << "," << exp << "," << dataset
+      << "," << ds.gen.numHyperedges << "," << ds.gen.numVertices << ","
+      << ds.gen.cMin << "," << ds.gen.cMax << "," << ds.gen.poolSize << ","
+      << ds.gen.bridgeFrac << "," << avgDeg << "," << hg.h2hPairCount << ","
+      << toString(kind) << "," << batchSize << "," << delPct << ","
+      << toString(pl) << "," << rep << "," << seed << "," << o.br.escherMs
+      << "," << o.br.deltaMs << "," << o.csrMs << "," << o.sospMs << ","
+      << dynTotal << "," << o.staticMs << ","
+      << (dynTotal > 0 ? o.staticMs / dynTotal : 0.0) << ","
+      << o.us.iterations << "," << (o.us.fallbackRecompute ? 1 : 0) << ","
+      << o.us.seedCount << "," << o.us.maxFrontier << ","
+      << ds.overflowRebuilds << "," << deviceMemUsedMB() << ","
+      << ds.dh.escherDeviceBytes() / (1024.0 * 1024.0) << ","
+      << (ds.dev.deviceBytes() + ds.stateA.deviceBytes() +
+          ds.stateB.deviceBytes()) /
+             (1024.0 * 1024.0)
+      << "," << ds.reachableFrac << "," << (o.verified() ? 1 : 0) << ","
+      << (o.correct() ? 1 : 0) << "," << (o.oracleRan ? "host" : "none")
+      << "," << o.mismatchStatic << ","
+      << (o.oracleRan ? o.oracle.distMismatches : -1) << ","
+      << (o.oracleRan ? o.oracle.parentErrors : -1);
+    csv.endRow();
+    std::fprintf(stderr,
+                 "[row] %s %s %s dE=%d del=%.0f %s rep=%d: "
+                 "dyn=%.1fms (escher=%.1f delta=%.1f csr=%.1f "
+                 "sosp=%.1f) static=%.1fms speedup=%.2f iters=%d%s%s\n",
+                 dataset.c_str(), exp.c_str(), toString(kind), batchSize,
+                 delPct, toString(pl), rep, dynTotal, o.br.escherMs,
+                 o.br.deltaMs, o.csrMs, o.sospMs, o.staticMs,
+                 dynTotal > 0 ? o.staticMs / dynTotal : 0.0, o.us.iterations,
+                 o.us.fallbackRecompute ? " FALLBACK" : "",
+                 o.oracleRan ? (o.verified() ? " verified" : " ORACLE-FAIL")
+                             : "");
 }
 
 void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
                  const Scenario& sc, const CliOptions& opt, CsvWriter& csv) {
     HostHypergraph& hg = ds.dh.host();
-    hsosp::UpdateConfig ucfg;
-    ucfg.maxIterations = opt.maxIterations;
 
     for (int rep = 0; rep < opt.reps; ++rep) {
         unsigned long long bseed = mixSeed(
@@ -264,113 +426,68 @@ void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
         HgBatch batch =
             generateBatch(hg, ds.gen, bp, distSnapshot, parentSnapshot);
 
-        // ---- dynamic pipeline (timed) ----------------------------------
-        double csrMs = 0.0, sospMs = 0.0;
-        DynamicHypergraph::BatchResult br;
-        try {
-            br = ds.dh.applyBatch(batch);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "[error] %s %s: applyBatch failed: %s\n",
-                         dcfg.name.c_str(), sc.experiment.c_str(), e.what());
-            ++globalFailures;
-            return;
-        }
-
-        auto t0 = Clock::now();
-        bool ok = hsosp::applyDeltaToDevice(ds.dev, hg, br.delta);
-        csrMs = msSince(t0);
-        if (!ok) {
-            // Tail exhausted: rebuild from the shadow (counted, not timed
-            // as part of the update) and re-run this batch's CSR stage as
-            // a rebuild (the rebuild itself installs the post-batch state).
-            ++ds.overflowRebuilds;
-            std::fprintf(stderr,
-                         "[warn] %s: device CSR overflow, rebuilding\n",
-                         dcfg.name.c_str());
-            hsosp::buildDeviceH2H(ds.dev, hg, ds.stateA.maxNodes, 1.6);
-        }
-
-        t0 = Clock::now();
-        hsosp::UpdateStats us =
-            hsosp::hsospUpdate(ds.dev, ds.stateA, br.delta.seeds,
-                               br.delta.deadHe, hg.sourceHe, ucfg);
-        sospMs = msSince(t0);
-
-        // ---- static baseline (timed) -----------------------------------
-        t0 = Clock::now();
-        hsosp::UpdateStats rs =
-            hsosp::hsospRecompute(ds.dev, ds.stateB, hg.sourceHe, ucfg);
-        double staticMs = msSince(t0);
-        (void)rs;
-
-        // ---- correctness ----------------------------------------------
-        // update == static recompute (same kernels, so not independent),
-        // and, when the oracle runs, update == Dijkstra on the line graph
-        // rebuilt from the incidence lists, with a valid shortest-path tree.
-        // "verified" is 1 only when the oracle ran and agreed.
-        const long long mismatches =
-            hsosp::compareDistances(ds.stateA, ds.stateB, hg.maxId());
-        const bool oracleRan = hg.maxId() <= opt.verifyMax;
-        SospCheck oc;
-        if (oracleRan) {
-            LineGraphCSR lg = rebuildLineGraph(hg);
-            std::vector<long long> got;
-            std::vector<int> par;
-            ds.stateA.downloadDistances(got, hg.maxId());
-            ds.stateA.downloadParents(par, hg.maxId());
-            oc = checkSosp(hg, lg, referenceDistances(hg, lg, hg.sourceHe),
-                           got, par);
-        }
-        const bool verified = oracleRan && oc.ok();
-        const bool correct = mismatches == 0 && (!oracleRan || oc.ok());
-        if (!correct) {
-            ++globalFailures;
-            std::fprintf(stderr,
-                         "[FAIL] %s %s rep %d: %lld mismatches vs static, "
-                         "%lld vs oracle, %lld parent errors\n",
-                         dcfg.name.c_str(), sc.experiment.c_str(), rep,
-                         mismatches, oc.distMismatches, oc.parentErrors);
-        }
-
-        const double dynTotal = br.escherMs + br.deltaMs + csrMs + sospMs;
-        const double avgDeg =
-            hg.aliveCount ? 2.0 * hg.h2hPairCount / hg.aliveCount : 0.0;
-
-        auto& o = csv.row();
-        o << nowString() << "," << opt.suite << "," << sc.experiment << ","
-          << dcfg.name << "," << ds.gen.numHyperedges << ","
-          << ds.gen.numVertices << "," << ds.gen.cMin << "," << ds.gen.cMax
-          << "," << ds.gen.poolSize << "," << ds.gen.bridgeFrac << ","
-          << avgDeg << "," << hg.h2hPairCount << "," << toString(sc.kind)
-          << "," << sc.batchSize << "," << sc.delPct << ","
-          << toString(sc.placement) << "," << rep << "," << bseed << ","
-          << br.escherMs << "," << br.deltaMs << "," << csrMs << ","
-          << sospMs << "," << dynTotal << "," << staticMs << ","
-          << (dynTotal > 0 ? staticMs / dynTotal : 0.0) << ","
-          << us.iterations << "," << (us.fallbackRecompute ? 1 : 0) << ","
-          << us.seedCount << "," << us.maxFrontier << ","
-          << ds.overflowRebuilds << "," << deviceMemUsedMB() << ","
-          << ds.dh.escherDeviceBytes() / (1024.0 * 1024.0) << ","
-          << (ds.dev.deviceBytes() + ds.stateA.deviceBytes() +
-              ds.stateB.deviceBytes()) /
-                 (1024.0 * 1024.0)
-          << "," << ds.reachableFrac << "," << (verified ? 1 : 0) << ","
-          << (correct ? 1 : 0) << "," << (oracleRan ? "host" : "none") << ","
-          << mismatches << "," << (oracleRan ? oc.distMismatches : -1) << ","
-          << (oracleRan ? oc.parentErrors : -1);
-        csv.endRow();
-
-        std::fprintf(stderr,
-                     "[row] %s %s %s dE=%d del=%.0f %s rep=%d: "
-                     "dyn=%.1fms (escher=%.1f delta=%.1f csr=%.1f "
-                     "sosp=%.1f) static=%.1fms speedup=%.2f iters=%d%s\n",
-                     dcfg.name.c_str(), sc.experiment.c_str(),
-                     toString(sc.kind), sc.batchSize, sc.delPct,
-                     toString(sc.placement), rep, dynTotal, br.escherMs,
-                     br.deltaMs, csrMs, sospMs, staticMs,
-                     dynTotal > 0 ? staticMs / dynTotal : 0.0, us.iterations,
-                     us.fallbackRecompute ? " FALLBACK" : "");
+        const std::string what = dcfg.name + " " + sc.experiment +
+                                 " rep " + std::to_string(rep);
+        BatchOutcome o = runBatch(ds, batch, opt,
+                                  hg.maxId() <= opt.verifyMax, what);
+        if (!o.ok) return;
+        writeRow(csv, opt, sc.experiment, dcfg.name, ds, sc.kind,
+                 sc.batchSize, sc.delPct, sc.placement, rep, bseed, o);
     }
+}
+
+/** --hg mode: a real hypergraph, the paper's preprocessing and batches. */
+int runRealDataset(const CliOptions& opt, CsvWriter& csv) {
+    auto tStart = Clock::now();
+    auto t0 = Clock::now();
+    GeneratedHypergraph g =
+        loadHypergraphFile(opt.hgPath, opt.maxCardinality, opt.seed);
+    const double readMs = msSince(t0);
+    std::string name = opt.hgPath;
+    const auto slash = name.find_last_of('/');
+    if (slash != std::string::npos) name = name.substr(slash + 1);
+    GenParams gen;
+    gen.numHyperedges = static_cast<long long>(g.rows.size()) - 2;
+    gen.numVertices = g.numVertices;
+    gen.cMin = 1;
+    gen.cMax = opt.maxCardinality;
+    gen.poolSize = 0;
+    gen.bridgeFrac = 0;
+    gen.seed = opt.seed;
+    std::fprintf(stderr,
+                 "[load] %s: %lld hyperedges (cardinality <= %d), %d "
+                 "vertices, read in %.0f ms\n",
+                 name.c_str(), gen.numHyperedges, opt.maxCardinality,
+                 gen.numVertices, readMs);
+    const int plannedInserts =
+        (opt.kind == BatchKind::Hyperedge ? opt.batchSize : 0) * opt.batches +
+        65536;
+    auto ds = buildDataset(name, std::move(g), gen, opt, plannedInserts,
+                           opt.maxCardinality + 2 * 128 + 16);
+    const double loadMs = msSince(tStart);
+
+    std::mt19937_64 rng(mixSeed(opt.seed, 0x5eedull));
+    double dynamicSum = 0.0, staticSum = 0.0;
+    for (int b = 0; b < opt.batches; ++b) {
+        HgBatch batch = generatePaperBatch(ds->dh.host(), opt.kind,
+                                           opt.batchSize, opt.delPct,
+                                           opt.replaceFrac, rng);
+        const bool verify = opt.verifyMode == "all" ||
+                            (opt.verifyMode == "first" && b == 0);
+        BatchOutcome o = runBatch(*ds, batch, opt, verify,
+                                  name + " batch " + std::to_string(b));
+        if (!o.ok) return 1;
+        dynamicSum += o.dynamicMs();
+        staticSum += o.staticMs;
+        writeRow(csv, opt, "paper", name, *ds, opt.kind, opt.batchSize,
+                 opt.delPct, Placement::Random, b, opt.seed, o);
+    }
+    std::fprintf(stderr,
+                 "[e2e] %s: load %.0f ms, %d batches: dynamic %.0f ms, "
+                 "static %.0f ms, wall %.0f ms\n",
+                 name.c_str(), loadMs, opt.batches, dynamicSum, staticSum,
+                 msSince(tStart));
+    return 0;
 }
 
 bool wantExp(const CliOptions& opt, const char* e) {
@@ -400,10 +517,56 @@ int main(int argc, char** argv) {
             opt.maxIterations = std::stoi(next("--maxiter"));
         else if (a == "--seed") opt.seed = std::stoull(next("--seed"));
         else if (a == "--list") opt.listOnly = true;
+        else if (a == "--hg") opt.hgPath = next("--hg");
+        else if (a == "--maxcard")
+            opt.maxCardinality = std::stoi(next("--maxcard"));
+        else if (a == "--kind") {
+            std::string k = next("--kind");
+            if (k == "hyperedge") opt.kind = BatchKind::Hyperedge;
+            else if (k == "vertex") opt.kind = BatchKind::Vertex;
+            else {
+                std::fprintf(stderr, "--kind must be hyperedge or vertex\n");
+                return 2;
+            }
+        }
+        else if (a == "--batch") opt.batchSize = std::stoi(next("--batch"));
+        else if (a == "--batches") opt.batches = std::stoi(next("--batches"));
+        else if (a == "--del") opt.delPct = std::stod(next("--del"));
+        else if (a == "--verify") {
+            opt.verifyMode = next("--verify");
+            if (opt.verifyMode != "all" && opt.verifyMode != "first" &&
+                opt.verifyMode != "none") {
+                std::fprintf(stderr, "--verify must be all, first or none\n");
+                return 2;
+            }
+        }
         else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             return 2;
         }
+    }
+    if (!opt.hgPath.empty()) {
+        if (opt.batchSize < 1 || opt.batches < 0 || opt.maxCardinality < 1 ||
+            !(opt.delPct >= 0 && opt.delPct <= 100)) {
+            std::fprintf(stderr, "invalid --batch/--batches/--maxcard/--del\n");
+            return 2;
+        }
+        opt.suite = "real";
+        auto slash = opt.out.find_last_of('/');
+        if (slash != std::string::npos) {
+            std::string dir = "mkdir -p " + opt.out.substr(0, slash);
+            int rc = std::system(dir.c_str());
+            (void)rc;
+        }
+        CsvWriter csv(opt.out);
+        int rc = 1;
+        try {
+            rc = runRealDataset(opt, csv);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[error] %s\n", e.what());
+        }
+        if (rc == 0 && globalFailures > 0) rc = 1;
+        return rc;
     }
     const bool smoke = (opt.suite == "smoke");
 

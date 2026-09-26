@@ -235,3 +235,21 @@ test with other seeds, 0 failures.
   checked: `oracle` (host / none), `mismatch_static`, `mismatch_oracle`,
   `parent_errors`; `verified` is 1 only when the oracle ran and agreed. The
   smoke suite runs in `make test`.
+
+## Benchmark driver
+
+- **Real hypergraphs** (`hsospBench --hg FILE`). The repository had no
+  loader for the paper's datasets (synthetic generators only). The new mode
+  reads one hyperedge per line with the paper's preprocessing (duplicate
+  vertices merged, hyperedges above `--maxcard`, default 25, dropped, vertex
+  ids renumbered; weights U[1,100]; source = a vertex of maximum degree,
+  target = a random vertex) and runs consecutive batches with the paper's
+  batch model (`generatePaperBatch`: deletions of random hyperedges;
+  insertions clone a hyperedge and replace about 30% of its vertices by
+  vertices of a neighbouring hyperedge; vertex batches remove a member or
+  adopt a neighbour's vertex), `--batch`, `--batches`, `--del`, `--kind`.
+  Every batch goes through the same routine as the synthetic suite (dynamic
+  pipeline, static recompute, checks) and gives one CSV row; `--verify`
+  selects the batches the independent oracle checks (all / first / none).
+  On coauth-DBLP this gives 2,466,792 hyperedges and 1,924,991 vertices
+  (the paper lists 2,466,661 / 1,924,991).
