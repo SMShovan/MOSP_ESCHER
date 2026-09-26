@@ -371,3 +371,18 @@ medians of three runs are in [results/README.md](results/README.md).
   stable sort; the calls receive the same rows and values.
   DBLP 50K: ESCHER maintenance 0.92-1.13 s → 120-135 ms (333 ms on the
   first batch, see P4b); dynamic time per batch 1.03-1.24 s → 0.22-0.44 s.
+- **P4b ESCHER operations without per-item copies, per-call allocations
+  and redundant synchronization** (`escher/structure/operations.cu`).
+  Surplus rows of an insert were appended with two or three `cudaMemcpy`
+  / `cudaMemset` calls per row (about 220 ms for the 25K new rows of the
+  first DBLP batch); they are now packed on the host and appended with one
+  copy. Every temporary was a `cudaMalloc` / `cudaFree` pair (`cudaFree`
+  synchronizes the device), every kernel launch was followed by
+  `cudaDeviceSynchronize`, the three degree bins were uploaded separately,
+  and a fill uploaded a zero relocation plan and downloaded the whole plan
+  to read one total. Temporaries now come from the stream-ordered pool
+  (`cudaMallocAsync`, freed blocks kept up to 1 GiB), launches are only
+  error-checked, the bins go up in one copy, the plan is zeroed on the
+  device and only the total is read back. (The same changes were made in
+  ESCHER-GPU.) DBLP 50K: ESCHER maintenance 333 → 113 ms on the first
+  batch, 120-135 → 109-123 ms afterwards.

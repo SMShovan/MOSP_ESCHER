@@ -38,6 +38,77 @@ static inline void checkCuda(cudaError_t result) {
   ::escher::checkCudaImpl(result, __FILE__, __LINE__, "checkCuda");
 }
 
+// Stream-ordered temporary buffer (cudaMallocAsync / cudaFreeAsync on the
+// default stream). The operations used cudaMalloc / cudaFree for every
+// temporary, and cudaFree synchronizes the device; with the pool, an
+// operation queues its kernels without host round trips except where it
+// reads a result back.
+template <class T> class TempBuffer {
+public:
+  explicit TempBuffer(size_t n) {
+    static const bool poolReady = [] {
+      // Keep freed blocks in the pool instead of returning them to the
+      // driver at every synchronization.
+      int device = 0;
+      cudaMemPool_t pool;
+      if (cudaGetDevice(&device) == cudaSuccess &&
+          cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess) {
+        unsigned long long threshold = 1ull << 30;
+        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
+                                &threshold);
+      }
+      return true;
+    }();
+    (void)poolReady;
+    checkCuda(cudaMallocAsync(reinterpret_cast<void **>(&ptr_),
+                              std::max<size_t>(n, 1) * sizeof(T), 0));
+  }
+  ~TempBuffer() { cudaFreeAsync(ptr_, 0); }
+  TempBuffer(const TempBuffer &) = delete;
+  TempBuffer &operator=(const TempBuffer &) = delete;
+  T *get() const { return ptr_; }
+
+private:
+  T *ptr_ = nullptr;
+};
+
+// Degree binning of per-item work: items with fewer than 32 values run one
+// per thread, fewer than 1024 one per warp, larger ones one per block. The
+// three index lists are uploaded with one copy (the original allocated,
+// uploaded, synchronized and freed each list separately).
+struct DegreeBins {
+  explicit DegreeBins(const std::vector<int> &sizes) : index(sizes.size()) {
+    std::vector<int> lists[3];
+    for (size_t i = 0; i < sizes.size(); ++i)
+      lists[sizes[i] < 32 ? 0 : (sizes[i] < 1024 ? 1 : 2)].push_back(
+          static_cast<int>(i));
+    std::vector<int> all;
+    all.reserve(sizes.size());
+    for (int b = 0; b < 3; ++b) {
+      count[b] = static_cast<int>(lists[b].size());
+      all.insert(all.end(), lists[b].begin(), lists[b].end());
+    }
+    if (!all.empty())
+      checkCuda(cudaMemcpyAsync(index.get(), all.data(),
+                                all.size() * sizeof(int),
+                                cudaMemcpyHostToDevice, 0));
+  }
+  int *bin(int b) const {
+    return index.get() +
+           (b == 0 ? 0 : (b == 1 ? count[0] : count[0] + count[1]));
+  }
+  TempBuffer<int> index;
+  int count[3] = {0, 0, 0};
+};
+
+// Sizes of the items of an inclusive prefix-sum layout.
+static std::vector<int> itemSizes(const std::vector<int> &prefixSizes) {
+  std::vector<int> sizes(prefixSizes.size());
+  for (size_t i = 0; i < prefixSizes.size(); ++i)
+    sizes[i] = prefixSizes[i] - (i == 0 ? 0 : prefixSizes[i - 1]);
+  return sizes;
+}
+
 // Set each node's occupancy to the true number of data values stored in its
 // segment at construction time. Mirrors the tid -> index2 rank mapping of
 // storeItemsIntoNodes so occupancy[rank] lands on the right tree node.
@@ -87,7 +158,7 @@ static void ensureScratchCapacity(CBSTContext &ctx, int K,
 
 // Recomputes subtreeAvail (number of deleted slots per subtree) bottom-up,
 // one launch per tree level, so a level's parents read children that the
-// previous launch finished.
+// previous launch finished (stream order; no host synchronization).
 static void recomputeSubtreeAvail(CBSTContext &ctx) {
   const int blockSize = 256;
   int lastLevelStart = 1;
@@ -99,7 +170,7 @@ static void recomputeSubtreeAvail(CBSTContext &ctx) {
     int blocks = (count + blockSize - 1) / blockSize;
     reduceAvailLevel<<<blocks, blockSize>>>(
         levelStart, levelEnd, ctx.numRecords, ctx.d_avail, ctx.d_subtreeAvail);
-    checkCuda(cudaDeviceSynchronize());
+    checkCuda(cudaGetLastError());
     if (levelStart == 0)
       break;
     levelEnd = levelStart - 1;
@@ -184,14 +255,12 @@ void constructCBST(int *keys, int *startOffsets, int numRecords,
   // so subsequent fillCBST appends land after the construct-time data
   // instead of overwriting it (see structure.hpp for background).
   if (rowOccupancy != nullptr) {
-    int *d_rowOcc = nullptr;
-    checkCuda(cudaMalloc(&d_rowOcc, numRecords * sizeof(int)));
-    checkCuda(cudaMemcpy(d_rowOcc, rowOccupancy, numRecords * sizeof(int),
-                         cudaMemcpyHostToDevice));
-    setInitialOccupancy<<<numBlocks, blockSize>>>(ctx.d_nodes, d_rowOcc,
+    TempBuffer<int> d_rowOcc(numRecords);
+    checkCuda(cudaMemcpy(d_rowOcc.get(), rowOccupancy,
+                         numRecords * sizeof(int), cudaMemcpyHostToDevice));
+    setInitialOccupancy<<<numBlocks, blockSize>>>(ctx.d_nodes, d_rowOcc.get(),
                                                   numRecords);
     checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_rowOcc));
   }
 
   // The upstream ESCHER code launched @c printEachNode here for debugging,
@@ -212,101 +281,65 @@ void fillCBST(const std::vector<int> &insertKeys,
   if (insertKeys.empty())
     return;
   int K = static_cast<int>(insertKeys.size());
-  std::vector<int> relocationPlanHost(K * 3, 0);
 
   ensureScratchCapacity(ctx, K,
                         static_cast<long long>(insertPayload.size()));
-  checkCuda(cudaMemcpy(ctx.d_insertKeys, insertKeys.data(), K * sizeof(int),
-                       cudaMemcpyHostToDevice));
-  checkCuda(cudaMemcpy(ctx.d_insertPayload, insertPayload.data(),
-                       insertPayload.size() * sizeof(int),
-                       cudaMemcpyHostToDevice));
-  checkCuda(cudaMemcpy(ctx.d_insertPrefixSizes, insertPrefixSizes.data(),
-                       K * sizeof(int), cudaMemcpyHostToDevice));
-  checkCuda(cudaMemcpy(ctx.d_relocationPlan, relocationPlanHost.data(),
-                       relocationPlanHost.size() * sizeof(int),
-                       cudaMemcpyHostToDevice));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertKeys, insertKeys.data(),
+                            K * sizeof(int), cudaMemcpyHostToDevice, 0));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertPayload, insertPayload.data(),
+                            insertPayload.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, 0));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertPrefixSizes, insertPrefixSizes.data(),
+                            K * sizeof(int), cudaMemcpyHostToDevice, 0));
+  checkCuda(
+      cudaMemsetAsync(ctx.d_relocationPlan, 0, 3LL * K * sizeof(int), 0));
 
   int blockSize = 256;
 
   // ── Degree-binned insertNode dispatch ────────────────────────────────
-  // Compute per-item payload sizes and bin them
-  std::vector<int> smallBin, medBin, largeBin;
-  for (int i = 0; i < K; ++i) {
-    int numValues = (i == 0) ? insertPrefixSizes[0]
-                             : insertPrefixSizes[i] - insertPrefixSizes[i - 1];
-    if (numValues < 32)
-      smallBin.push_back(i);
-    else if (numValues < 1024)
-      medBin.push_back(i);
-    else
-      largeBin.push_back(i);
-  }
-
-  // Upload bin index arrays and launch specialized kernels
-  if (!smallBin.empty()) {
-    int *d_binIdx;
-    int n = static_cast<int>(smallBin.size());
-    checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-    checkCuda(cudaMemcpy(d_binIdx, smallBin.data(), n * sizeof(int),
-                         cudaMemcpyHostToDevice));
-    int blocks = (n + blockSize - 1) / blockSize;
-    insertNode_thread<<<blocks, blockSize>>>(
+  DegreeBins bins(itemSizes(insertPrefixSizes));
+  if (int n = bins.count[0]) {
+    insertNode_thread<<<(n + blockSize - 1) / blockSize, blockSize>>>(
         ctx.d_nodes, ctx.d_flatPayload, ctx.d_insertKeys, ctx.d_insertPayload,
-        ctx.d_insertPrefixSizes, ctx.d_relocationPlan, d_binIdx, n);
-    checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_binIdx));
+        ctx.d_insertPrefixSizes, ctx.d_relocationPlan, bins.bin(0), n);
+    checkCuda(cudaGetLastError());
   }
-  if (!medBin.empty()) {
-    int *d_binIdx;
-    int n = static_cast<int>(medBin.size());
-    checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-    checkCuda(cudaMemcpy(d_binIdx, medBin.data(), n * sizeof(int),
-                         cudaMemcpyHostToDevice));
-    int totalThreads = n * 32;
-    int blocks = (totalThreads + blockSize - 1) / blockSize;
-    insertNode_warp<<<blocks, blockSize>>>(
+  if (int n = bins.count[1]) {
+    insertNode_warp<<<(n * 32 + blockSize - 1) / blockSize, blockSize>>>(
         ctx.d_nodes, ctx.d_flatPayload, ctx.d_insertKeys, ctx.d_insertPayload,
-        ctx.d_insertPrefixSizes, ctx.d_relocationPlan, d_binIdx, n);
-    checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_binIdx));
+        ctx.d_insertPrefixSizes, ctx.d_relocationPlan, bins.bin(1), n);
+    checkCuda(cudaGetLastError());
   }
-  if (!largeBin.empty()) {
-    int *d_binIdx;
-    int n = static_cast<int>(largeBin.size());
-    checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-    checkCuda(cudaMemcpy(d_binIdx, largeBin.data(), n * sizeof(int),
-                         cudaMemcpyHostToDevice));
+  if (int n = bins.count[2]) {
     insertNode_block<<<n, blockSize>>>(
         ctx.d_nodes, ctx.d_flatPayload, ctx.d_insertKeys, ctx.d_insertPayload,
-        ctx.d_insertPrefixSizes, ctx.d_relocationPlan, d_binIdx, n);
-    checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_binIdx));
+        ctx.d_insertPrefixSizes, ctx.d_relocationPlan, bins.bin(2), n);
+    checkCuda(cudaGetLastError());
   }
 
-  // ── Overflow handling (same as before) ───────────────────────────────
-  int *d_tmp;
-  checkCuda(cudaMalloc(&d_tmp, K * sizeof(int)));
+  // ── Overflow handling ────────────────────────────────────────────────
+  TempBuffer<int> d_tmp(K);
   computeNextMultipleOf4<<<(K + blockSize - 1) / blockSize, blockSize>>>(
-      ctx.d_relocationPlan, d_tmp, K);
-  checkCuda(cudaDeviceSynchronize());
-  thrust::device_ptr<int> tmp_ptr = thrust::device_pointer_cast(d_tmp);
+      ctx.d_relocationPlan, d_tmp.get(), K);
+  checkCuda(cudaGetLastError());
+  thrust::device_ptr<int> tmp_ptr = thrust::device_pointer_cast(d_tmp.get());
   thrust::inclusive_scan(tmp_ptr, tmp_ptr + K, tmp_ptr);
-  checkCuda(cudaDeviceSynchronize());
   updatePartialSolution<<<(K + blockSize - 1) / blockSize, blockSize>>>(
-      ctx.d_relocationPlan, d_tmp, K);
-  checkCuda(cudaDeviceSynchronize());
+      ctx.d_relocationPlan, d_tmp.get(), K);
+  checkCuda(cudaGetLastError());
 
+  // Only the total appended size is needed on the host.
+  int totalAppended = 0;
+  checkCuda(cudaMemcpy(&totalAppended, ctx.d_relocationPlan + 3 * (K - 1) + 2,
+                       sizeof(int), cudaMemcpyDeviceToHost));
+#ifdef ESCHER_DEBUG_FILL
   std::vector<int> relocationPlanHostOut(K * 3);
   checkCuda(cudaMemcpy(relocationPlanHostOut.data(), ctx.d_relocationPlan,
                        K * 3 * sizeof(int), cudaMemcpyDeviceToHost));
-#ifdef ESCHER_DEBUG_FILL
   printVector(relocationPlanHostOut, "Cumulative Relocation Plan");
 #endif
 
-  int totalAppended = (K > 0) ? relocationPlanHostOut[3 * (K - 1) + 2] : 0;
   if (ctx.initialPayloadSize + totalAppended > ctx.fixedSize) {
-    checkCuda(cudaFree(d_tmp));
     throw ::escher::EscherError(
         std::string("fillCBST [") + (ctx.datasetName ? ctx.datasetName : "?") +
         "]: payload overflow (" +
@@ -323,17 +356,15 @@ void fillCBST(const std::vector<int> &insertKeys,
   allocateSpace<<<numBlocks, blockSize>>>(
       ctx.d_relocationPlan, ctx.d_flatPayload, ctx.initialPayloadSize,
       ctx.d_insertKeys, ctx.d_insertPayload, ctx.d_insertPrefixSizes, K);
-  checkCuda(cudaDeviceSynchronize());
+  checkCuda(cudaGetLastError());
 
   // Fixup metadata for overflowed nodes
   fixupOverflowMetadata<<<numBlocks, blockSize>>>(
       ctx.d_nodes, ctx.d_insertKeys, ctx.d_insertPrefixSizes,
       ctx.d_relocationPlan, ctx.initialPayloadSize, K);
-  checkCuda(cudaDeviceSynchronize());
+  checkCuda(cudaGetLastError());
 
-  if (K > 0) {
-    ctx.initialPayloadSize += totalAppended;
-  }
+  ctx.initialPayloadSize += totalAppended;
 
 #ifdef ESCHER_DEBUG_FILL
   std::vector<int> updatedFlat(ctx.fixedSize);
@@ -341,39 +372,33 @@ void fillCBST(const std::vector<int> &insertKeys,
                        ctx.fixedSize * sizeof(int), cudaMemcpyDeviceToHost));
   printVector(updatedFlat, "Updated Flattened Values (vec1d)");
 #endif
-
-  checkCuda(cudaFree(d_tmp));
 }
 
 void deleteCBST(const std::vector<int> &deleteKeys, CBSTContext &ctx) {
   if (deleteKeys.empty())
     return;
   int deleteSize = static_cast<int>(deleteKeys.size());
-  int *d_deleteKeys;
-  checkCuda(cudaMalloc(&d_deleteKeys, deleteSize * sizeof(int)));
-  checkCuda(cudaMemcpy(d_deleteKeys, deleteKeys.data(),
-                       deleteSize * sizeof(int), cudaMemcpyHostToDevice));
+  TempBuffer<int> d_deleteKeys(deleteSize);
+  checkCuda(cudaMemcpyAsync(d_deleteKeys.get(), deleteKeys.data(),
+                            deleteSize * sizeof(int), cudaMemcpyHostToDevice,
+                            0));
 
   // Temporary buffer for located node positions
-  int *d_deletePositions;
-  checkCuda(cudaMalloc(&d_deletePositions, deleteSize * sizeof(int)));
+  TempBuffer<int> d_deletePositions(deleteSize);
 
   int blockSize = 256;
   int numBlocks = (deleteSize + blockSize - 1) / blockSize;
 
   // Phase 1: Read-only traversal to locate targets (no races)
-  locateDeleteTargets<<<numBlocks, blockSize>>>(ctx.d_nodes, d_deleteKeys,
-                                                deleteSize, d_deletePositions);
-  checkCuda(cudaDeviceSynchronize());
+  locateDeleteTargets<<<numBlocks, blockSize>>>(
+      ctx.d_nodes, d_deleteKeys.get(), deleteSize, d_deletePositions.get());
+  checkCuda(cudaGetLastError());
 
   // Phase 2: Apply deletions + mark avail using precomputed positions (no
   // traversal)
-  applyDeletes<<<numBlocks, blockSize>>>(ctx.d_nodes, d_deletePositions,
+  applyDeletes<<<numBlocks, blockSize>>>(ctx.d_nodes, d_deletePositions.get(),
                                          deleteSize, ctx.d_avail);
-  checkCuda(cudaDeviceSynchronize());
-
-  checkCuda(cudaFree(d_deletePositions));
-  checkCuda(cudaFree(d_deleteKeys));
+  checkCuda(cudaGetLastError());
 
   // Bottom-up level-wise reduction to recompute subtreeAvail
   recomputeSubtreeAvail(ctx);
@@ -393,13 +418,13 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
 
   // Copy inputs to device
   ensureScratchCapacity(ctx, K, static_cast<long long>(newPayload.size()));
-  checkCuda(cudaMemcpy(ctx.d_insertKeys, newKeys.data(), K * sizeof(int),
-                       cudaMemcpyHostToDevice));
-  checkCuda(cudaMemcpy(ctx.d_insertPayload, newPayload.data(),
-                       newPayload.size() * sizeof(int),
-                       cudaMemcpyHostToDevice));
-  checkCuda(cudaMemcpy(ctx.d_insertPrefixSizes, newPrefixSizes.data(),
-                       K * sizeof(int), cudaMemcpyHostToDevice));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertKeys, newKeys.data(), K * sizeof(int),
+                            cudaMemcpyHostToDevice, 0));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertPayload, newPayload.data(),
+                            newPayload.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, 0));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertPrefixSizes, newPrefixSizes.data(),
+                            K * sizeof(int), cudaMemcpyHostToDevice, 0));
 
   // Determine number of deleted slots (root's subtreeAvail)
   int D = 0;
@@ -412,12 +437,11 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
   // ── GPU Best-Fit Matching Pipeline ──────────────────────────────────
   if (D > 0 && reuseK > 0) {
     // Locate ALL D deleted slots via order-statistic tree
-    int *d_allPositions = nullptr, *d_deletedKeys = nullptr,
-        *d_slotCaps = nullptr, *d_slotOrder = nullptr;
-    checkCuda(cudaMalloc(&d_allPositions, D * sizeof(int)));
-    checkCuda(cudaMalloc(&d_deletedKeys, D * sizeof(int)));
-    checkCuda(cudaMalloc(&d_slotCaps, D * sizeof(int)));
-    checkCuda(cudaMalloc(&d_slotOrder, D * sizeof(int)));
+    TempBuffer<int> allPositions(D), deletedKeys(D), slotCaps(D),
+        slotOrder(D);
+    int *d_allPositions = allPositions.get(),
+        *d_deletedKeys = deletedKeys.get(), *d_slotCaps = slotCaps.get(),
+        *d_slotOrder = slotOrder.get();
     int numBlocksD = (D + blockSize - 1) / blockSize;
     locateReusableSlots<<<numBlocksD, blockSize>>>(
         ctx.d_subtreeAvail, ctx.d_avail, ctx.numRecords, d_allPositions, D);
@@ -431,13 +455,11 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
         ctx.d_nodes, d_allPositions, d_slotCaps, D);
 
     // Step 2: Compute item sizes for eligible items (GPU parallel)
-    int *d_itemSizes = nullptr, *d_itemOrder = nullptr, *d_lo = nullptr,
-        *d_prefixMax = nullptr, *d_assigned = nullptr;
-    checkCuda(cudaMalloc(&d_itemSizes, reuseK * sizeof(int)));
-    checkCuda(cudaMalloc(&d_itemOrder, reuseK * sizeof(int)));
-    checkCuda(cudaMalloc(&d_lo, reuseK * sizeof(int)));
-    checkCuda(cudaMalloc(&d_prefixMax, reuseK * sizeof(int)));
-    checkCuda(cudaMalloc(&d_assigned, reuseK * sizeof(int)));
+    TempBuffer<int> itemSizesBuf(reuseK), itemOrder(reuseK), lo(reuseK),
+        prefixMax(reuseK), assigned(reuseK);
+    int *d_itemSizes = itemSizesBuf.get(), *d_itemOrder = itemOrder.get(),
+        *d_lo = lo.get(), *d_prefixMax = prefixMax.get(),
+        *d_assigned = assigned.get();
     int numBlocksR = (reuseK + blockSize - 1) / blockSize;
     computeItemSizes<<<numBlocksR, blockSize>>>(ctx.d_insertPrefixSizes,
                                                 d_itemSizes, reuseK);
@@ -494,9 +516,9 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     if (matchCount > 0) {
       // Step 10: matched (item, slot) pairs: sorted item i -> slot of rank
       // assigned[i]
-      int *d_matchedItemIdx = nullptr, *d_matchedSlotIdx = nullptr;
-      checkCuda(cudaMalloc(&d_matchedItemIdx, matchCount * sizeof(int)));
-      checkCuda(cudaMalloc(&d_matchedSlotIdx, matchCount * sizeof(int)));
+      TempBuffer<int> matchedItemIdx(matchCount), matchedSlotIdx(matchCount);
+      int *d_matchedItemIdx = matchedItemIdx.get(),
+          *d_matchedSlotIdx = matchedSlotIdx.get();
       pairMatches<<<(matchCount + blockSize - 1) / blockSize, blockSize>>>(
           d_itemOrder, d_assigned, d_slotOrder, matchCount, d_matchedItemIdx,
           d_matchedSlotIdx);
@@ -509,25 +531,22 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
                            matchCount * sizeof(int), cudaMemcpyDeviceToHost));
       checkCuda(cudaMemcpy(h_keys.data(), d_deletedKeys, D * sizeof(int),
                            cudaMemcpyDeviceToHost));
-      std::vector<int> bins[3];
+      std::vector<int> matchSizes(matchCount);
       for (int k = 0; k < matchCount; ++k) {
         int itemIdx = h_items[k];
         mapping.itemToKey[itemIdx] = h_keys[h_slots[k]];
         matched[itemIdx] = 1;
-        int len = newPrefixSizes[itemIdx] -
-                  (itemIdx == 0 ? 0 : newPrefixSizes[itemIdx - 1]);
-        bins[len < 32 ? 0 : (len < 1024 ? 1 : 2)].push_back(k);
+        matchSizes[k] = newPrefixSizes[itemIdx] -
+                        (itemIdx == 0 ? 0 : newPrefixSizes[itemIdx - 1]);
       }
 
       // ── Degree-binned applyReuse dispatch (thread / warp / block) ──────
+      DegreeBins bins(matchSizes);
       for (int b = 0; b < 3; ++b) {
-        int n = static_cast<int>(bins[b].size());
+        int n = bins.count[b];
         if (n == 0)
           continue;
-        int *d_binIdx = nullptr;
-        checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-        checkCuda(cudaMemcpy(d_binIdx, bins[b].data(), n * sizeof(int),
-                             cudaMemcpyHostToDevice));
+        int *d_binIdx = bins.bin(b);
         if (b == 0)
           applyReuse<<<(n + blockSize - 1) / blockSize, blockSize>>>(
               ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
@@ -543,22 +562,9 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
               ctx.d_nodes, ctx.d_flatPayload, ctx.d_avail, d_allPositions,
               ctx.d_insertPayload, ctx.d_insertPrefixSizes, d_matchedItemIdx,
               d_matchedSlotIdx, d_deletedKeys, d_binIdx, n);
-        checkCuda(cudaDeviceSynchronize());
-        checkCuda(cudaFree(d_binIdx));
+        checkCuda(cudaGetLastError());
       }
-      checkCuda(cudaFree(d_matchedItemIdx));
-      checkCuda(cudaFree(d_matchedSlotIdx));
     }
-
-    checkCuda(cudaFree(d_itemSizes));
-    checkCuda(cudaFree(d_itemOrder));
-    checkCuda(cudaFree(d_lo));
-    checkCuda(cudaFree(d_prefixMax));
-    checkCuda(cudaFree(d_assigned));
-    checkCuda(cudaFree(d_allPositions));
-    checkCuda(cudaFree(d_deletedKeys));
-    checkCuda(cudaFree(d_slotCaps));
-    checkCuda(cudaFree(d_slotOrder));
   }
 
   // ── Build surplus list ──────────────────────────────────────────────
@@ -578,8 +584,12 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
       return q * a;
     };
     // Tail metadata of each surplus row: one segment holding len values,
-    // zero padding up to the alignment, then the INT_MIN terminator.
+    // zero padding up to the alignment, then the INT_MIN terminator. The
+    // rows are packed on the host and appended with one copy (the original
+    // issued two or three copies per row: 220 ms for the 25K new rows of a
+    // DBLP batch).
     std::vector<CBSTNode> surplusRecords(surplus);
+    std::vector<int> packed;
     int cursor = ctx.initialPayloadSize;
     for (int s = 0; s < surplus; ++s) {
       int globalIdx = surplusIndices[s];
@@ -588,7 +598,7 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
       int len = end - start;
       int aligned = nextMultiple(len, ctx.alignment);
       int base = cursor;
-      int neededEnd = base + aligned + 1;
+      long long neededEnd = static_cast<long long>(base) + aligned + 1;
       if (neededEnd > ctx.fixedSize) {
         throw ::escher::EscherError(
             std::string("insertCBST [") +
@@ -605,20 +615,15 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
       r.occupancy = len;
       r.tailBase = base;
       r.tailCapacity = aligned;
-      if (len > 0) {
-        checkCuda(cudaMemcpy(ctx.d_flatPayload + base,
-                             newPayload.data() + start, len * sizeof(int),
-                             cudaMemcpyHostToDevice));
-      }
-      if (aligned > len) {
-        checkCuda(cudaMemset(ctx.d_flatPayload + base + len, 0,
-                             (aligned - len) * sizeof(int)));
-      }
-      int sentinel = INT_MIN;
-      checkCuda(cudaMemcpy(ctx.d_flatPayload + base + aligned, &sentinel,
-                           sizeof(int), cudaMemcpyHostToDevice));
+      packed.insert(packed.end(), newPayload.begin() + start,
+                    newPayload.begin() + end);
+      packed.insert(packed.end(), aligned - len, 0);
+      packed.push_back(INT_MIN);
       cursor += aligned + 1;
     }
+    checkCuda(cudaMemcpyAsync(ctx.d_flatPayload + ctx.initialPayloadSize,
+                              packed.data(), packed.size() * sizeof(int),
+                              cudaMemcpyHostToDevice, 0));
     ctx.initialPayloadSize = cursor;
 
     // Reconstruct the CBST from the surviving (non-deleted) nodes plus the
@@ -629,12 +634,10 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
     // the row from its base and overflow chains were lost. Live nodes are
     // brought into key order through their in-order rank, then compacted.
     int oldN = ctx.numRecords;
-    CBSTNode *d_ranked = nullptr, *d_records = nullptr;
-    int *d_rankedLive = nullptr;
-    checkCuda(cudaMalloc(&d_ranked, oldN * sizeof(CBSTNode)));
-    checkCuda(cudaMalloc(&d_records,
-                         static_cast<size_t>(oldN + surplus) * sizeof(CBSTNode)));
-    checkCuda(cudaMalloc(&d_rankedLive, oldN * sizeof(int)));
+    TempBuffer<CBSTNode> ranked(oldN), records(oldN + surplus);
+    TempBuffer<int> rankedLive(oldN);
+    CBSTNode *d_ranked = ranked.get(), *d_records = records.get();
+    int *d_rankedLive = rankedLive.get();
     int blocksOld = (oldN + blockSize - 1) / blockSize;
     rankOrderNodes<<<blocksOld, blockSize>>>(ctx.d_nodes, ctx.d_avail, oldN,
                                              d_ranked, d_rankedLive);
@@ -688,10 +691,7 @@ InsertMapping insertCBST(const std::vector<int> &newKeys,
                                                     ctx.d_startOffsets);
     buildEmptyBinaryTree<<<blocksBuild, blockSize>>>(ctx.d_nodes, newN);
     placeNodeRecords<<<blocksBuild, blockSize>>>(ctx.d_nodes, d_records, newN);
-    checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_ranked));
-    checkCuda(cudaFree(d_records));
-    checkCuda(cudaFree(d_rankedLive));
+    checkCuda(cudaGetLastError());
   } else {
     // No surplus: mapping for matched items was already populated above.
     // Any items that were NOT matched and NOT surplus don't exist (K == 0
@@ -828,79 +828,38 @@ void unfillCBST(const std::vector<int> &keysToUnfill,
   // Reuse insert buffers for passing inputs
   ensureScratchCapacity(ctx, static_cast<int>(keysToUnfill.size()),
                         static_cast<long long>(valuesToRemove.size()));
-  checkCuda(cudaMemcpy(ctx.d_insertKeys, keysToUnfill.data(),
-                       keysToUnfill.size() * sizeof(int),
-                       cudaMemcpyHostToDevice));
-  checkCuda(cudaMemcpy(ctx.d_insertPayload, valuesToRemove.data(),
-                       valuesToRemove.size() * sizeof(int),
-                       cudaMemcpyHostToDevice));
-  checkCuda(cudaMemcpy(ctx.d_insertPrefixSizes, removePrefixSizes.data(),
-                       removePrefixSizes.size() * sizeof(int),
-                       cudaMemcpyHostToDevice));
-  int K = static_cast<int>(keysToUnfill.size());
+  checkCuda(cudaMemcpyAsync(ctx.d_insertKeys, keysToUnfill.data(),
+                            keysToUnfill.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, 0));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertPayload, valuesToRemove.data(),
+                            valuesToRemove.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, 0));
+  checkCuda(cudaMemcpyAsync(ctx.d_insertPrefixSizes, removePrefixSizes.data(),
+                            removePrefixSizes.size() * sizeof(int),
+                            cudaMemcpyHostToDevice, 0));
   int blockSize = 256;
 
   // ── Degree-binned unfill dispatch ────────────────────────────────────
-  // We need per-node occupancy to bin by work size. Read it from device.
-  // For simplicity, we bin by removal count (end - start per item) since
-  // occupancy requires a device read per node. The removal count is a
-  // good proxy: more removals = more work per element.
-  std::vector<int> smallBin, medBin, largeBin;
-  for (int i = 0; i < K; ++i) {
-    int numRemovals = (i == 0)
-                          ? removePrefixSizes[0]
-                          : removePrefixSizes[i] - removePrefixSizes[i - 1];
-    // Use removal count as a proxy for work. The actual segment scan
-    // work is O(segment_length), but without reading node metadata to
-    // host, we approximate using a fixed threshold.
-    // For small removal sets, the inner loop is short -> thread is fine.
-    // For larger sets, cooperative processing helps.
-    if (numRemovals < 32)
-      smallBin.push_back(i);
-    else if (numRemovals < 1024)
-      medBin.push_back(i);
-    else
-      largeBin.push_back(i);
+  // Binned by the number of values to remove from the row (a proxy for
+  // the work; the row length would need a read of the node metadata).
+  DegreeBins bins(itemSizes(removePrefixSizes));
+  if (int n = bins.count[0]) {
+    unfill_thread<<<(n + blockSize - 1) / blockSize, blockSize>>>(
+        ctx.d_nodes, ctx.d_flatPayload, ctx.d_insertKeys, ctx.d_insertPayload,
+        ctx.d_insertPrefixSizes, bins.bin(0), n);
+    checkCuda(cudaGetLastError());
   }
-
-  if (!smallBin.empty()) {
-    int n = static_cast<int>(smallBin.size());
-    int *d_binIdx;
-    checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-    checkCuda(cudaMemcpy(d_binIdx, smallBin.data(), n * sizeof(int),
-                         cudaMemcpyHostToDevice));
-    int blocks = (n + blockSize - 1) / blockSize;
-    unfill_thread<<<blocks, blockSize>>>(ctx.d_nodes, ctx.d_flatPayload,
-                                         ctx.d_insertKeys, ctx.d_insertPayload,
-                                         ctx.d_insertPrefixSizes, d_binIdx, n);
-    checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_binIdx));
+  if (int n = bins.count[1]) {
+    unfill_warp<<<(n * 32 + blockSize - 1) / blockSize, blockSize>>>(
+        ctx.d_nodes, ctx.d_flatPayload, ctx.d_insertKeys, ctx.d_insertPayload,
+        ctx.d_insertPrefixSizes, bins.bin(1), n);
+    checkCuda(cudaGetLastError());
   }
-  if (!medBin.empty()) {
-    int n = static_cast<int>(medBin.size());
-    int *d_binIdx;
-    checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-    checkCuda(cudaMemcpy(d_binIdx, medBin.data(), n * sizeof(int),
-                         cudaMemcpyHostToDevice));
-    int totalThreads = n * 32;
-    int blocks = (totalThreads + blockSize - 1) / blockSize;
-    unfill_warp<<<blocks, blockSize>>>(ctx.d_nodes, ctx.d_flatPayload,
-                                       ctx.d_insertKeys, ctx.d_insertPayload,
-                                       ctx.d_insertPrefixSizes, d_binIdx, n);
-    checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_binIdx));
-  }
-  if (!largeBin.empty()) {
-    int n = static_cast<int>(largeBin.size());
-    int *d_binIdx;
-    checkCuda(cudaMalloc(&d_binIdx, n * sizeof(int)));
-    checkCuda(cudaMemcpy(d_binIdx, largeBin.data(), n * sizeof(int),
-                         cudaMemcpyHostToDevice));
+  if (int n = bins.count[2]) {
     size_t shmem = sizeof(int) * static_cast<size_t>(blockSize + 1);
-    unfill_block<<<n, blockSize, shmem>>>(ctx.d_nodes, ctx.d_flatPayload,
-                                          ctx.d_insertKeys, ctx.d_insertPayload,
-                                          ctx.d_insertPrefixSizes, d_binIdx, n);
-    checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaFree(d_binIdx));
+    unfill_block<<<n, blockSize, shmem>>>(
+        ctx.d_nodes, ctx.d_flatPayload, ctx.d_insertKeys, ctx.d_insertPayload,
+        ctx.d_insertPrefixSizes, bins.bin(2), n);
+    checkCuda(cudaGetLastError());
   }
 }
