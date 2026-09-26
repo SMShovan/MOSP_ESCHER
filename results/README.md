@@ -115,8 +115,8 @@ What the numbers say:
   than updating once ESCHER maintenance and unification are counted, as
   the paper counts them. The paper reports 1.3-12.1x on DBLP (A100). The
   SOSP update stage alone takes 1.5-20 ms, 1.4-25x less than the
-  recompute; ESCHER maintenance (50-70 % of the dynamic time) and
-  unification (20-40 %) dominate.
+  recompute; ESCHER maintenance (50-71 % of the dynamic time) and
+  unification (20-43 %) dominate.
 - Geology hyperedge batches of 100K and 200K invalidate about 40 % of the
   nodes in one of their three batches; the update then exceeds its work
   budget and falls back to the recompute (3 of 9 batches each), as

@@ -525,8 +525,8 @@ fallback), `hsospStress --configs 3 --check-escher`, `test_mosp_update` and
 - **The paper's speedups are not reproduced.** With both paths measured
   the same way, the dynamic path (ESCHER maintenance + unification + CSR
   apply + update) beats the GPU recompute only for 25K vertex batches on
-  DBLP. ESCHER maintenance (50-70 % of the remaining time) and the
-  unification (20-40 %) dominate; the update stage itself is 1.4-25x
+  DBLP. ESCHER maintenance (50-71 % of the dynamic time) and the
+  unification (20-43 %) dominate; the update stage itself is 1.4-25x
   faster than the recompute. Further reductions are possible (building
   the CBST fill / unfill inputs on the device instead of downloading the
   delta, overlapping the CBST maintenance with the update, a device-side
