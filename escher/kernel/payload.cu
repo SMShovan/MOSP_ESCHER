@@ -171,7 +171,9 @@ __global__ void insertNode_thread(CBSTNode *nodes, int *flatValues,
     return;
 
   int writePos = current->tailBase + current->occupancy;
-  int remaining = current->tailCapacity - current->occupancy;
+  // Clamped: a row without room for its terminator must not write at
+  // tailBase + occupancy - 1 (or read values[-1] in allocateSpace).
+  int remaining = max(0, current->tailCapacity - current->occupancy);
 
   if (numValues <= remaining) {
     // All values fit in the current segment
@@ -226,7 +228,7 @@ __global__ void insertNode_warp(CBSTNode *nodes, int *flatValues,
   if (current != nullptr) {
     nodeFound = 1;
     writePos = current->tailBase + current->occupancy;
-    remaining = current->tailCapacity - current->occupancy;
+    remaining = max(0, current->tailCapacity - current->occupancy);
     tailBase = current->tailBase;
     tailCap = current->tailCapacity;
   }
@@ -289,7 +291,7 @@ __global__ void insertNode_block(CBSTNode *nodes, int *flatValues,
     sh_node = bstFind(nodes, insertIndex);
     if (sh_node != nullptr) {
       sh_writePos = sh_node->tailBase + sh_node->occupancy;
-      sh_remaining = sh_node->tailCapacity - sh_node->occupancy;
+      sh_remaining = max(0, sh_node->tailCapacity - sh_node->occupancy);
     }
   }
   __syncthreads();

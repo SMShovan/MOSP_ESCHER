@@ -2,10 +2,13 @@
 #include <climits>
 #include <vector>
 
-static inline int nextMultipleOf4(int num) {
-    if (num <= 0) return 0;
-    int q = (num + 4 - 1) / 4;
-    return q * 4;
+// Padded length of a row: the next multiple of 4 that leaves at least one
+// slot for the INT_MIN terminator (the same rule as the device-side
+// nextMultipleOf4 in kernel/device_utils.cuh). The original padded a row of
+// length 4k to exactly 4k entries, so it had no terminator: readers ran into
+// the next row and a fill wrote over the row's last value.
+static inline int paddedRowSize(int num) {
+    return ((num + 4) / 4) * 4;
 }
 
 std::pair<std::vector<int>, std::vector<int>> flatten2DVector(const std::vector<std::vector<int>>& vec2d) {
@@ -16,7 +19,7 @@ std::pair<std::vector<int>, std::vector<int>> flatten2DVector(const std::vector<
     for (size_t i = 0; i < vec2d.size(); ++i) {
         startOffsets[i] = index;
         int innerSize = static_cast<int>(vec2d[i].size());
-        int paddedSize = (innerSize == 0) ? 4 : nextMultipleOf4(innerSize);
+        int paddedSize = paddedRowSize(innerSize);
         for (int j = 0; j < paddedSize; ++j) {
             if (j < innerSize) {
                 flatValues.push_back(vec2d[i][j]);

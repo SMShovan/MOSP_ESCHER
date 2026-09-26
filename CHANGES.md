@@ -89,3 +89,14 @@ made there; these commits port those fixes, adapted to this copy's API
   level per launch (ESCHER-GPU fixed the same loop). Regression:
   `test_h2h_delta` (no longer XFAIL) and the `subtreeAvail` check after every
   step of `test_cbst_ops`.
+- **E3 flatten terminator** (`utils/flatten.cpp`, `kernel/payload.cu`). A
+  row whose length is a multiple of 4 was padded to exactly that length,
+  so it had no INT_MIN terminator: readers ran into the next row (row
+  {1,2,3,4} read back as [1,2,3,4,5,6]), construct gave it
+  `tailCapacity = len - 1 < occupancy`, and a fill then wrote its
+  back-pointer over the row's last value and `allocateSpace` read
+  `values[-1]` (compute-sanitizer: invalid global read, hit by the repo's
+  own `test_hsosp_matches_dijkstra` and `hsospStress`). About a quarter of
+  the h2v / h2h rows are affected. Rows are now padded to the next multiple
+  of 4 above their length (the device rule), and the fill kernels clamp the
+  free space of a row at 0. Regression: `test_cbst_ops terminator`.
