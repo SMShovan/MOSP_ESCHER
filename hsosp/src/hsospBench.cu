@@ -34,11 +34,14 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "DynamicHypergraph.hpp"
@@ -443,8 +446,20 @@ void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
     }
 }
 
-/** --hg mode: a real hypergraph, the paper's preprocessing and batches. */
-int runRealDataset(const CliOptions& opt, CsvWriter& csv) {
+/** Creates the directory of @p path (best effort). */
+void makeParentDir(const std::string& path) {
+    auto slash = path.find_last_of('/');
+    if (slash != std::string::npos) {
+        std::string dir = "mkdir -p " + path.substr(0, slash);
+        int rc = std::system(dir.c_str());
+        (void)rc;
+    }
+}
+
+/** --hg mode: a real hypergraph, the paper's preprocessing and batches.
+ *  The CSV is opened only once the dataset is loaded, so a failed load
+ *  leaves no output file behind. */
+int runRealDataset(const CliOptions& opt) {
     auto tStart = Clock::now();
     auto t0 = Clock::now();
     GeneratedHypergraph g =
@@ -466,12 +481,26 @@ int runRealDataset(const CliOptions& opt, CsvWriter& csv) {
                  "vertices, read in %.0f ms\n",
                  name.c_str(), gen.numHyperedges, opt.maxCardinality,
                  gen.numVertices, readMs);
-    const int plannedInserts =
-        (opt.kind == BatchKind::Hyperedge ? opt.batchSize : 0) * opt.batches +
+    // Capacity planning: every id must fit an int (caps.maxHyperedges).
+    const long long plannedInserts =
+        (opt.kind == BatchKind::Hyperedge ? 1LL * opt.batchSize : 0LL) *
+            opt.batches +
         65536;
-    auto ds = buildDataset(name, std::move(g), gen, opt, plannedInserts,
+    if (static_cast<long long>(g.rows.size()) + plannedInserts + 1024 >
+        std::numeric_limits<int>::max()) {
+        std::fprintf(stderr,
+                     "[error] %lld hyperedges plus %d batches of %d "
+                     "insertions exceed the int hyperedge-id range\n",
+                     static_cast<long long>(g.rows.size()), opt.batches,
+                     opt.batchSize);
+        return 2;
+    }
+    auto ds = buildDataset(name, std::move(g), gen, opt,
+                           static_cast<int>(plannedInserts),
                            opt.maxCardinality + 2 * 128 + 16);
     const double loadMs = msSince(tStart);
+    makeParentDir(opt.out);
+    CsvWriter csv(opt.out);
 
     std::mt19937_64 rng(mixSeed(opt.seed, 0x5eedull));
     double dynamicSum = 0.0, staticSum = 0.0;
@@ -505,6 +534,19 @@ bool wantExp(const CliOptions& opt, const char* e) {
 
 int main(int argc, char** argv) {
     CliOptions opt;
+    // Conversions for numeric values: the whole string must be consumed.
+    const auto toInt = [](const std::string& s, std::size_t* p) {
+        return std::stoi(s, p);
+    };
+    const auto toLL = [](const std::string& s, std::size_t* p) {
+        return std::stoll(s, p);
+    };
+    const auto toULL = [](const std::string& s, std::size_t* p) {
+        return std::stoull(s, p);
+    };
+    const auto toDouble = [](const std::string& s, std::size_t* p) {
+        return std::stod(s, p);
+    };
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -514,21 +556,38 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
+        auto value = [&](const char* what, auto conv) {
+            const std::string s = next(what);
+            std::size_t pos = 0;
+            try {
+                const auto v = conv(s, &pos);
+                // (stoull accepts a minus sign and wraps the value.)
+                const bool badSign =
+                    std::is_unsigned<std::decay_t<decltype(v)>>::value &&
+                    s.find('-') != std::string::npos;
+                if (pos == s.size() && !badSign) return v;
+            } catch (const std::invalid_argument&) {
+            } catch (const std::out_of_range&) {
+            }
+            std::fprintf(stderr, "invalid value for %s: %s\n", what,
+                         s.c_str());
+            std::exit(2);
+        };
         if (a == "--suite") opt.suite = next("--suite");
         else if (a == "--out") opt.out = next("--out");
         else if (a == "--exp") opt.experiments = next("--exp");
-        else if (a == "--reps") opt.reps = std::stoi(next("--reps"));
+        else if (a == "--reps") opt.reps = value("--reps", toInt);
         else if (a == "--verify-max")
-            opt.verifyMax = std::stoll(next("--verify-max"));
+            opt.verifyMax = value("--verify-max", toLL);
         else if (a == "--maxiter")
-            opt.maxIterations = std::stoi(next("--maxiter"));
+            opt.maxIterations = value("--maxiter", toInt);
         else if (a == "--work-budget")
-            opt.workBudget = std::stod(next("--work-budget"));
-        else if (a == "--seed") opt.seed = std::stoull(next("--seed"));
+            opt.workBudget = value("--work-budget", toDouble);
+        else if (a == "--seed") opt.seed = value("--seed", toULL);
         else if (a == "--list") opt.listOnly = true;
         else if (a == "--hg") opt.hgPath = next("--hg");
         else if (a == "--maxcard")
-            opt.maxCardinality = std::stoi(next("--maxcard"));
+            opt.maxCardinality = value("--maxcard", toInt);
         else if (a == "--kind") {
             std::string k = next("--kind");
             if (k == "hyperedge") opt.kind = BatchKind::Hyperedge;
@@ -538,9 +597,9 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        else if (a == "--batch") opt.batchSize = std::stoi(next("--batch"));
-        else if (a == "--batches") opt.batches = std::stoi(next("--batches"));
-        else if (a == "--del") opt.delPct = std::stod(next("--del"));
+        else if (a == "--batch") opt.batchSize = value("--batch", toInt);
+        else if (a == "--batches") opt.batches = value("--batches", toInt);
+        else if (a == "--del") opt.delPct = value("--del", toDouble);
         else if (a == "--verify") {
             opt.verifyMode = next("--verify");
             if (opt.verifyMode != "all" && opt.verifyMode != "first" &&
@@ -561,16 +620,9 @@ int main(int argc, char** argv) {
             return 2;
         }
         opt.suite = "real";
-        auto slash = opt.out.find_last_of('/');
-        if (slash != std::string::npos) {
-            std::string dir = "mkdir -p " + opt.out.substr(0, slash);
-            int rc = std::system(dir.c_str());
-            (void)rc;
-        }
-        CsvWriter csv(opt.out);
         int rc = 1;
         try {
-            rc = runRealDataset(opt, csv);
+            rc = runRealDataset(opt);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[error] %s\n", e.what());
         }
@@ -606,15 +658,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Ensure the output directory exists (best effort).
-    {
-        auto slash = opt.out.find_last_of('/');
-        if (slash != std::string::npos) {
-            std::string dir = "mkdir -p " + opt.out.substr(0, slash);
-            int rc = std::system(dir.c_str());
-            (void)rc;
-        }
-    }
+    makeParentDir(opt.out);
     CsvWriter csv(opt.out);
 
     // Upper bound on inserted hyperedges per dataset instance, for

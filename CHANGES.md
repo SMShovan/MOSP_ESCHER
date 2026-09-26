@@ -361,6 +361,15 @@ test with other seeds, 0 failures.
   64-bit values (they were truncated to `int`, which merged distinct
   vertices of files with ids above 2^31, as some MAG / AMiner exports
   have); a token outside that range is an error.
+- **Command line** (`hsospBench`). A malformed number (`--batch abc`,
+  `--reps 99999999999`, `--batch 12abc`) aborted with an uncaught
+  `std::invalid_argument` / `std::out_of_range` or was silently truncated;
+  it is now a usage error (`invalid value for --X`, exit status 2), like a
+  bad `--kind`. In `--hg` mode the CSV is opened only after the dataset has
+  loaded, so a missing input file no longer leaves a header-only CSV, and
+  the planned insertions (`--batch` x `--batches`) are computed in 64 bits
+  and rejected when the hyperedge ids would not fit an `int` (the product
+  overflowed and gave a misleading capacity error).
 
 ## Performance
 

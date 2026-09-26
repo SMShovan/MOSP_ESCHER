@@ -80,6 +80,16 @@ for kind in hyperedge vertex; do
         --out "hsospBench_real.csv"
 done
 
+# Usage errors: a malformed number is exit status 2 (not an abort), and a
+# missing input file leaves no CSV behind.
+run_case hsospBench_cli bash -c '
+    for bad in "--batch abc" "--batch 12abc" "--reps 99999999999" \
+               "--seed -1" "--del 5x"; do
+        "$0" --hg "$1" $bad --out cli.csv; [ $? -eq 2 ] || exit 1
+    done
+    "$0" --hg missing.hg --out cli.csv; [ $? -eq 1 ] || exit 1
+    [ ! -e cli.csv ]' "$BIN/hsospBench" "$WORK/random.hg"
+
 echo "=== MOSP pipeline and stress tests ==="
 # Fixed seeds keep the suite reproducible; seed 6 of parallelStressTest hit
 # the original MOSP count-to-infinity defect (run 195).
