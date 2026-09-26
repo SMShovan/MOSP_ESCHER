@@ -116,6 +116,38 @@ int main() {
         distsMatch(st, hg, "disconnect", 9999);
     }
 
+    // ---- non-positive weights are rejected ----------------------------
+    // (With two adjacent zero-weight hyperedges cut off from the source the
+    // update kept a stale finite distance: {1,2} and {2,3} of weight 0
+    // reachable only through {0,1}, delete {0,1}.)
+    {
+        auto expectThrow = [&](const char* what, auto&& fn) {
+            try {
+                fn();
+            } catch (const std::exception&) {
+                return;
+            }
+            std::printf("FAIL: %s accepted\n", what);
+            ++failures;
+        };
+        expectThrow("zero-weight hyperedge in bulkLoad", [] {
+            DynamicHypergraph::Caps caps;
+            caps.maxHyperedges = 16;
+            DynamicHypergraph dh(5, caps);
+            dh.bulkLoad({{0}, {0, 1}, {1, 2}, {2, 3}, {3}}, {0, 5, 0, 0, 0},
+                        1, 5);
+        });
+        expectThrow("zero-weight inserted hyperedge", [] {
+            DynamicHypergraph::Caps caps;
+            caps.maxHyperedges = 16;
+            DynamicHypergraph dh(5, caps);
+            dh.bulkLoad({{0}, {0, 1}, {1, 2}, {3}}, {0, 5, 4, 0}, 1, 4);
+            HgBatch b;
+            b.heInsert.push_back({{2, 3}, 0});
+            dh.applyBatch(b);
+        });
+    }
+
     std::printf("test_hsosp_matches_dijkstra: %s\n",
                 failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;

@@ -10,6 +10,7 @@
 #include <map>
 #include <ostream>
 #include <stdexcept>
+#include <string>
 
 #include "escher_errors.hpp"
 #include "flatten.hpp"
@@ -181,6 +182,22 @@ void DynamicHypergraph::bulkLoad(std::vector<std::vector<int>>&& rows,
                                  std::vector<long long>&& weights,
                                  int sourceHe, int targetHe) {
     Impl& im = *pImpl;
+    if (rows.size() != weights.size()) {
+        throw escher::EscherError(
+            "DynamicHypergraph::bulkLoad: one weight per hyperedge required");
+    }
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        const int id = static_cast<int>(i) + 1;
+        const bool isVirtual = (id == sourceHe || id == targetHe);
+        if (isVirtual ? weights[i] != 0 : weights[i] < 1) {
+            throw escher::EscherError(
+                "DynamicHypergraph::bulkLoad: hyperedge " +
+                std::to_string(id) + " has weight " +
+                std::to_string(weights[i]) +
+                "; weights must be >= 1 (0 only for the virtual source and "
+                "target)");
+        }
+    }
     im.host.buildFrom(im.numVertices, std::move(rows), std::move(weights));
     im.host.sourceHe = sourceHe;
     im.host.targetHe = targetHe;
@@ -226,6 +243,18 @@ DynamicHypergraph::BatchResult DynamicHypergraph::applyBatch(
     const HgBatch& batch) {
     Impl& im = *pImpl;
     BatchResult res;
+    for (const auto& ins : batch.heInsert) {
+        if (ins.weight < 1) {
+            throw escher::EscherError(
+                "DynamicHypergraph::applyBatch: inserted hyperedge weight " +
+                std::to_string(ins.weight) + " < 1; weights must be positive");
+        }
+        if (ins.vertices.empty()) {
+            throw escher::EscherError(
+                "DynamicHypergraph::applyBatch: inserted hyperedge without "
+                "vertices");
+        }
+    }
 
     // ---------------------------------------------------------------
     // 1. Vertical h2v insert FIRST: the returned mapping decides the

@@ -17,7 +17,7 @@ in the **fully dynamic** setting, on GPU, reusing two existing assets:
 Model, exactly as in the handwritten notes:
 
 - Hypergraph `H = (V, E_H)` with hyperedges `h_1 .. h_m`. Each hyperedge `h_i` carries one
-  non-negative weight `w_i` (single objective). Per the meeting discussion, the hypergraph is
+  positive weight `w_i >= 1` (single objective; zero weights are rejected). Per the meeting discussion, the hypergraph is
   treated as **undirected** for this phase (the notes sketch directed variants; the decision
   in the meeting was to take the undirected case first).
 - Two hyperedges are neighbors iff they share at least one vertex (stated explicitly in the

@@ -205,3 +205,15 @@ both updates; the first two fail on the original code), `parallelStressTest`
 seed 6 (failed on the original), and the stress tests' tree comparison.
 Additional check (not in `make test`): 5 x 400 configurations of each stress
 test with other seeds, 0 failures.
+
+## Correctness: H-SOSP
+
+- **S3 non-positive weights** (`hypergraph/src/DynamicHypergraph.cpp`,
+  docs). The documentation allowed non-negative weights and nothing checked
+  them; two adjacent zero-weight hyperedges cut off from the source keep a
+  stale finite distance, a fixed point of the relaxation, so the update
+  converged to wrong distances without a fallback (reproduced: 3 wrong
+  distances after one deletion). As in the paper (ω → R>0), weights must be
+  >= 1; only the virtual source and target have weight 0. `bulkLoad` and
+  `applyBatch` reject other weights (and empty inserted hyperedges) before
+  touching any structure. Regression: `test_hsosp_matches_dijkstra`.

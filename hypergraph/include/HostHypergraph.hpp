@@ -16,7 +16,10 @@
  * correctness-critical delta rules are unit-testable off-GPU.
  *
  * Model (from the project meeting):
- *  - Hyperedge h_i carries one non-negative weight w_i.
+ *  - Hyperedge h_i carries one positive weight w_i >= 1 (the virtual
+ *    source and target hyperedges: 0). DynamicHypergraph rejects other
+ *    weights; with a zero-weight pair cut off from the source the update
+ *    would keep a stale finite distance.
  *  - h2h edge (h_i, h_j) exists iff the two hyperedges share >= 1 vertex.
  *  - Stepping into h_j costs w_j, so ALL in-edges of node j in the line
  *    graph have weight w_j; the h2h adjacency is therefore kept as a single
