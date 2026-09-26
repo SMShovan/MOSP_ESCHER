@@ -87,7 +87,13 @@ batches, against 1.3-12.1x reported in the paper.
   original compared `std::set`s, which hid duplicate entries).
 - **ESCHER contents in the H-SOSP pipeline**:
   `DynamicHypergraph::checkEscher` compares the h2v, v2h and h2h CBSTs with
-  the host model and the rebuilt line graph (`hsospStress --check-escher`).
+  the host model and the rebuilt line graph, and the maintained line-graph
+  pair count (the `h2h_pairs` / `avg_h2h_deg` columns) with the rebuilt
+  line graph (`hsospStress --check-escher`, `test_hsosp_scale`, and
+  `hsospBench --check-escher` on every oracle-checked batch of both
+  modes). The benchmark cases of `make test` pass `--check-escher`, so the
+  paper's batch model, whose insertions can repeat a vertex (the synthetic
+  generator never does), is covered too.
 - **`test_hsosp_scale`**: 75,000 hyperedges / 80,000 vertices (every CBST
   above 65,535 records), seven consecutive batches (insert-only, delete-only,
   mixed, vertex, delete-heavy, insert-heavy); device rows, distances,
@@ -103,6 +109,8 @@ committed) `make test` failed:
 | CSR apply skips the last deletion of each row | `hsospStress` (device CSR rows) |
 | (after E1-E7) unfill ignores the last value of each removal list | `test_cbst_ops` (4 scenarios), `hsospStress --check-escher`, `test_hsosp_scale` |
 | (after E8) `DynamicGraph` keeps its own edge ids instead of ESCHER's keys | `test_dynamicgraph_roundtrip` |
+| the h2v insert payload is not deduplicated (repeated vertices stored) | `hsospBench_real_hyperedge` (`--check-escher`: hundreds of wrong h2v rows per batch) |
+| the pair count adds deleted instead of subtracting them | `test_hsosp_scale`, `hsospStress --check-escher`, `hsospBench` smoke and real cases |
 
 On the original code the new cases fail as expected: every `test_cbst_ops`
 scenario, `test_hsosp_scale` (abort on a colliding hyperedge id),

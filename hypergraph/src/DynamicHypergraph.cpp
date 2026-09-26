@@ -199,6 +199,13 @@ long long DynamicHypergraph::checkEscher(const LineGraphCSR& lg,
     }
     errors += checkTreeRows(im.h2h->context(), h2hRows, true, "h2h", log);
     errors += checkSubtreeAvail(im.h2h->context(), "h2h", log);
+
+    // The pair count kept per batch (the h2h_pairs / avg_h2h_deg columns).
+    if (hg.h2hPairCount != lg.numEntries() / 2) {
+        log << "[check] h2h pair count " << hg.h2hPairCount
+            << " != line graph " << lg.numEntries() / 2 << "  <-- FAILED\n";
+        ++errors;
+    }
     return errors;
 }
 

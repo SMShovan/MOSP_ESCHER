@@ -127,7 +127,11 @@ preprocessing and batch model (Section VI):
 - `--verify all|first|none` selects the batches checked by the independent
   oracle (Dijkstra on the line graph rebuilt from the vertex lists, plus
   the canonical shortest-path tree). Every batch is also compared with the
-  static recompute.
+  static recompute. `--check-escher` (both modes) also reads the three
+  ESCHER CBSTs back on every oracle-checked batch and compares them, and
+  the maintained line-graph pair count (`h2h_pairs`), with the host model;
+  the shortest-path results do not depend on the CBSTs, so the oracle
+  alone cannot see an error there. A violation fails the batch.
 - Each batch writes one CSV row (columns below); stderr has one summary
   line per batch and an `[e2e]` line with the load time, the sums of the
   dynamic and static times and the process wall time.

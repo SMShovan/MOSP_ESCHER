@@ -68,15 +68,17 @@ run_case hsospStress        "$BIN/hsospStress" --configs 50
 run_case hsospStress_escher "$BIN/hsospStress" --configs 20 --seed 11 \
     --check-escher
 run_case hsospBench_smoke   "$BIN/hsospBench" --suite smoke --reps 1 \
-    --out hsospBench_smoke.csv
+    --check-escher --out hsospBench_smoke.csv
 # A random 30,000-hyperedge file (one hyperedge per line) through the
-# real-hypergraph mode, every batch checked by the oracle.
+# real-hypergraph mode, every batch checked by the oracle and the ESCHER
+# contents compared with the host model (the paper's insertions can
+# repeat a vertex, which the synthetic generator never does).
 awk 'BEGIN { srand(7); for (i = 0; i < 30000; i++) { k = 1 + int(rand() * 6);
      line = ""; for (j = 0; j < k; j++) line = line (j ? " " : "") \
      int(rand() * 20000); print line } }' > "$WORK/random.hg"
 for kind in hyperedge vertex; do
     run_case "hsospBench_real_$kind" "$BIN/hsospBench" --hg "$WORK/random.hg" \
-        --kind "$kind" --batch 2000 --batches 3 --verify all \
+        --kind "$kind" --batch 2000 --batches 3 --verify all --check-escher \
         --out "hsospBench_real.csv"
 done
 

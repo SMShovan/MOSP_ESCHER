@@ -104,8 +104,9 @@ public:
      * the host incidence model (h2v, v2h) and with @p lg, the line graph
      * rebuilt from it (h2h, under the key the h2h insert assigned). Also
      * checks the CBST tail metadata and availability bookkeeping (see
-     * integrity.hpp). Returns the number of violations; details go to
-     * @p log.
+     * integrity.hpp) and the maintained line-graph pair count
+     * (HostHypergraph::h2hPairCount). Returns the number of violations;
+     * details go to @p log.
      */
     long long checkEscher(const LineGraphCSR& lg, std::ostream& log) const;
 

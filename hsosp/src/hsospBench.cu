@@ -14,6 +14,8 @@
  * generatePaperBatch): consecutive batches of --batch changes, --del %
  * deletions, of --kind hyperedge or vertex, one CSV row per batch. The
  * oracle checks the batches selected by --verify (all, first, none).
+ * --check-escher also compares the ESCHER CBSTs with the host model on
+ * every oracle-checked batch (either mode); a violation fails the batch.
  *
  * Experiments (see docs/HSOSP.md):
  *   E1 time vs changed-batch size (hyperedge + incident-vertex batches)
@@ -81,6 +83,9 @@ struct CliOptions {
     double delPct = 50.0;
     double replaceFrac = 0.3;
     std::string verifyMode = "first";   ///< all | first | none
+    /// Also compare the three ESCHER CBSTs (and the maintained line-graph
+    /// pair count) with the host model on every oracle-checked batch.
+    bool checkEscher = false;
 };
 
 struct DatasetCfg {
@@ -280,8 +285,10 @@ struct BatchOutcome {
     long long mismatchStatic = 0;
     bool oracleRan = false;
     SospCheck oracle;
+    long long escherViolations = 0;   ///< --check-escher
     bool correct() const {
-        return ok && mismatchStatic == 0 && (!oracleRan || oracle.ok());
+        return ok && mismatchStatic == 0 && (!oracleRan || oracle.ok()) &&
+               escherViolations == 0;
     }
     bool verified() const { return ok && oracleRan && oracle.ok(); }
     double dynamicMs() const {
@@ -346,15 +353,19 @@ BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
         ds.stateA.downloadParents(par, hg.maxId());
         o.oracle = checkSosp(hg, lg, referenceDistances(hg, lg, hg.sourceHe),
                              got, par);
+        // The distances do not depend on the CBSTs (the oracle reads the
+        // host model), so their contents are checked separately.
+        if (opt.checkEscher)
+            o.escherViolations = ds.dh.checkEscher(lg, std::cerr);
     }
     o.ok = true;
     if (!o.correct()) {
         ++globalFailures;
         std::fprintf(stderr,
                      "[FAIL] %s: %lld mismatches vs static, %lld vs oracle, "
-                     "%lld parent errors\n",
+                     "%lld parent errors, %lld ESCHER violations\n",
                      what.c_str(), o.mismatchStatic, o.oracle.distMismatches,
-                     o.oracle.parentErrors);
+                     o.oracle.parentErrors, o.escherViolations);
     }
     return o;
 }
@@ -585,6 +596,7 @@ int main(int argc, char** argv) {
             opt.workBudget = value("--work-budget", toDouble);
         else if (a == "--seed") opt.seed = value("--seed", toULL);
         else if (a == "--list") opt.listOnly = true;
+        else if (a == "--check-escher") opt.checkEscher = true;
         else if (a == "--hg") opt.hgPath = next("--hg");
         else if (a == "--maxcard")
             opt.maxCardinality = value("--maxcard", toInt);
