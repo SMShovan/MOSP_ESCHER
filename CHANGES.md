@@ -176,8 +176,9 @@ made there; these commits port those fixes, adapted to this copy's API
   node's occupancy to 0 and its tail to the first segment, so the next
   fill overwrote each row from its base and chained segments were lost
   (row [20,21,22] + surplus insert + fill 777 read back as [777]). H-SOSP
-  takes this path in almost every batch (the study measured h2h rows with
-  correct content falling from 78.7% to 32.7% over three DBLP batches). The
+  takes this path in almost every batch (a read-back of the original build
+  found h2h rows with correct content falling from 78.7% to 32.7% over
+  three DBLP batches). The
   rebuild now keeps the full record of every live node (brought into key
   order through its in-order rank) and gives surplus rows their real
   occupancy and tail. Regression: `test_cbst_ops surplus`.
