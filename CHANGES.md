@@ -51,7 +51,10 @@ batches, against 1.3-12.1x reported in the paper.
   `-lineinfo`; `nvcc -MMD -MP` header dependencies and a flags stamp
   (`build/.flags`), so editing a header or changing `CUDA_ARCH` rebuilds what
   it affects (the original had no header dependencies); `NVCC` falls back to
-  `/usr/local/cuda/bin/nvcc`; host OpenMP for the oracles.
+  `/usr/local/cuda/bin/nvcc`; host OpenMP for the oracles. `make
+  syntax-check` referred to an undefined `GRAPH_CPP_SRCS` and skipped the
+  two `graph/src/*.cpp` files; it now preprocesses every translation
+  unit.
 - **`make test`** (`tests/run_tests.sh`) runs every unit test, the H-SOSP
   stress harness and the MOSP harnesses in a temporary directory, prints
   PASS/FAIL per case and exits non-zero on any failure. Known defects were
@@ -313,6 +316,12 @@ test with other seeds, 0 failures.
   so the virtual ids never reach the free list. Regression:
   `test_hsosp_matches_dijkstra` (full pipeline, oracle and ESCHER contents)
   and `tests/local`.
+- **Empty generator pool** (`HypergraphGen.cpp`). With no real hyperedge
+  left, `generateBatch` read `pool[0]` of an empty pool for a vertex batch
+  (ASan: out-of-bounds read), reachable from `hsospStress` and
+  `test_hsosp_matches_dijkstra`, whose deletion rates go up to 100 %. A
+  vertex batch is now empty in that case and a hyperedge batch has only
+  insertions, as in `generatePaperBatch`. Regression: `tests/local`.
 - **S4 "targeted" change placement** (`hsospBench.cu`, `hsospStress.cu`,
   `HypergraphGen.hpp`). Device parents are 0-based node indices but
   `generateBatch` reads them as 1-based hyperedge ids, so the targeted
@@ -423,6 +432,11 @@ medians of three runs are in [results/README.md](results/README.md).
   DBLP static recompute: 332-334 ms → 81-83 ms (4.1x). This speeds up the
   baseline the dynamic time is compared with (the paper compares against
   "the same GPU kernels"), so the reported speedup becomes smaller.
+  One warp per node needs whole warps per block: `UpdateConfig::blockSize`
+  (still passed to these kernels) must be a multiple of 32 in [32, 1024],
+  and `hsospRecompute` / `hsospUpdate` reject other values (with 16
+  threads the recompute gave wrong distances, with 48 or 100 it never
+  finished). Regression: `test_hsosp_matches_dijkstra`.
 - **P2 device-side grouping and warp-per-row CSR apply**
   (`applyDeltaToDevice`). The line-graph delta was grouped per row in a
   host `unordered_map<int, pair<vector, vector>>`, uploaded with 7
