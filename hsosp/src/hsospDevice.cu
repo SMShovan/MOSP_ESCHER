@@ -1017,6 +1017,17 @@ int propagate(const DeviceH2H& dev, HsospState& st,
     return iterations;
 }
 
+/** The recompute kernels run one warp per node and reduce with full-warp
+ *  shuffles, so a block must hold whole warps. */
+void checkBlockSize(const UpdateConfig& cfg, const char* where) {
+    if (cfg.blockSize < 32 || cfg.blockSize > 1024 || cfg.blockSize % 32) {
+        throw std::invalid_argument(
+            std::string(where) +
+            ": blockSize must be a multiple of 32 in [32, 1024], got " +
+            std::to_string(cfg.blockSize));
+    }
+}
+
 void resetForRecompute(const DeviceH2H& dev, HsospState& st, int source0) {
     const int n = dev.numNodes;
     const int block = 256;
@@ -1034,6 +1045,7 @@ void resetForRecompute(const DeviceH2H& dev, HsospState& st, int source0) {
 
 UpdateStats hsospRecompute(const DeviceH2H& dev, HsospState& st, int sourceId,
                            const UpdateConfig& cfg) {
+    checkBlockSize(cfg, "hsospRecompute");
     UpdateStats stats;
     const int source0 = sourceId - 1;
     resetForRecompute(dev, st, source0);
@@ -1052,6 +1064,9 @@ UpdateStats hsospRecompute(const DeviceH2H& dev, HsospState& st, int sourceId,
 
 UpdateStats hsospUpdate(const DeviceH2H& dev, HsospState& st, int sourceId,
                         const UpdateConfig& cfg) {
+    // Checked up front: the fallback recompute would otherwise throw
+    // after the update had already modified the state.
+    checkBlockSize(cfg, "hsospUpdate");
     UpdateStats stats;
     const int n = dev.numNodes;
     const int source0 = sourceId - 1;

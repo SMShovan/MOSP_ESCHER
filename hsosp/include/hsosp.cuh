@@ -267,6 +267,10 @@ struct UpdateConfig {
     /// Update budget: edge relaxations (pull + push) before falling back,
     /// as a multiple of the live adjacency entries.
     double workBudget = 1.0;
+    /// Threads per block of the recompute kernels (hsospRecompute and the
+    /// update's fallback), which run one warp per node: a multiple of 32
+    /// in [32, 1024], else both entry points throw std::invalid_argument.
+    /// The update kernels always use 256.
     int blockSize = 256;
 };
 

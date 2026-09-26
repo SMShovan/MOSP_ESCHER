@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 #include "DynamicHypergraph.hpp"
@@ -169,6 +170,55 @@ int main() {
                         "SOSP-tree parents\n",
                         notParent, batch.heDelete.size());
             ++failures;
+        }
+    }
+
+    // ---- recompute block size -------------------------------------------
+    // The recompute runs one warp per node: other multiples of 32 must give
+    // the same result, anything else must be rejected (a block of 48 or 100
+    // threads hung, 16 gave wrong distances).
+    {
+        GenParams gp;
+        gp.numHyperedges = 1500;
+        gp.numVertices = 1000;
+        gp.cMin = 1;
+        gp.cMax = 6;
+        gp.poolSize = 48;
+        gp.seed = 31;
+        GeneratedHypergraph g = generateHypergraph(gp);
+        DynamicHypergraph::Caps caps;
+        caps.maxHyperedges = static_cast<int>(g.rows.size()) + 64;
+        DynamicHypergraph dh(g.numVertices, caps);
+        LineGraphCSR lg0 = dh.bulkLoad(std::move(g.rows),
+                                       std::move(g.weights), g.sourceHe,
+                                       g.targetHe);
+        HostHypergraph& hg = dh.host();
+        hsosp::DeviceH2H dev;
+        hsosp::buildDeviceH2H(dev, hg, lg0, caps.maxHyperedges, 1.4);
+        hsosp::HsospState st;
+        st.allocate(caps.maxHyperedges);
+        for (int bs : {32, 64, 96, 1024}) {
+            hsosp::UpdateConfig c = ucfg;
+            c.blockSize = bs;
+            hsosp::hsospRecompute(dev, st, hg.sourceHe, c);
+            distsMatch(st, hg, "recompute with a non-default block size", bs);
+        }
+        for (int bs : {0, 16, 48, 100, 2048}) {
+            hsosp::UpdateConfig c = ucfg;
+            c.blockSize = bs;
+            for (int update = 0; update < 2; ++update) {
+                try {
+                    if (update)
+                        hsosp::hsospUpdate(dev, st, hg.sourceHe, c);
+                    else
+                        hsosp::hsospRecompute(dev, st, hg.sourceHe, c);
+                    std::printf("FAIL: %s accepted blockSize %d\n",
+                                update ? "hsospUpdate" : "hsospRecompute",
+                                bs);
+                    ++failures;
+                } catch (const std::invalid_argument&) {
+                }
+            }
         }
     }
 
