@@ -27,9 +27,18 @@ average about 8 during the runs), CUDA 12.9 (final build) and 13.1
   make -C ../baseline CUDA_ARCH=sm_86 NVCC=/usr/local/cuda-13.1/bin/nvcc \
       bin/hsospBench
   ```
-- **final**: this branch, measured at commit `07bbceb` (later commits
-  only zero allocations for the sanitizer, replace a deprecated functor
-  and change documentation).
+- **final**: this branch, measured at commit `07bbceb`. Later commits
+  zero allocations for the sanitizer, replace a deprecated functor, change
+  documentation and fix review findings in the code: payload compaction
+  when a fill or insert runs out of space, 64-bit vertex ids in the
+  loader, a hyperedge weight cap of 2^28, skipping batch operations on the
+  virtual source and target hyperedges, an empty vertex batch when no
+  real hyperedge is left, and option and load checks in
+  `hsospBench`. The tables were not re-measured after them. A check on
+  DBLP (hyperedge batches of 50K and 200K, vertex batches of 50K; three
+  batches, median of three runs) found the same h2h pairs and iterations
+  in every batch, no fallback, and per-batch dynamic times 2.5-5% lower
+  than before the review fixes.
 
 Every vertex batch and the first two hyperedge batches of each
 configuration are identical in the two builds (the batch generator is
