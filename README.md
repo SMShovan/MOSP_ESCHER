@@ -70,9 +70,10 @@ the before/after tables on coauth-DBLP and coauth-MAG-Geology. In short:
   fallback to the recompute is kept and counted in the update time.
 - **Ties.** Parents are canonical (lowest id among the tight neighbours)
   in the update, the recompute and the oracle.
-- **Weights.** Integer hyperedge weights >= 1 (zero or negative weights
-  are rejected; the paper's weights are positive reals). Real datasets get
-  U[1,100] weights.
+- **Weights.** Integer hyperedge weights in [1, 2^28] (other weights are
+  rejected; the paper's weights are positive reals, and the cap keeps
+  every path cost far from 64-bit overflow). Real datasets get U[1,100]
+  weights.
 - **Baseline.** The static baseline is the GPU recompute with the same
   kernels (as in the paper). Those kernels became about 4x faster (P3 in
   CHANGES.md), which lowers the reported speedups.
