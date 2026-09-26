@@ -357,7 +357,11 @@ test with other seeds, 0 failures.
   pipeline, static recompute, checks) and gives one CSV row; `--verify`
   selects the batches the independent oracle checks (all / first / none).
   On coauth-DBLP this gives 2,466,792 hyperedges and 1,924,991 vertices
-  (the paper lists 2,466,661 / 1,924,991).
+  (the paper lists 2,466,661 / 1,924,991). Vertex ids are read as signed
+  64-bit values (they were truncated to `int`, which merged distinct
+  vertices of files with ids above 2^31, as some MAG / AMiner exports
+  have); a token outside that range is an error.
+
 ## Performance
 
 Paper metric per batch = ESCHER maintenance + unification (line-graph delta)

@@ -28,9 +28,15 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <random>
 #include <set>
+#include <stdexcept>
+#include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace escher_mosp;
@@ -364,6 +370,54 @@ int main() {
         CHECK(b.heDelete.empty() && !b.heInsert.empty(),
               "empty pool: hyperedge batch has %zu deletions, %zu "
               "insertions", b.heDelete.size(), b.heInsert.size());
+    }
+
+    // ---- real-hypergraph loader: 64-bit vertex ids -----------------------
+    // (Ids were truncated to int: 4294967297 became 1 and an out-of-range
+    // token became -1, merging distinct vertices.)
+    {
+        const std::string path =
+            (std::filesystem::temp_directory_path() /
+             ("local_tests_" + std::to_string(::getpid()) + ".hg"))
+                .string();
+        auto load = [&](const char* text, GeneratedHypergraph& g) {
+            {
+                std::ofstream out(path);
+                out << text;
+            }
+            try {
+                g = loadHypergraphFile(path, 100, 1);
+            } catch (const std::runtime_error&) {
+                return false;
+            }
+            return true;
+        };
+        // Rows 2 and 3 are the file's first two lines (row 1: virtual s);
+        // a row lists its vertices in order of raw id.
+        auto disjoint = [](const GeneratedHypergraph& g) {
+            std::vector<int> a = g.rows[1], b = g.rows[2];
+            std::sort(a.begin(), a.end());
+            std::sort(b.begin(), b.end());
+            std::vector<int> common;
+            std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+                                  std::back_inserter(common));
+            return common.empty();
+        };
+        GeneratedHypergraph g;
+        CHECK(load("4294967297 5\n1 7\n", g) && g.numVertices == 4 &&
+                  disjoint(g),
+              "loader: ids 4294967297 and 1 merged (n = %d)", g.numVertices);
+        CHECK(load("-9223372036854775808 5\n9223372036854775807 5 -1\n",
+                   g) &&
+                  g.numVertices == 4,
+              "loader: 64-bit extremes: n = %d, want 4", g.numVertices);
+        CHECK(!load("99999999999999999999 5\n-1 8\n", g),
+              "loader: id beyond 64 bits accepted");
+        CHECK(!load("12 x5\n", g), "loader: non-numeric token accepted");
+        CHECK(load("-3 5\n2 7\n5 -3 2\n", g) && g.numVertices == 4 &&
+                  disjoint(g) && g.rows[3] == (std::vector<int>{0, 2, 1}),
+              "loader: in-range ids: n = %d, want 4", g.numVertices);
+        std::remove(path.c_str());
     }
 
     std::printf("local_tests: %d configs, %d batches, "

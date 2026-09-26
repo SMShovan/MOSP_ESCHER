@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <unordered_map>
@@ -275,54 +276,105 @@ HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
     return batch;
 }
 
+namespace {
+
+enum class IdParse { Ok, NotANumber, OutOfRange };
+
+/** Decimal integer at @p p ([+-]digits, the prefix std::strtoll would
+ *  accept after the separators), advancing @p p past it. Faster than
+ *  strtoll with errno; values outside the signed 64-bit range are
+ *  reported, not saturated. */
+IdParse parseVertexId(const char*& p, long long& out) {
+    const char* q = p;
+    const bool neg = (*q == '-');
+    if (*q == '-' || *q == '+') ++q;
+    if (*q < '0' || *q > '9') return IdParse::NotANumber;
+    // Accumulate the magnitude; the negative range has one more value.
+    const unsigned long long limit =
+        static_cast<unsigned long long>(
+            std::numeric_limits<long long>::max()) + (neg ? 1u : 0u);
+    unsigned long long mag = 0;
+    bool overflow = false;
+    for (; *q >= '0' && *q <= '9'; ++q) {
+        const unsigned d = static_cast<unsigned>(*q - '0');
+        if (mag > (limit - d) / 10) overflow = true;
+        else mag = mag * 10 + d;
+    }
+    p = q;
+    if (overflow) return IdParse::OutOfRange;
+    out = neg ? static_cast<long long>(0 - mag) : static_cast<long long>(mag);
+    return IdParse::Ok;
+}
+
+} // namespace
+
 GeneratedHypergraph loadHypergraphFile(const std::string& path,
                                        int maxCardinality,
                                        std::uint64_t seed) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("cannot open hypergraph file " + path);
-    std::vector<std::vector<int>> raw;
+    // Raw ids are read as 64-bit values (some collections use ids above
+    // 2^31; truncating them to int merged distinct vertices) and renumbered
+    // 0..n-1 in order of first appearance as each kept row is read.
+    std::unordered_map<long long, int> remap;
+    {
+        // Pre-size the map from the file size (as the two-pass version
+        // did from the row count) so that it does not rehash as it grows.
+        in.seekg(0, std::ios::end);
+        const std::streamoff bytes = in.tellg();
+        in.seekg(0, std::ios::beg);
+        if (bytes > 0) remap.reserve(static_cast<std::size_t>(bytes / 16));
+    }
+    std::vector<std::vector<int>> rows;
     std::string line;
-    std::vector<int> r;
+    std::vector<long long> r;
     while (std::getline(in, line)) {
         r.clear();
         const char* p = line.c_str();
         while (*p) {
             while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\r') ++p;
             if (!*p) break;
-            char* end = nullptr;
-            const long v = std::strtol(p, &end, 10);
-            if (end == p) {
+            long long v = 0;
+            switch (parseVertexId(p, v)) {
+            case IdParse::NotANumber:
                 throw std::runtime_error("non-numeric token in " + path +
                                          ": " + line);
+            case IdParse::OutOfRange:
+                throw std::runtime_error("vertex id out of range in " + path +
+                                         ": " + line);
+            case IdParse::Ok:
+                break;
             }
-            r.push_back(static_cast<int>(v));
-            p = end;
+            r.push_back(v);
         }
         if (r.empty()) continue;
         std::sort(r.begin(), r.end());
         r.erase(std::unique(r.begin(), r.end()), r.end());
-        if (static_cast<int>(r.size()) > maxCardinality) continue;
-        raw.push_back(r);
+        if (static_cast<long long>(r.size()) > maxCardinality) continue;
+        std::vector<int> row;
+        row.reserve(r.size());
+        for (long long v : r) {
+            auto it = remap.find(v);
+            if (it == remap.end()) {
+                if (remap.size() >= static_cast<std::size_t>(
+                                        std::numeric_limits<int>::max()))
+                    throw std::runtime_error(
+                        "more than 2^31 - 1 distinct vertices in " + path);
+                it = remap.emplace(v, static_cast<int>(remap.size())).first;
+            }
+            row.push_back(it->second);
+        }
+        rows.push_back(std::move(row));
     }
-    if (raw.empty()) {
+    if (rows.empty()) {
         throw std::runtime_error("no hyperedge of at most " +
                                  std::to_string(maxCardinality) +
                                  " vertices in " + path);
     }
-    // Renumber the vertices 0..n-1 in order of first appearance.
-    std::unordered_map<int, int> remap;
-    remap.reserve(raw.size() * 2);
-    for (auto& row : raw)
-        for (int& v : row) {
-            auto it = remap.find(v);
-            if (it == remap.end())
-                it = remap.emplace(v, static_cast<int>(remap.size())).first;
-            v = it->second;
-        }
     GeneratedHypergraph g;
     g.numVertices = static_cast<int>(remap.size());
     std::vector<int> deg(g.numVertices, 0);
-    for (const auto& row : raw)
+    for (const auto& row : rows)
         for (int v : row) ++deg[v];
     std::mt19937_64 rng(seed);
     g.sourceVertex = static_cast<int>(
@@ -330,11 +382,11 @@ GeneratedHypergraph loadHypergraphFile(const std::string& path,
     g.targetVertex =
         std::uniform_int_distribution<int>(0, g.numVertices - 1)(rng);
     std::uniform_int_distribution<long long> wDist(1, 100);
-    g.rows.reserve(raw.size() + 2);
-    g.weights.reserve(raw.size() + 2);
+    g.rows.reserve(rows.size() + 2);
+    g.weights.reserve(rows.size() + 2);
     g.rows.push_back({g.sourceVertex});
     g.weights.push_back(0);
-    for (auto& row : raw) {
+    for (auto& row : rows) {
         g.rows.push_back(std::move(row));
         g.weights.push_back(wDist(rng));
     }

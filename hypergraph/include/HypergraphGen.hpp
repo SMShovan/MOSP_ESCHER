@@ -89,16 +89,20 @@ HgBatch generateBatch(const HostHypergraph& hg, const GenParams& gen,
  * @brief Loads a real hypergraph with the paper's preprocessing.
  *
  * Input: one hyperedge per line, vertex ids separated by spaces, tabs or
- * commas (e.g. coauth-DBLP). Duplicate vertices of a line are merged,
- * hyperedges with more than @p maxCardinality vertices are dropped, and the
- * vertex ids are renumbered 0..n-1 in order of first appearance. Real
+ * commas (e.g. coauth-DBLP). Ids are signed 64-bit integers. Duplicate
+ * vertices of a line are merged, hyperedges with more than
+ * @p maxCardinality vertices are dropped, and the vertex ids are
+ * renumbered 0..n-1 in order of first appearance. Repeated lines are not
+ * merged (each becomes its own hyperedge). Real
  * hyperedges get weights U[1,100] (seeded; the paper does not say how it
  * weights real data). The virtual source hyperedge {s} is row 1 (s = a
  * vertex of maximum degree) and the virtual target {t} the last row (t =
  * a uniformly random vertex), both with weight 0.
  *
- * @throws std::runtime_error if the file cannot be read or has no
- *         hyperedge within the cardinality bound.
+ * @throws std::runtime_error if the file cannot be read, has a token
+ *         that is not an integer or does not fit 64 bits, has more than
+ *         2^31 - 1 distinct vertices, or has no hyperedge within the
+ *         cardinality bound.
  */
 GeneratedHypergraph loadHypergraphFile(const std::string& path,
                                        int maxCardinality,
