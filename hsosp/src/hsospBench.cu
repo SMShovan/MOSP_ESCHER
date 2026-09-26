@@ -65,7 +65,8 @@ struct CliOptions {
     /// incidence lists) for every batch of a hypergraph with at most this
     /// many hyperedge ids.
     long long verifyMax = 5000000;
-    int maxIterations = 512;
+    int maxIterations = 4096;    ///< update budget: push iterations
+    double workBudget = 1.0;     ///< update budget: relaxations / entries
     unsigned long long seed = 20260725ull;
     bool listOnly = false;
     // Real-hypergraph mode (--hg).
@@ -151,7 +152,8 @@ public:
                     "t_static_ms,speedup,iters,fallback,seeds,max_frontier,"
                     "overflow_rebuilds,dev_mem_mb,escher_mb,graph_mb,"
                     "reachable_frac,verified,correct,oracle,"
-                    "mismatch_static,mismatch_oracle,parent_errors\n";
+                    "mismatch_static,mismatch_oracle,parent_errors,"
+                    "fallback_iters,invalidated,update_work,static_iters\n";
             out_.flush();
         }
     }
@@ -223,6 +225,7 @@ std::unique_ptr<LoadedDataset> buildDataset(const std::string& name,
     ds->stateB.allocate(caps.maxHyperedges);
     hsosp::UpdateConfig ucfg;
     ucfg.maxIterations = opt.maxIterations;
+    ucfg.workBudget = opt.workBudget;
     hsosp::UpdateStats is =
         hsosp::hsospRecompute(ds->dev, ds->stateA, hg.sourceHe, ucfg);
     std::fprintf(stderr,
@@ -266,6 +269,7 @@ struct BatchOutcome {
     DynamicHypergraph::BatchResult br;
     double csrMs = 0.0, sospMs = 0.0, staticMs = 0.0;
     hsosp::UpdateStats us;
+    int staticIterations = 0;
     long long mismatchStatic = 0;
     bool oracleRan = false;
     SospCheck oracle;
@@ -291,6 +295,7 @@ BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
     HostHypergraph& hg = ds.dh.host();
     hsosp::UpdateConfig ucfg;
     ucfg.maxIterations = opt.maxIterations;
+    ucfg.workBudget = opt.workBudget;
 
     // ---- dynamic pipeline (timed) --------------------------------------
     try {
@@ -304,16 +309,16 @@ BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
 
     auto t0 = Clock::now();
     bool ok = hsosp::applyDeltaToDevice(ds.dev, hg, o.br.delta);
-    o.csrMs = msSince(t0);
     if (!ok) {
-        // Tail exhausted: rebuild from the shadow (counted, not timed
-        // as part of the update) and re-run this batch's CSR stage as
-        // a rebuild (the rebuild itself installs the post-batch state).
+        // Tail exhausted: rebuild from the shadow; the rebuild installs the
+        // post-batch state and is part of this batch's CSR stage (the
+        // original stopped the timer before it).
         ++ds.overflowRebuilds;
         std::fprintf(stderr, "[warn] %s: device CSR overflow, rebuilding\n",
                      what.c_str());
         hsosp::buildDeviceH2H(ds.dev, hg, ds.stateA.maxNodes, 1.6);
     }
+    o.csrMs = msSince(t0);
 
     t0 = Clock::now();
     o.us = hsosp::hsospUpdate(ds.dev, ds.stateA, hg.sourceHe, ucfg);
@@ -321,7 +326,8 @@ BatchOutcome runBatch(LoadedDataset& ds, const HgBatch& batch,
 
     // ---- static baseline (timed) ---------------------------------------
     t0 = Clock::now();
-    hsosp::hsospRecompute(ds.dev, ds.stateB, hg.sourceHe, ucfg);
+    o.staticIterations =
+        hsosp::hsospRecompute(ds.dev, ds.stateB, hg.sourceHe, ucfg).iterations;
     o.staticMs = msSince(t0);
 
     // ---- correctness ---------------------------------------------------
@@ -382,16 +388,20 @@ void writeRow(CsvWriter& csv, const CliOptions& opt, const std::string& exp,
       << (o.correct() ? 1 : 0) << "," << (o.oracleRan ? "host" : "none")
       << "," << o.mismatchStatic << ","
       << (o.oracleRan ? o.oracle.distMismatches : -1) << ","
-      << (o.oracleRan ? o.oracle.parentErrors : -1);
+      << (o.oracleRan ? o.oracle.parentErrors : -1) << ","
+      << o.us.fallbackIterations << "," << o.us.seedCount << ","
+      << o.us.work << "," << o.staticIterations;
     csv.endRow();
     std::fprintf(stderr,
                  "[row] %s %s %s dE=%d del=%.0f %s rep=%d: "
                  "dyn=%.1fms (escher=%.1f delta=%.1f csr=%.1f "
-                 "sosp=%.1f) static=%.1fms speedup=%.2f iters=%d%s%s\n",
+                 "sosp=%.1f) static=%.1fms speedup=%.2f iters=%d "
+                 "invalidated=%lld%s%s\n",
                  dataset.c_str(), exp.c_str(), toString(kind), batchSize,
                  delPct, toString(pl), rep, dynTotal, o.br.escherMs,
                  o.br.deltaMs, o.csrMs, o.sospMs, o.staticMs,
                  dynTotal > 0 ? o.staticMs / dynTotal : 0.0, o.us.iterations,
+                 o.us.seedCount,
                  o.us.fallbackRecompute ? " FALLBACK" : "",
                  o.oracleRan ? (o.verified() ? " verified" : " ORACLE-FAIL")
                              : "");
@@ -514,6 +524,8 @@ int main(int argc, char** argv) {
             opt.verifyMax = std::stoll(next("--verify-max"));
         else if (a == "--maxiter")
             opt.maxIterations = std::stoi(next("--maxiter"));
+        else if (a == "--work-budget")
+            opt.workBudget = std::stod(next("--work-budget"));
         else if (a == "--seed") opt.seed = std::stoull(next("--seed"));
         else if (a == "--list") opt.listOnly = true;
         else if (a == "--hg") opt.hgPath = next("--hg");

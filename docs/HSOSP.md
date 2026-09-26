@@ -38,7 +38,7 @@ project's parallel SOSP-update framework as the update engine.
         ▼
  DeviceH2H: resident slack-CSR line graph  ◄── applyDeltaToDevice (t_csr_apply_ms)
         ▼
- hsospUpdate: seeded candidate/affected propagation        (t_sosp_update_ms)
+ hsospUpdate: invalidate subtrees, pull, push              (t_sosp_update_ms)
  hsospRecompute: static baseline from blank                (t_static_ms)
 ```
 
@@ -51,11 +51,16 @@ project's parallel SOSP-update framework as the update engine.
 - `hsosp/include/hsosp.cuh` — device line graph + node-weighted SOSP
   kernels (adapted from `mosp/src/parallelSOSPUpdate.cu`, originals
   untouched).
-- Convergence: positive weights make any fixed point of the relaxation
-  correct, so no reachability BFS is needed on the happy path. If a batch
-  disconnects a region, its stale distances keep increasing until the
-  iteration cap (`--maxiter`, default 512) triggers a full recompute
-  fallback (counted in the CSV as `fallback`).
+- Update (exact): the pre-batch shortest-path subtree of every deleted
+  tree edge and of every new, recreated or dead node is invalidated
+  (pointer jumping), invalidated nodes pull their best neighbour, inserted
+  pairs are relaxed, and decreases are pushed to convergence with a packed
+  (distance, parent) atomicMin. No stale distance survives, so there is no
+  count-to-infinity and no iteration cap; parent ties go to the lowest id.
+  An update that exceeds its budget (`--work-budget` x adjacency entries
+  relaxations, default 1, or `--maxiter` push iterations, default 4,096)
+  falls back to the recompute inside the timed update (CSV: `fallback`,
+  `fallback_iters`).
 
 ## Binaries
 
@@ -95,7 +100,13 @@ hypergraph has at most `--verify-max` hyperedge ids (default 5,000,000), with
 an independent oracle: Dijkstra on the line graph rebuilt from the incidence
 lists, plus a check of the shortest-path tree (`oracle` = `host`,
 `mismatch_oracle`, `parent_errors`). `verified` is 1 only when that oracle
-ran and agreed; `correct` requires both checks that ran to pass.
+ran and agreed; `correct` requires both checks that ran to pass. `iters` is
+the update's push iterations, `fallback_iters` the rounds of a fallback
+recompute, `invalidated` the invalidated nodes, `update_work` the edge
+relaxations, `static_iters` the baseline's rounds. `t_csr_apply_ms` includes
+a rebuild after a tail overflow (`overflow_rebuilds`). `dev_mem_mb` is the
+device-wide used memory (`cudaMemGetInfo`, other processes included);
+`escher_mb` and `graph_mb` are this process's structures.
 
 ## Running on the cluster
 

@@ -286,3 +286,11 @@ test with other seeds, 0 failures.
   takes the incremental path; 0 failures), `test_hsosp_matches_dijkstra`
   (alternating batches with a zero budget exercise the fallback),
   `test_hsosp_scale`.
+- **S5 measurement reporting** (`hsospBench`). On a fallback the `iters`
+  column held only the recompute's rounds (the 512 capped iterations
+  vanished); the CSR overflow rebuild ran after the CSR timer was read, so
+  it was never counted in the dynamic time; `dev_mem_mb` counted other
+  processes' memory without saying so. The CSR stage now includes a
+  rebuild, the CSV has `fallback_iters`, `invalidated`, `update_work` and
+  `static_iters` next to `iters`, and the columns are documented in
+  `docs/HSOSP.md` (`--work-budget` sets the update budget).
