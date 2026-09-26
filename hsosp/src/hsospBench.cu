@@ -34,6 +34,7 @@
 
 #include "DynamicHypergraph.hpp"
 #include "HypergraphGen.hpp"
+#include "HypergraphOracle.hpp"
 #include "hsosp.cuh"
 
 using namespace escher_mosp;
@@ -51,7 +52,10 @@ struct CliOptions {
     std::string out = "results/results.csv";
     std::string experiments = "E1,E2,E3,E4,E5,E7";
     int reps = 3;
-    long long verifyMax = 300000;   ///< host-Dijkstra gate on hyperedge count
+    /// Independent oracle (Dijkstra on the line graph rebuilt from the
+    /// incidence lists) for every batch of a hypergraph with at most this
+    /// many hyperedge ids.
+    long long verifyMax = 5000000;
     int maxIterations = 512;
     unsigned long long seed = 20260725ull;
     bool listOnly = false;
@@ -128,7 +132,8 @@ public:
                     "t_csr_apply_ms,t_sosp_update_ms,t_dynamic_total_ms,"
                     "t_static_ms,speedup,iters,fallback,seeds,max_frontier,"
                     "overflow_rebuilds,dev_mem_mb,escher_mb,graph_mb,"
-                    "reachable_frac,verified,correct\n";
+                    "reachable_frac,verified,correct,oracle,"
+                    "mismatch_static,mismatch_oracle,parent_errors\n";
             out_.flush();
         }
     }
@@ -299,28 +304,32 @@ void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
         (void)rs;
 
         // ---- correctness ----------------------------------------------
-        long long mismatches =
+        // update == static recompute (same kernels, so not independent),
+        // and, when the oracle runs, update == Dijkstra on the line graph
+        // rebuilt from the incidence lists, with a valid shortest-path tree.
+        // "verified" is 1 only when the oracle ran and agreed.
+        const long long mismatches =
             hsosp::compareDistances(ds.stateA, ds.stateB, hg.maxId());
-        bool verified = true;
-        bool correct = (mismatches == 0);
-        if (hg.maxId() <= opt.verifyMax) {
+        const bool oracleRan = hg.maxId() <= opt.verifyMax;
+        SospCheck oc;
+        if (oracleRan) {
+            LineGraphCSR lg = rebuildLineGraph(hg);
             std::vector<long long> got;
+            std::vector<int> par;
             ds.stateA.downloadDistances(got, hg.maxId());
-            std::vector<long long> truth = hg.dijkstra(hg.sourceHe);
-            for (int i = 0; i < hg.maxId(); ++i) {
-                if (got[i] != truth[i]) {
-                    correct = false;
-                    break;
-                }
-            }
+            ds.stateA.downloadParents(par, hg.maxId());
+            oc = checkSosp(hg, lg, referenceDistances(hg, lg, hg.sourceHe),
+                           got, par);
         }
+        const bool verified = oracleRan && oc.ok();
+        const bool correct = mismatches == 0 && (!oracleRan || oc.ok());
         if (!correct) {
             ++globalFailures;
             std::fprintf(stderr,
-                         "[FAIL] %s %s rep %d: distance mismatch "
-                         "(%lld vs static)\n",
+                         "[FAIL] %s %s rep %d: %lld mismatches vs static, "
+                         "%lld vs oracle, %lld parent errors\n",
                          dcfg.name.c_str(), sc.experiment.c_str(), rep,
-                         mismatches);
+                         mismatches, oc.distMismatches, oc.parentErrors);
         }
 
         const double dynTotal = br.escherMs + br.deltaMs + csrMs + sospMs;
@@ -346,7 +355,9 @@ void runScenario(LoadedDataset& ds, const DatasetCfg& dcfg,
               ds.stateB.deviceBytes()) /
                  (1024.0 * 1024.0)
           << "," << ds.reachableFrac << "," << (verified ? 1 : 0) << ","
-          << (correct ? 1 : 0);
+          << (correct ? 1 : 0) << "," << (oracleRan ? "host" : "none") << ","
+          << mismatches << "," << (oracleRan ? oc.distMismatches : -1) << ","
+          << (oracleRan ? oc.parentErrors : -1);
         csv.endRow();
 
         std::fprintf(stderr,

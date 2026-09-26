@@ -89,8 +89,13 @@ HG-L (10M), HG-XL (16M), HG-C (2M, cardinality up to 64).
 
 Every measured batch appends one CSV row (flushed immediately); the row
 carries all phase timings, iteration counts, seed values, memory, and the
-correctness verdict (compared against the static recompute on every batch,
-and against host Dijkstra whenever `m <= --verify-max`).
+correctness verdict. Every batch is compared with the static recompute
+(`mismatch_static`; same kernels, so not an independent check) and, when the
+hypergraph has at most `--verify-max` hyperedge ids (default 5,000,000), with
+an independent oracle: Dijkstra on the line graph rebuilt from the incidence
+lists, plus a check of the shortest-path tree (`oracle` = `host`,
+`mismatch_oracle`, `parent_errors`). `verified` is 1 only when that oracle
+ran and agreed; `correct` requires both checks that ran to pass.
 
 ## Running on the cluster
 

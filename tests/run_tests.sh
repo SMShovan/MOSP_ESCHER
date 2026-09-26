@@ -64,6 +64,8 @@ echo "=== H-SOSP randomized stress (pipeline vs independent oracle) ==="
 run_case hsospStress        "$BIN/hsospStress" --configs 50
 run_case hsospStress_escher "$BIN/hsospStress" --configs 20 --seed 11 \
     --check-escher
+run_case hsospBench_smoke   "$BIN/hsospBench" --suite smoke --reps 1 \
+    --out hsospBench_smoke.csv
 
 echo "=== MOSP pipeline and stress tests ==="
 # Fixed seeds keep the suite reproducible; seed 6 of parallelStressTest hit

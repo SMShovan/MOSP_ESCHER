@@ -225,3 +225,13 @@ test with other seeds, 0 failures.
   sites use it and the convention is documented. Regression:
   `test_hsosp_matches_dijkstra` (every deletion of a targeted batch is a
   tree parent; 153 of 200 were not with the old conversion).
+- **S2 verification in `hsospBench`**. Correctness was "update == static
+  recompute", two results of the same kernels; after the fallback (every
+  realistic batch, see S1) the update *was* the recompute, so the check could
+  not fail. Host Dijkstra ran only up to 300K hyperedges and the `verified`
+  column was hard-coded to 1. Now every batch of a hypergraph with at most
+  `--verify-max` ids (default 5M) is also checked against the independent
+  oracle (distances and shortest-path tree), and the CSV reports what was
+  checked: `oracle` (host / none), `mismatch_static`, `mismatch_oracle`,
+  `parent_errors`; `verified` is 1 only when the oracle ran and agreed. The
+  smoke suite runs in `make test`.
